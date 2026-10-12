@@ -1,5 +1,11 @@
 # Murmurly
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/hero-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="docs/hero-light.png">
+  <img alt="Murmurly's settings window on the Dictation tab, with the speech model ready, next to the Murmurly menu open in the macOS menu bar" src="docs/hero-light.png">
+</picture>
+
 Murmurly is a dictation and meeting recorder for your Mac. Speech is recognized
 on your Mac: Murmurly never uploads your recordings or text to be transcribed.
 
@@ -11,8 +17,6 @@ on your Mac: Murmurly never uploads your recordings or text to be transcribed.
 - **Get a transcript.** When the call ends, Murmurly transcribes it into a text
   file with timestamps, where your microphone and the call audio are labeled
   separately.
-
-<!-- Screenshots will be added later. -->
 
 ## Features
 

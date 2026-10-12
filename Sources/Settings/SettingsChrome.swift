@@ -55,7 +55,7 @@ enum SettingsChrome {
     static let historyRowHorizontalPadding: CGFloat = 10
     static let historyRowVerticalPadding: CGFloat = 8
     static let historyRowSpacing: CGFloat = 11
-    static let historyTimeWidth: CGFloat = 38
+    static let historyTimeWidth: CGFloat = 52
     static let historyLanguageWidth: CGFloat = 28
     static let historyLanguageFontSize: CGFloat = 9
     static let historyActionSize: CGFloat = 24
