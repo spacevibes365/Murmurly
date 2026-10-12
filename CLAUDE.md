@@ -1,0 +1,575 @@
+# CLAUDE.md
+
+Build, architecture and contribution guidance for this repository.
+
+## Project
+
+A macOS menu bar app for local dictation and meeting recording with on-device
+speech recognition. Apple silicon only, macOS 15+. Swift 6, SwiftUI with AppKit
+where SwiftUI falls short. Speech recognition runs locally; recordings and
+transcripts are not uploaded for transcription. Model downloads (Hugging Face)
+and update checks use the network. User-selected storage folders may be remote
+or cloud-synced.
+
+## Commands
+
+The Xcode project is generated from `project.yml` and is not in git. Run this
+after any change to `project.yml` and after adding or removing a file:
+
+```sh
+xcodegen generate
+```
+
+Build and test:
+
+```sh
+xcodebuild -project Murmurly.xcodeproj -scheme Murmurly \
+  -destination 'platform=macOS,arch=arm64' test                     # unit + UI
+xcodebuild -project Murmurly.xcodeproj -scheme Murmurly \
+  -destination 'platform=macOS,arch=arm64' \
+  -only-testing:MurmurlyTests test                               # unit only (what CI runs)
+xcodebuild -project Murmurly.xcodeproj -scheme Murmurly analyze
+```
+
+A single test:
+
+```sh
+xcodebuild -project Murmurly.xcodeproj -scheme Murmurly \
+  -destination 'platform=macOS,arch=arm64' \
+  -only-testing:MurmurlyTests/MeetingWatchdogJointTests/testConfiguredExclusionDoesNotStartAtActivation test
+```
+
+The stage gate is a separate scheme that runs the app as shipped: real models,
+real permissions, real audio, real global shortcuts and the real settings
+domain. It is deliberately not part of the `Murmurly` scheme. Anyone can build
+it; the production cold-launch check below runs on any machine. The real-audio
+tests also need downloaded models and specific audio fixtures that are not in
+the repository (see the `MURMURLY_*` variables in
+`RealAudioStageGateTests.swift`); they check that particular material, so
+arbitrary recordings are no substitute.
+
+```sh
+xcodebuild -project Murmurly.xcodeproj -scheme MurmurlyStageGate \
+  -destination 'platform=macOS,arch=arm64' \
+  -derivedDataPath /tmp/tr-stagegate build-for-testing
+xcodebuild -project Murmurly.xcodeproj -scheme MurmurlyStageGate \
+  -destination 'platform=macOS,arch=arm64' -derivedDataPath /tmp/tr-stagegate \
+  -only-testing:MurmurlyStageGateTests/RealAudioStageGateTests/testProductionColdLaunchIsMenuBarOnly test
+```
+
+`scripts/install.sh` builds a Release copy and installs it into `~/Applications`.
+`scripts/release.sh` builds the DMG: ad-hoc by default, or signed, notarized and
+stapled with `DEVELOPER_ID` and `NOTARY_PROFILE`. Its Finder window (the app, an
+arrow, Applications) comes from `scripts/dmg/DS_Store` and
+`scripts/dmg/background.tiff`, copied into the image. The `.DS_Store` finds the
+picture and the icons by the volume name `Murmurly`, `/.background.tiff`,
+`Murmurly.app` and `Applications`: rename one and Finder silently shows its
+plain default window.
+
+### Traps
+
+- **The `Murmurly` scheme does not build `MurmurlyStageGateTests`.** A
+  change that breaks only the stage gate passes a green run unnoticed. If you
+  touched anything the gate uses, build its scheme with `build-for-testing`: the
+  test target is bound to the `test` action, so a plain `build` does not compile
+  it at all.
+- **Build the stage gate into its own `-derivedDataPath`.** Its `.xctest` lands
+  inside the built `.app`, and the `Murmurly` scheme then fails on code
+  signing. `clean` only postpones this; separate folders fix it.
+- **Exit code 0 does not mean tests ran.** Read the `Executed N tests` lines. A
+  wrong `-only-testing` path exits 0 with `Executed 0 tests`.
+- **Keyboard layout.** XCUITest's `typeKey` and `typeText` map characters through
+  the active keyboard layout. On a non-Latin layout ⌘, cannot be typed, so
+  `testCommandCommaOpensSettingsWithoutExistingWindow` skips itself; other UI
+  tests open Settings from the menu bar and type only digits. After touching
+  scenes or the Settings command, run the UI tests once on a Latin layout.
+- **`Timed out while enabling automation mode`** with no `Executed N tests` line
+  at all is a hung `testmanagerd`, not a code problem. It ignores SIGTERM:
+  `kill -9` it (launchd restarts it on demand) and check with `ps -p <pid>`.
+
+## Build constraints
+
+- **Warnings are errors** in every target (`SWIFT_TREAT_WARNINGS_AS_ERRORS`,
+  `GCC_TREAT_WARNINGS_AS_ERRORS`), Swift 6 with `SWIFT_STRICT_CONCURRENCY:
+  complete`. Keep zero warnings in `Sources/` and `Tests/`. Warnings from
+  third-party Swift packages are built with their own settings and are not ours
+  to fix.
+- **Signing goes through `Signing.xcconfig`.** The default is ad-hoc (`-`), so a
+  fresh clone builds anywhere, but macOS ties permissions to the exact build,
+  so you may need to grant them again after a rebuild. To keep most of them,
+  name a certificate from your keychain in a git-ignored `Local.xcconfig`:
+  `MURMURLY_CODE_SIGN_IDENTITY = <certificate name>`. `project.yml` reads this
+  variable; never put a certificate name into `project.yml`. A self-signed
+  certificate has no Team ID, so Accessibility stays tied to the binary's
+  CDHash. The app asks for it again only at the first launch of a new
+  `CFBundleVersion`; after a rebuild of the same version, use **Grant…** in
+  Settings → Permissions. Only Developer ID fixes this for good.
+- Hardened Runtime is on in Release and off in Debug: a certificate without a
+  Team ID fails library validation when XCTest is injected. For the same reason
+  `Murmurly.entitlements` carries `com.apple.security.cs.disable-library-validation`:
+  without it, a Release build signed ad-hoc or with a self-signed certificate
+  crashes at launch because it cannot load the embedded `Sparkle.framework`
+  (`different Team IDs`). A Developer ID build does not need it;
+  `scripts/release.sh` removes it when re-signing and fails if it is still
+  there.
+- App Sandbox is off: the process tap, pasting into other apps and user-chosen
+  meeting folders need their own design first.
+- `ARCHS = arm64`: the Core ML models need Apple silicon.
+- `Package.resolved` is not tracked; every package is pinned with `exactVersion`
+  in `project.yml`.
+
+## Architecture
+
+A menu bar resident with no Dock icon. `MurmurlyApp` creates the
+`@MainActor ObservableObject`s and passes them down: `SettingsStore`,
+`RecordingIndicator`, `DictationCoordinator`, `MeetingRecorder`,
+`MeetingTranscriptionQueue`, `ModelDownloader`, `PermissionManager`,
+`LoginItemManager`. Shortcuts and background services start from the `.task` of
+`MenuBarLabel`, on the label's first render, not when a window opens: dictation
+and the meeting watchdog live with all windows closed. There is one window,
+Settings (`Window(id: "settings")`), whose tabs include Getting Started and
+Files; the menu's "Transcribe a File…" opens it on Files. There is no help book,
+so the Help menu has no help item (`CommandGroup(replacing: .help) {}`). Open at
+login is on by default: the first launch from `/Applications` or
+`~/Applications` registers the login item and macOS announces it with "Login
+Item Added", so Getting Started shows the same switch as Permissions, next to
+automatic recording. Getting Started numbers its five cards as README numbers
+the steps; only the model's step gets a check, from `ModelRow.isReady`, the
+same answer as the row's green dot. Each permission shows its own mark, and
+trying dictation, automatic recording and Open at login are not tasks to tick.
+Every tab is built with the window and only hidden, so a tab's `onAppear` runs
+once, when the window opens; what must happen on a switch of tabs watches
+`settings.settingsTab` (the scroll bar's flash, for one).
+
+**Two mutually exclusive recording modes.** `DictationCoordinator` (⌥Space) and
+`MeetingRecorder` (⌥⇧R) hold weak references to each other
+(`dictation.meetingPeer` is set in `MeetingRecorder.activate`) and refuse to
+start while the other is busy. Both need the microphone. The refusal shows even
+with the recording indicator turned off: `RecordingIndicator.visibleState` then
+keeps failures and conflict notices and hides only the plain ones.
+
+**Dictation flow:** `MicCapture` (an actor around `AVAudioEngine`, so
+`engine.start()` never blocks the main actor) → temporary CAF → engine →
+history → `TextInjector`. The history is written before delivery: audio and the
+JSONL line are one store operation (`saveDictation`), so clearing the history
+sees a dictation whole or not at all. If the history write fails, the text is
+still delivered and stays in the menu's unsaved dictations until quit; the
+temporary CAF is kept. If the recording breaks off (device change, write error),
+`MicCapture.stop` returns what was recorded as a `PartialRecording`: it is
+recognized and saved as raw CAF marked `interrupted` (and `recognition_failed`
+if recognition failed), but never pasted. A full recording that fails
+recognition takes the same path: a history line marked `recognition_failed`
+with the source CAF byte for byte (saved even with dictation audio off), or the
+menu's unsaved dictations if that save fails; the indicator says where the
+audio is, and if the model never became `.ready`, the reason goes to
+`modelFailure`. With Accessibility, the previous front
+app is activated and receives ⌘V, then the previous clipboard is restored unless
+`changeCount` shows someone else changed it; without Accessibility the text
+stays on the clipboard. Never lose text silently. The start is guarded by an
+attempt token (`startAttempt`) and an 8 s watchdog: a late success of a
+cancelled attempt is wound down instead of changing state. A dictation lasts at
+most 5 minutes (`maxRecordingSeconds`); the indicator counts down the last
+30 s, and a dictation stopped at the limit is recognized and delivered as usual,
+then an error-style banner (shown even with the indicator off) names the limit
+and the menu keeps saying so until the next dictation (`lastDictationHitLimit`,
+in memory).
+
+**Dictation readiness.** One function,
+`DictationCoordinator.readiness(modelDownloaded:microphoneGranted:modelState:modelFailure:)`,
+answers "will dictation work" for the menu's Dictation line and the Settings
+footer (`SettingsWindow.footerText` / `footerColor`, exhaustive `switch`es), in
+this order: model downloaded, then preparation failure, then microphone, then model
+state; only `.ready` is ready, and Accessibility is not part of it. A failed
+warm-up sets `modelFailure`, in memory only and guarded by the engine selection's
+generation; `retryModelPreparation()` is both "Try Again" and the path after a
+download.
+
+Hotkeys use KeyboardShortcuts (Carbon). The alternative double-press of a
+modifier uses `NSEvent` monitors, which need Accessibility but not Input
+Monitoring.
+
+**Quitting.** Every path — the Quit item, ⌘Q, logout and SIGTERM (the app turns
+the signal into `NSApp.terminate`) — reaches
+`AppDelegate.applicationShouldTerminate`. While recording, quitting has two
+phases: the first request gets `.terminateCancel`, recordings finish in the
+normal event loop, and after a confirmed save the app calls `NSApp.terminate`
+again (`.terminateNow`); without confirmation it keeps running and says why.
+`.terminateLater` is not used: AppKit would wait in a nested modal run loop
+inside `terminate`, and a call from a main-queue block (a main-actor task, the
+SIGTERM handler) keeps that loop from draining the main queue, so quit hung
+forever. The cost: logout or restart during a recording is cancelled by the
+first phase. The 20 s deadline is a separate timer, and on expiry quit is
+cancelled, not forced. Quit does not wait for the model: a dictation has a
+`DictationJob` with an ownership token; quit takes it, cancels recognition and
+saves the raw CAF itself (`recognition_skipped`), and the late pipeline neither
+saves a duplicate nor pastes nor deletes the source. What could not be saved
+stays in `pendingSaves` / `unconfirmedRecording`, blocks the next quit and is
+cleared only by success or by an explicit "Remove" / "Allow Quitting Without
+Confirmation" in the menu. Crashes, SIGKILL and power loss are not covered. The
+DEBUG probe mode `-QuitProbe` (`Sources/QuitProbe.swift`) and
+`MurmurlyUITests/QuitProbeTests` test this in a live process.
+
+A quit by the user (the Quit item, ⌘Q, the Dock, and Sparkle's quit after
+"Install and Relaunch") that would end work nothing redoes is cancelled with a
+banner that names it (`AppDelegate.QuitLoss`: a meeting transcription running
+or queued; the copy of a finished transcript into the chosen folder
+(`.transcriptCopy`: a transcribing `activeJob` with `isTranscribing` already
+false, no compression or move step yet and a copy folder set), which the
+launch-time scan never makes again; a meeting being recorded with "transcribe
+after stop", which quit saves but does not queue; a Files run; unsaved Files
+text). The same quit
+repeated within 10 s, with nothing new to lose, goes the usual way. Logout,
+restart, shutdown (`kAEQuitReason`) and SIGTERM do not wait for a person: they
+only log the loss. The route is `AppDelegate.route(quitReason:signalled:)`; the
+two Files cases come from `FilesModel.quitLosses` (`.fileTranscription` while a
+run goes, `.unsavedFileText` while `hasUnsavedText`), which `MenuBarLabel` sets
+as `AppDelegate.fileLosses` right after `attach`.
+
+**Meeting recording:** `SystemAudioCapture` (an actor) creates a Core Audio
+process tap (`AudioHardwareCreateProcessTap` plus a private aggregate device),
+so no Screen Recording permission is needed. The microphone is the aggregate's
+input device and the clock source, and one IOProc writes both tracks, so they
+share one clock; `MicCapture` is not involved. Output: `system.caf`,
+`microphone.caf` and an atomically written `metadata.json` in
+`~/Library/Application Support/Murmurly/Meetings/<yyyy-MM-dd HH-mm-ss> Meeting/`.
+**Separate tracks are the key design choice:** they give the recording source
+and the order of utterances (not speaker identity: the system track mixes
+everyone on the call, and the microphone may hear more than one person). A
+partial failure never discards the recording: the error carries
+`savedDirectory` and the user is told it was saved incompletely.
+After `stop`, both closed tracks are opened and measured by actual frames (the
+`ExtAudioFileWriteAsync` counter only counts what was queued): an unreadable
+track or a write/close error → `failed`; frames that differ from the queued
+count, tracks of different length, or audio length more than 2 s off the wall
+clock → `suspect`, with the reason in `issues`. A cycle in which one stream is
+missing or empty, or the two differ in frames (a Bluetooth headset dropping
+out), is left out of both tracks, so they stay aligned, and counted instead of
+failing the recording: the recording is then `suspect`, with the missing
+seconds by the clock, or with where it ended if the skipping lasted to the
+stop, and the clock check reports only audio longer than the clock.
+`metadata.json` also holds `frames` / `micFrames` (measured; absent means not
+measured) and `enqueuedFrames`. The warning stays in the menu, tied to its
+folder.
+
+**Automatic recording** (`MeetingWatchdog`, a 2 s tick). A meeting is a foreign
+process holding audio input: Core Audio reports
+`kAudioProcessPropertyIsRunningInput` per process without any permission or
+prompt. The watchdog acts on explicit `MeetingRecorder` events, not on guesses
+from state. Only the microphone holders of the session that was stopped are
+banned from restarting it (the snapshot is taken as the stop begins, before the
+save is awaited; without one, the session's known holders), and only the holders
+of a `capture.start` that actually failed — not a refusal because dictation is
+busy or permissions are missing. A ban lifts when the process releases the
+microphone. An automatic recording stops 30 s after the last holder lets go,
+when the Mac sleeps, or after 4 hours; the limit is checked before the snapshot
+is read. A manual start takes over the automatic attempt, so neither the 30 s
+stop nor the limit applies to it. Exclusions (`meetingExcludedBundleIDs`) keep
+an app from starting a recording; the app's own bundle ID is always excluded.
+The tap records the whole system mix, so an exclusion never removes sound.
+System Settings and its panes (`com.apple.systempreferences*` and
+`com.apple.*-Settings.extension`, as each pane runs as an extension process of
+its own) are never holders at all (`MeetingWatchdog.holders`), so they neither
+start nor prolong an automatic recording: Sound → Input holds the microphone for
+its level meter, and checking the microphone would otherwise record an empty
+meeting (on a first install, right after macOS's system audio prompt).
+The stop at the 4-hour limit reaches the recorder through the watchdog's own
+`requestLimitStop` (`stopFromWatchdog(atLimit: true)`); the recorder names the
+limit in `recordingWarning.issues` and shows the "saved with a warning" banner.
+That stays in memory: `metadata.json` describes the tracks' integrity, and the
+limit is not about the tracks.
+
+**Settings → Storage counts in two steps** (`ArchiveSnapshot.refresh`): this
+Mac's figures first, then the chosen folders, which may be on a network volume
+and are read off the main actor. Each publication checks that its task was not
+cancelled, so a late answer from a folder that is no longer chosen overwrites
+nothing. Until a folder answers, its previous figures stay, and the view matches
+them to the chosen folder by path, so another folder never borrows them. A
+failed count (`archiveFailure`) and the retry counter (`archiveRetry`, used by
+"Try Again" and "Move Now") live only in the window's state. Each folder has its
+own availability, and "Show in Finder" selects exactly the folder in its row.
+The window checks the chosen folders again when the app becomes active and when
+a volume is mounted or unmounted. Neither the meetings nor the transcripts
+folder may be the dictation archive or inside it: `chooseMeetingsFolder` and
+`chooseTranscriptsFolder` compare paths after resolving links and refuse with
+`.insideDictationArchive`, which Storage shows as a warning line.
+
+**Meeting transcription** (`MeetingTranscription.swift`). `MeetingTranscriber`
+finds speech with the Silero VAD, cuts each track into chunks, recognizes them
+with the selected engine, drops microphone chunks whose words mostly appear in
+the system track at the same time (echo; split on spaces, so it does nothing for
+languages written without them), and interleaves both tracks by time into
+`transcript.md` (never overwriting an existing one). `MeetingTranscriptionQueue`
+then compresses the tracks to 24-bit ALAC `.m4a`, verified sample by sample,
+can move finished meetings to a user-chosen folder, and can copy each transcript
+into another folder. The queue remembers where its own moves put each folder in
+this run (`movedTo`, in memory), and `location(of:)` looks there once the local
+folder is gone, so "Show Last Recording…" and the menu's warnings point at the
+moved meeting even after the folder setting changes. The Files tab uses
+`MeetingTranscriber.transcribeFile`: the same pipeline on one track, with work
+files only in a temporary folder, so nothing is created or deleted next to the
+user's file. A file run that breaks after at least one recognized line throws
+`Failure.fileCutShort` with those lines, the position and the reason, and the
+tab keeps them under a note; the user's cancel is still a `CancellationError`.
+
+Progress steps go `.reading` → `.detecting` → `.preparingModel` /
+`.waitingForEngine` → `.recognizing(track:done:total:)`, and the per-chunk ones
+come from inside the cache operation: the cache's progress callback feeds a
+local `AsyncStream` that the operation drains before it takes the result, so
+"recognizing" appears only once the engine is ready and no step arrives after
+the result. The meeting menu and the Files tab name the same steps.
+
+**The Files tab's state lives in the app.** `FilesModel` (in `ContentView.swift`)
+is created in `MurmurlyApp` with the other objects and handed to the window
+as an environment object, so closing the window neither stops a run nor loses
+its text; it is in memory only. `hasUnsavedText` compares `resultRevision`
+with `savedRevision` (copying is not saving), and is the one definition for the
+note under the text, the replace sheet and the quit warning. A new file or run
+over unsaved text only sets `pendingReplacement` and asks ("Save .md…",
+"Replace", "Cancel"); a `Replacement` carries the revision the user agreed to
+drop, so a newer result is never replaced unasked, and "Save .md…" replaces only
+after the write succeeded. The open and save panels are sheets on the tab's
+window (`beginSheetModal`), or, with no key window, an asynchronous `begin()`;
+never `runModal`: nested modal loops already hung quit and this tab once. The
+DEBUG probe `-FileProbeRoot <dir>` (`Sources/FileProbe.swift`) drives the tab in
+UI tests; with `-FileProbeRealPanels` the real panels open in that folder,
+otherwise saving goes through a gate that waits with `Task.sleep` and never holds
+the main thread.
+
+**Engines.** Parakeet TDT v3 through FluidAudio (the default) and Whisper
+through WhisperKit. `WhisperKitCache` (an actor, despite its name it serves both
+engines) keeps exactly one loaded engine per `EngineDescriptor` and serializes
+loads and decodes through a cancellation-aware FIFO with generations: changing
+the engine or model path is a hard boundary, and the old engine never becomes a
+fallback for a failed new load. WhisperKit types never leave the
+`WhisperKitEngine` actor; `WhisperEngine` returns only Sendable DTOs. The
+Whisper tokenizer is a separate Hugging Face repository; `WhisperTokenizerLocator`
+takes it from next to the model (`Models/openai/whisper-large-v3`) and checks it
+before WhisperKit would go to the network for it.
+
+**Language.** One setting, `dictationLanguage` (`"auto"` or an ISO code), and
+one function that builds the engine request, `SettingsSnapshot.decodeRequest`,
+for dictation, meetings and files. The pickers list the selected engine's
+languages (`DictationEngine.languages`: 25 European ones for Parakeet,
+WhisperKit's list for Whisper). A code the current engine does not know acts as
+Auto without rewriting the setting. For Parakeet the language is not a hint but
+FluidAudio's script filter: `ru` forbids Latin letters, so English terms come
+out in Cyrillic; on Auto Parakeet runs without a filter, chosen by measuring a
+Russian meeting recording: English terms stay in Latin letters and only a few
+short replies come out in Latin, while the filter would turn the terms into
+Cyrillic. In meetings and files
+on Auto, Whisper detects the language per chunk until the first recognized
+chunk longer than 5 s fixes it for the rest of the job; chunks are processed
+track by track, microphone first, so this is no detector of language changes
+during a call. Without a filter Parakeet writes `<unk>` for a few characters
+(the Russian letter yo, angle quotes); the engine strips that token. Settings
+has a search over the picker by name and code (`filteredLanguages`) that never
+hides Auto or the current choice; the menu shows Auto, the current language
+and "More Languages…". A language the selected engine does not know is
+explained under the picker (`fallbackNote`), and the setting stays.
+
+**Models are downloaded by the app.** `ModelDownloader`
+(`Sources/ModelDownloader.swift`) describes four models as data pinned to
+Hugging Face revisions, lists files through the HF API, writes them straight
+into `Models/.partial-<UUID>/` (sha256 for LFS files, size for the rest) and
+moves each model into place with one `rename(2)`, the tokenizer before Whisper.
+Readiness is the presence of the model files (`coremldata.bin`), not a stored
+flag. FluidAudio is held in `ModelHub.offlineMode` and WhisperKit loads with
+`download: false`, so the downloader is the only code that fetches models.
+Without a model, the dictation shortcut does not record but says where to get
+one; a meeting is still recorded and explains how to transcribe it later.
+
+**Updates.** Sparkle 2.10.0. `AppUpdater` (`Sources/AppUpdater.swift`) is the
+only place the app talks to Sparkle: the standard window with release notes and
+"Install and Relaunch", a daily check (`SUEnableAutomaticChecks`, so no consent
+question, and the first check right after the first launch), the menu item and
+the Updates group in the Permissions tab. Whether checks run is Sparkle's own
+setting (`automaticallyChecksForUpdates`); the app keeps no flag of its own.
+The feed URL, the download base and the public EdDSA key come from
+`MURMURLY_SU_*` in `Signing.xcconfig` (`//` starts an xcconfig comment, hence
+`https:/$()/…`), so a fork points them to its own releases. The controller is
+created with `startingUpdater: false` and `AppUpdater` calls `SPUUpdater.start()`
+itself: on failure the controller would show its alert through a nested modal
+run loop, so the reason goes to Settings and the log instead. With an empty key
+(a fork's, or one emptied in `Local.xcconfig`) the updater is never created, and
+a test process (`TestIsolation.isTestProcess`, the stage gate included) never
+creates it either: no feed, no windows.
+"Install and Relaunch" quits through the ordinary
+quit, so while `AppUpdater.busy` is true the delegate refuses the current
+attempt (`updaterShouldRelaunchApplication` → `relaunchNow()`): a meeting being
+recorded or saved, a dictation, a meeting transcription queued or under way,
+where a job that transcribes (`activeJob`) counts until it ends, its copy into
+the transcripts folder included, and a Files run (`files.$isTranscribing`; the
+`files:` parameter of `busy` is required, so it cannot be forgotten).
+Compression and moves of their own are not counted (the launch-time scan queues
+them again). Refused, Sparkle closes its window and keeps the prepared update:
+it installs at the next quit, and "Check for Updates…" or the daily check offer
+"Install and Relaunch" / "Install on Quit" again. Why the window closed is said
+by "The update will be installed when you quit the app" in the menu and the
+Updates group (`installsAtQuit`, in memory; "Install on Quit" in Sparkle's
+window keeps it, "Skip" clears it). Unsaved Files text is not in `busy`: it
+never ends by itself and would hold the update until saved. The relaunch then
+goes ahead, Sparkle's quit takes the user route and is cancelled by the Files
+warning, and `updaterWillRelaunchApplication` → `willRelaunch()` has already set
+`installsAtQuit`, so the menu and Settings say the update installs at the next
+quit. Postponing the relaunch instead (`shouldPostponeRelaunchForUpdate`) would
+leave Sparkle's "Ready to Install" window on screen, unclosable and with a dead
+button, for the whole call. `busy` reads the `@Published` streams, not the
+objects: `@Published` emits before the property changes. The answer is read
+when Sparkle asks; the hand-overs between recorder and queue run synchronously
+on the main actor, so the question never lands on the brief `false` between
+them. The feed is signed (`SURequireSignedFeed`) and the archive is checked
+before extraction (`SUVerifyUpdateBeforeExtraction`). `scripts/release.sh` runs
+`generate_appcast` on the verified DMG alone, signs with the key from the login
+keychain (or `SPARKLE_PRIVATE_KEY_FILE`) and links the DMG by the release tag
+`v<MARKETING_VERSION>`; Sparkle compares `CURRENT_PROJECT_VERSION`. How to create
+the key is in the script's header. Without Developer ID every update is a new
+CDHash, so macOS may ask for the permissions again.
+
+**Cancellation is end to end.** `FilesModel` keeps `runToken` /
+`activeRunToken` so a late progress callback cannot overwrite a final status;
+only the Cancel button stops a run, closing the window does not. If
+cancellation arrives after the transcription returns, the completed result is
+kept ("Cancelled — the text so far is above"); cancelling a transcription in
+progress does not keep its partial chunks.
+
+**`AppWindowController`** switches the activation policy: `.regular` (Dock
+icon) while a real window is open, `.accessory` otherwise. The recording
+indicator is an `NSPanel` and deliberately does not count as a real window, or
+the app would stick in the Dock for the whole dictation.
+
+**Appearance.** Settings → Permissions → Appearance offers Match System, Light
+and Dark (`ui.appearance`; Match System is the default and writes nothing).
+`AppDelegate.followAppearance(of:)` sets `NSApp.appearance` from the value the
+publisher sends; it is the first call in `MenuBarLabel`'s `.task`, so Getting
+Started already opens in the chosen look. Windows, sheets, panels and the menu
+follow it; the recording indicator draws fixed colours and stays dark.
+
+**`PermissionManager` polls instead of subscribing.** There is no reliable
+public notification for Accessibility trust changes, so it polls every 3 s while
+something is missing and refreshes on app activation;
+`com.apple.accessibility.api` is only an extra trigger, never the source of
+truth. The native Accessibility prompt never appears at launch on a first
+install (Getting Started explains that the permission is optional first). It
+appears once at the first launch of a new version (`CFBundleVersion`) if the
+grant is missing, because without Developer ID an update loses it; the version
+is kept in `permissions.accessibilityPromptedVersion`, a value for the system
+prompt, not a window flag. Otherwise only a button in the menu or Settings
+asks. The system audio "Check…"
+button only creates and destroys a process tap
+(`SystemAudioCapture.canCreateProcessTap`): that proves a source can be created,
+not that recording is allowed. macOS asks for system audio at the first meeting
+recording, so Settings never shows it as granted. Never trigger permission
+prompts from the dictation shortcut: an `.accessory` app cannot present them
+reliably and the hot path may hang.
+
+**Logs:** `~/Library/Logs/Murmurly/murmurly.log` plus `os.Logger`; one
+generation (`.old.log`) is kept, rotated at launch above 5 MB. Log lines contain
+file names and paths.
+
+**Test processes are isolated** (`Sources/TestIsolation.swift`). A test process
+is one launched with `-UITesting`, `-UITestSettingsStore` or with XCTest
+injected. Any test process skips the launch-time permission prompt, model
+warm-up, Getting Started and the login item. In DEBUG it is also isolated: no
+global shortcuts or `NSEvent` monitors, no reading of the Core Audio process
+list (the watchdog starts nothing), and archives, log and settings in its own
+`$TMPDIR/Murmurly-test-<UUID>` (settings in `settings.plist` there, nothing in
+`~/Library/Preferences`); KeyboardShortcuts' initial shortcuts are not written to
+the standard domain. The exception is reading shortcuts: KeyboardShortcuts reads
+only `UserDefaults.standard`, which for the unit-test host is the app's own,
+live domain, so a test sets a shortcut only in the process's volatile argument
+domain (`IndicatorTests.withMeetingShortcut`), never by writing a domain. The
+`MurmurlyStageGate` scheme sets `MURMURLY_PRODUCTION_SERVICES=1` to opt
+out of the isolation, so its cold launch is the app as shipped. Release builds
+have no isolation at all.
+
+## Dictation archive
+
+The root is `~/Library/Application Support/Murmurly/Dictations/`, created
+with mode `0700`, files `0600`. `history.jsonl` is append-only JSONL, one
+`DictationHistoryEntry` per line: an open format for ordinary scripts. A last
+line without a trailing newline is parsed like any other.
+
+After every actual change to the index (line appended, entry deleted, history
+cleared — even if removing the audio then failed) the store posts
+`dictationHistoryDidChange` with itself as the `object`. Every consumer (the
+list and search, Settings statistics, the recent menu) keeps a
+`DictationHistoryChanges` for that store, created before its first read, and
+re-reads on its revision; the menu is replaced with a fresh snapshot, never
+patched by hand. History reports a failed read or count in the tab, with "Try
+Again" (`DictationHistoryViewModel.readFailure`); sheets are only for actions
+(delete, clear, play).
+
+**Clear All removes only what the archive writes**
+(`DictationHistoryStore+Mutation.swift`): it empties the index, deletes the
+files `ownedFiles(in:)` names — audio at `<yyyy>/<MM>/<UUID>.caf|m4a` (a
+four-digit year, a month 01–12) and leftover `.history-<UUID>.tmp` in the root —
+and then removes month and year folders only if nothing is left in them.
+Ownership is determined by the path and filename, not by the file's origin. A
+meeting moved there under an earlier setting, a note or any other file stays;
+links to year or month folders are not followed. A folder that cannot be read
+fails the clear instead of passing for empty. The clear button stays enabled
+while the index has lines or the archive has a file of its own
+(`ArchiveSnapshot.hasDictationFiles`), so a clear that failed halfway can be
+finished.
+
+No absolute paths in the JSONL. `audio_path` is empty when audio is not saved;
+otherwise it is relative to `Dictations/`, with audio in dated subfolders.
+Moving the whole folder to another Mac or disk must be enough, without
+rewriting the JSONL.
+
+Saving dictation audio is off by default: the text is indexed with an empty
+`audio_path` and the temporary CAF is deleted only after the history write
+succeeds. After a recognition failure, a cut-off or a quit, the audio is saved
+regardless of the switch. Saved audio is m4a with **mono 24-bit ALAC at the
+microphone's own sample rate**, lossless so the archive can be listened to; if
+conversion fails, the original CAF is kept. The format is defined in exactly one
+place: `DictationHistoryStore.dictationArchiveFormatID` in
+`Sources/Dictation/DictationAudioArchive.swift`. Before encoding, every buffer and
+channel is checked for Float32 in `[-1, 1]`: a peak outside, a non-numeric sample
+or an unverifiable format keeps the file as a byte-for-byte CAF, because 24-bit
+ALAC would clip it silently.
+
+## Verified on real hardware
+
+- The microphone starts up to ~2 s after the system tap. That is normal; both
+  tracks share one clock, and `metadata.json` marks real mismatches `suspect`.
+- A process tap's stream declares the tap's own rate even when the aggregate
+  resamples it. With AirPods in headset mode the microphone, the aggregate's
+  clock, runs at 24 kHz, and the tap stream still says 48 kHz while 24 kHz
+  arrive, 480 frames a cycle on both. Both files therefore take the aggregate's
+  nominal rate (`SystemAudioCapture.trackFormats`), and the IOProc's
+  equal-frames check guards it while recording. AirPods also have a 48 kHz
+  two-way mode, so a meeting with them is recorded at 24 or 48 kHz.
+- Whisper produces stock subtitle phrases on silence. Known ones are dropped
+  (`WhisperSegmentDTO.removingKnownSubtitleHallucinations`), and WhisperKit runs
+  with `chunkingStrategy: .vad`: its default strategy hallucinated a segment and
+  silently skipped real speech after it.
+- `.defaultLaunchBehavior(.presented)` no longer reliably materializes a window
+  under XCUITest on current macOS; UI tests open Settings through the menu bar.
+
+## Conventions
+
+- Code comments are in English and explain *why*, not *what*.
+- Interface text: English is the base language and the catalog key is the
+  English text itself; translations live in the String Catalogs
+  `Resources/Localizable.xcstrings` and `Resources/InfoPlist.xcstrings`.
+  SwiftUI literals go through `LocalizedStringKey`, strings built in code
+  through `String(localized:)`, plurals through the catalog. Russian is
+  reviewed (`translated`); machine translations stay `needs_review` until a
+  native speaker checks them, so mark a new machine translation the same way.
+  Never translate `UserDefaults` keys, `state` values in `metadata.json`, file
+  names (the folder suffix ` Meeting` and the transcript copy `… Meeting.md`
+  included) or log messages, and never branch on displayed text. Both test
+  schemes pass `-AppleLanguages (en)` and `-AppleLocale en_US`; UI tests find
+  elements by `accessibilityIdentifier`, and `TEST_RUNNER_MURMURLY_UI_LOCALE`
+  (for example `de_DE`) runs them against a translated interface.
+- **No stored flag decides whether a window is shown.** A persisted "show the
+  window" flag once caused an endless open/close loop. Getting Started, for
+  example, is shown when the automatic-recording preference does not exist yet,
+  and that key is written before the window opens.
+- Keep it simple: plain code in the existing types; a new type or file only when
+  there is no other way. Remove dead code rather than work around it.
+- Write tests at the seams where parts meet (settings → coordinator, recorder →
+  watchdog), not only inside the part you just wrote.
+- A bug fix comes with a test that fails without the fix. If a test cannot show
+  the bug, say so and describe how it was checked by hand.

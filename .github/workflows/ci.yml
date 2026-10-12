@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  unit-tests:
+    # Xcode 26 is required: KeyboardShortcuts 3 uses swift-tools 6.2 and the app
+    # uses the macOS 26 SDK CoreAudio overlay. UI tests need focus and privacy
+    # grants a hosted runner cannot give, so CI runs the unit suite only.
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: xcodebuild -version
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate the Xcode project
+        run: xcodegen generate
+
+      - name: Build and run unit tests (ad-hoc signing)
+        run: |
+          set -o pipefail
+          mkdir -p .build
+          xcodebuild \
+            -project Murmurly.xcodeproj \
+            -scheme Murmurly \
+            -destination 'platform=macOS,arch=arm64' \
+            -derivedDataPath .build/ci-derived-data \
+            -only-testing:MurmurlyTests \
+            test 2>&1 | tee .build/ci-test.log
+          # A green run must have executed tests: "Executed 0 tests" is a failure.
+          grep -E "Executed [1-9][0-9]* tests?, with 0 failures" .build/ci-test.log

@@ -1,0 +1,162 @@
+{
+  "sourceLanguage" : "en",
+  "strings" : {
+    "NSAudioCaptureUsageDescription" : {
+      "comment" : "Privacy - Audio Capture Usage Description",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "Nimmt den Systemton eines Meetings für die Transkription auf diesem Mac auf."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Records a meeting’s system audio for transcription on this Mac."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "Graba el audio del sistema de una reunión para transcribirlo en este Mac."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "Enregistre le son du système d’une réunion pour le transcrire sur ce Mac."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "Registra l’audio di sistema di una riunione per trascriverlo su questo Mac."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "ミーティングのシステムオーディオを録音し、この Mac 上で文字起こしします。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "이 Mac에서 텍스트로 변환하기 위해 회의의 시스템 오디오를 녹음합니다."
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "Nagrywa dźwięk systemowy spotkania na potrzeby transkrypcji na tym Macu."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "Grava o áudio do sistema de uma reunião para transcrição neste Mac."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Запись системного звука созвона для локальной транскрипции"
+          }
+        },
+        "uk" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "Записує системний звук зустрічі для розшифрування на цьому Mac."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "在这台 Mac 上录制会议的系统音频，以便进行转写。"
+          }
+        }
+      }
+    },
+    "NSMicrophoneUsageDescription" : {
+      "comment" : "Privacy - Microphone Usage Description",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "Nimmt Audio für die Transkription auf diesem Mac und für die separate Mikrofonspur eines Meetings auf."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Records audio for transcription on this Mac and for a meeting’s separate microphone track."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "Graba audio para transcribirlo en este Mac y para la pista de micrófono independiente de una reunión."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "Enregistre l’audio pour le transcrire sur ce Mac et pour la piste micro séparée d’une réunion."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "Registra l’audio per la trascrizione su questo Mac e per la traccia separata del microfono di una riunione."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "この Mac 上での文字起こしと、ミーティングのマイク専用トラックのためにオーディオを録音します。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "이 Mac에서 텍스트로 변환하고 회의의 별도 마이크 트랙을 만들기 위해 오디오를 녹음합니다."
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "Nagrywa dźwięk na potrzeby transkrypcji na tym Macu oraz osobnej ścieżki mikrofonu podczas spotkania."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "Grava áudio para transcrição neste Mac e para a faixa separada do microfone de uma reunião."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Запись звука для локальной транскрипции и отдельной дорожки созвона"
+          }
+        },
+        "uk" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "Записує звук для розшифрування на цьому Mac і для окремої доріжки мікрофона в записі зустрічі."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "在这台 Mac 上录制音频以便转写，并为会议录制单独的麦克风音轨。"
+          }
+        }
+      }
+    }
+  },
+  "version" : "1.0"
+}

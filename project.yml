@@ -1,0 +1,157 @@
+name: Murmurly
+options:
+  bundleIdPrefix: io.github.spacevibes365
+  # English is the base language; other languages come from the string catalogs.
+  developmentLanguage: en
+  deploymentTarget:
+    macOS: "15.0"
+configFiles:
+  Debug: Signing.xcconfig
+  Release: Signing.xcconfig
+settings:
+  base:
+    MARKETING_VERSION: "0.1"
+    CURRENT_PROJECT_VERSION: "1"
+    GENERATE_INFOPLIST_FILE: YES
+    # The Core ML models need Apple Silicon; an Intel slice would only be dead weight.
+    ARCHS: arm64
+    # Sandbox stays off for now: the process tap, Accessibility paste and
+    # user-chosen meeting folders need their own design before it can be enabled.
+    ENABLE_APP_SANDBOX: NO
+    INFOPLIST_KEY_LSApplicationCategoryType: "public.app-category.productivity"
+packages:
+  WhisperKit:
+    url: https://github.com/argmaxinc/WhisperKit
+    exactVersion: 1.0.0
+  KeyboardShortcuts:
+    url: https://github.com/sindresorhus/KeyboardShortcuts
+    exactVersion: 3.0.1
+  FluidAudio:
+    url: https://github.com/FluidInference/FluidAudio.git
+    exactVersion: 0.15.5
+  Sparkle:
+    url: https://github.com/sparkle-project/Sparkle
+    exactVersion: 2.10.0
+targets:
+  Murmurly:
+    type: application
+    platform: macOS
+    sources:
+      - Sources
+      - Resources/Assets.xcassets
+      # The interface text and the Info.plist permission texts, with translations.
+      - Resources/Localizable.xcstrings
+      - Resources/InfoPlist.xcstrings
+      # Licenses travel with the binary, not only with the source.
+      - path: THIRD_PARTY_NOTICES.md
+        buildPhase: resources
+    dependencies:
+      - package: WhisperKit
+      - package: KeyboardShortcuts
+      - package: FluidAudio
+      - package: Sparkle
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.github.spacevibes365.Murmurly
+        PRODUCT_NAME: Murmurly
+        # The compiler lists every localizable literal, so a build can bring
+        # the string catalog up to date (`xcstringstool sync`).
+        SWIFT_EMIT_LOC_STRINGS: YES
+        LOCALIZATION_PREFERS_STRING_CATALOGS: YES
+        GENERATE_INFOPLIST_FILE: NO
+        INFOPLIST_FILE: Murmurly-Info.plist
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        CODE_SIGN_STYLE: Manual
+        # Ad-hoc unless Local.xcconfig names a certificate (see Signing.xcconfig).
+        CODE_SIGN_IDENTITY: $(MURMURLY_CODE_SIGN_IDENTITY)
+        ENABLE_HARDENED_RUNTIME: YES
+        CODE_SIGN_ENTITLEMENTS: Murmurly.entitlements
+        # This app has no AppIntents dependency. Silence Xcode's metadata
+        # extractor warning for that expected case without suppressing compiler warnings.
+        LM_FILTER_WARNINGS: YES
+        SWIFT_VERSION: "6.0"
+        SWIFT_STRICT_CONCURRENCY: complete
+        GCC_TREAT_WARNINGS_AS_ERRORS: YES
+        SWIFT_TREAT_WARNINGS_AS_ERRORS: YES
+      configs:
+        Debug:
+          # XCTest loads Murmurly.debug.dylib and injected test frameworks.
+          # Ad-hoc and self-signed identities have no TeamIdentifier, so library
+          # validation cannot establish the same-team relationship in Debug.
+          ENABLE_HARDENED_RUNTIME: NO
+  MurmurlyTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - Tests/MurmurlyTests
+    dependencies:
+      - target: Murmurly
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.github.spacevibes365.MurmurlyTests
+        LM_FILTER_WARNINGS: YES
+        SWIFT_VERSION: "6.0"
+        SWIFT_STRICT_CONCURRENCY: complete
+        GCC_TREAT_WARNINGS_AS_ERRORS: YES
+        SWIFT_TREAT_WARNINGS_AS_ERRORS: YES
+  MurmurlyUITests:
+    type: bundle.ui-testing
+    platform: macOS
+    sources:
+      - Tests/MurmurlyUITests
+    dependencies:
+      - target: Murmurly
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.github.spacevibes365.MurmurlyUITests
+        LM_FILTER_WARNINGS: YES
+        SWIFT_VERSION: "6.0"
+        SWIFT_STRICT_CONCURRENCY: complete
+        GCC_TREAT_WARNINGS_AS_ERRORS: YES
+        SWIFT_TREAT_WARNINGS_AS_ERRORS: YES
+  MurmurlyStageGateTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - Tests/MurmurlyStageGateTests
+    dependencies:
+      - target: Murmurly
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.github.spacevibes365.MurmurlyStageGateTests
+        LM_FILTER_WARNINGS: YES
+        SWIFT_VERSION: "6.0"
+        SWIFT_STRICT_CONCURRENCY: complete
+        GCC_TREAT_WARNINGS_AS_ERRORS: YES
+        SWIFT_TREAT_WARNINGS_AS_ERRORS: YES
+schemes:
+  Murmurly:
+    build:
+      targets:
+        Murmurly: all
+        MurmurlyTests: [test]
+        MurmurlyUITests: [test]
+    test:
+      # Tests expect the English base text and US number and date formats,
+      # whatever the machine's language and region.
+      commandLineArguments:
+        "-AppleLanguages (en)": true
+        "-AppleLocale en_US": true
+      targets:
+        - MurmurlyTests
+        - MurmurlyUITests
+  MurmurlyStageGate:
+    build:
+      targets:
+        Murmurly: all
+        MurmurlyStageGateTests: [test]
+    test:
+      # The stage gate runs the app as shipped: real hotkeys, process snapshot,
+      # archives and log (see Sources/TestIsolation.swift).
+      environmentVariables:
+        MURMURLY_PRODUCTION_SERVICES: "1"
+      commandLineArguments:
+        "-AppleLanguages (en)": true
+        "-AppleLocale en_US": true
+      targets:
+        - MurmurlyStageGateTests

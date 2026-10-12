@@ -1,0 +1,30 @@
+// Code signing for builds from a fresh clone.
+//
+// The default is ad-hoc ("Sign to Run Locally"): it needs no certificate, but
+// macOS ties privacy grants (Microphone, Accessibility, system audio) to the
+// exact binary, so they are asked for again after every rebuild.
+//
+// A stable certificate from your login keychain keeps most grants across
+// rebuilds; without a Team ID, Accessibility may still have to be re-enabled
+// after an update. Create Local.xcconfig next to this file (git ignores it):
+//
+//     MURMURLY_CODE_SIGN_IDENTITY = My Code Signing Certificate
+//
+// The app target reads this variable instead of setting CODE_SIGN_IDENTITY
+// itself, so the override works even though target settings outrank xcconfigs.
+MURMURLY_CODE_SIGN_IDENTITY = -
+
+// Automatic updates (Sparkle). Murmurly-Info.plist reads the feed and the
+// public EdDSA key from here; scripts/release.sh points the appcast entry at
+// MURMURLY_SU_DOWNLOAD_BASE + MARKETING_VERSION + "/" + the DMG name, that
+// is the release tagged v<version>. A fork sets its own three values.
+// With an empty key the updater does not start: put an empty
+// MURMURLY_SU_PUBLIC_KEY into Local.xcconfig to keep updates off in a build of
+// your own. How to create a key is described in scripts/release.sh.
+// "//" starts a comment in an xcconfig, hence "https:/$()/" in the URLs;
+// a key that happens to contain "//" needs the same "/$()/".
+MURMURLY_SU_FEED_URL = https:/$()/github.com/spacevibes365/Murmurly/releases/latest/download/appcast.xml
+MURMURLY_SU_DOWNLOAD_BASE = https:/$()/github.com/spacevibes365/Murmurly/releases/download/v
+MURMURLY_SU_PUBLIC_KEY = 9cbGdLERnxi+8EF18/NaYF9QZIUvq+RA0EYtnTCF4cE=
+
+#include? "Local.xcconfig"
