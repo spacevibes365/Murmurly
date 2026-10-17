@@ -1815,8 +1815,14 @@ final class MeetingTranscriptionQueue: ObservableObject {
                 let answered = Once()
                 DispatchQueue(label: "meeting-audio-count \(path)", qos: .utility).async { [weak self] in
                     let counted = countAudio(root, local, days, now)
-                    if answered.claim() { continuation.resume(returning: counted) }
-                    DispatchQueue.main.async { MainActor.assumeIsolated { _ = self?.countingRoots.remove(path) } }
+                    // The root is free again before its answer is taken: a count
+                    // asked again at once (the meetings folder changed under this
+                    // one) reads it instead of finding it still being counted.
+                    // Two separate hops to the main actor keep no order.
+                    DispatchQueue.main.async {
+                        MainActor.assumeIsolated { _ = self?.countingRoots.remove(path) }
+                        if answered.claim() { continuation.resume(returning: counted) }
+                    }
                 }
                 if let limit {
                     let seconds = Double(limit.components.seconds) + Double(limit.components.attoseconds) / 1e18
