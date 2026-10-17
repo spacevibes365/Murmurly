@@ -1939,6 +1939,7 @@ final class MeetingTranscriptionTests: XCTestCase {
 
     /// "Meetings" and "Files" are switches of their own.
     func testMeetingsAndFilesFollowTheirOwnSwitches() async throws {
+        try MacOSRussianWordForms.require()
         let settings = try isolatedSettings()
         try settings.saveDictionary([DictionaryEntry(heard: ["клод код"], written: "Claude Code")])
         let factory = LevelEngineFactory(replies: [0.1: "у клода кода"])
@@ -2359,6 +2360,7 @@ final class MeetingTranscriptionTests: XCTestCase {
     /// meeting on Auto replace it. An exact spelling is replaced either way,
     /// and the meetings switch still turns every replacement off.
     func testDictionaryWordFormsFollowTheJobsLanguage() async throws {
+        try MacOSRussianWordForms.require()
         let settings = try isolatedSettings()
         try settings.saveDictionary([DictionaryEntry(heard: ["клод код"], written: "Claude Code")])
         let factory = LevelEngineFactory(replies: [0.1: "у клода кода", 0.5: "клод код"])
@@ -3158,6 +3160,7 @@ final class MeetingTranscriptionTests: XCTestCase {
     /// while the settings say Russian, one on Auto is. An exact spelling is
     /// replaced either way, and the Files switch turns it all off.
     func testFilesDictionaryWordFormsFollowTheRunsLanguage() async throws {
+        try MacOSRussianWordForms.require()
         let settings = try isolatedSettings()
         try settings.saveDictionary([DictionaryEntry(heard: ["клод код"], written: "Claude Code")])
         let factory = LevelEngineFactory(replies: [0.1: "у клода кода", 0.5: "клод код"])

@@ -3,6 +3,18 @@ import SwiftUI
 import XCTest
 @testable import Murmurly
 
+/// macOS gives Russian word forms only from its Russian language data, which a
+/// fresh Mac (a hosted CI runner) may not have yet. The tests of those forms
+/// skip there, naming the reason, rather than fail on a machine that cannot
+/// tell; where the data is present they check the forms as before.
+enum MacOSRussianWordForms {
+    static let available = DictionaryReplacer.macOSWordForms()("клода").lowercased() == "клод"
+
+    static func require() throws {
+        try XCTSkipUnless(available, "macOS gives no Russian word forms on this Mac (\"клода\" has no dictionary form): its Russian language data is not here")
+    }
+}
+
 final class PersonalDictionaryTests: XCTestCase {
     private func entry(_ heard: String, _ written: String, enabled: Bool = true) -> DictionaryEntry {
         DictionaryEntry(heard: DictionaryEntry.variants(fromList: heard), written: written, isEnabled: enabled)
@@ -190,7 +202,8 @@ final class PersonalDictionaryTests: XCTestCase {
 
     // MARK: - macOS word forms (must hold on every supported macOS)
 
-    func testMacOSFormsOfClaudeCode() {
+    func testMacOSFormsOfClaudeCode() throws {
+        try MacOSRussianWordForms.require()
         let real = DictionaryReplacer(entries: [claudeCode], matchesWordForms: true)
         XCTAssertEqual(real.replacing(in: "у клода кода").text, "у Claude Code")
         XCTAssertEqual(real.replacing(in: "клоду коду").text, "Claude Code")
@@ -199,13 +212,15 @@ final class PersonalDictionaryTests: XCTestCase {
     }
 
     /// Without the language set on the tagger these two words get no form.
-    func testMacOSFormsOfAShortDictation() {
+    func testMacOSFormsOfAShortDictation() throws {
+        try MacOSRussianWordForms.require()
         let real = DictionaryReplacer(entries: [claudeCode], matchesWordForms: true)
         XCTAssertEqual(real.replacing(in: "клода кода").text, "Claude Code")
     }
 
     /// Tagged in a sentence, a capitalised "Кода" is its own form.
-    func testMacOSFormsOfCapitalisedWords() {
+    func testMacOSFormsOfCapitalisedWords() throws {
+        try MacOSRussianWordForms.require()
         let real = DictionaryReplacer(entries: [claudeCode], matchesWordForms: true)
         XCTAssertEqual(real.replacing(in: "Клода Кода").text, "Claude Code")
     }
@@ -429,7 +444,8 @@ final class DictionaryStorageTests: XCTestCase {
 
     /// The flag comes from the same answer as the engine request: Auto, an
     /// empty code and one the engine does not know all mean "auto".
-    func testWordFormsFollowTheLanguageTheEngineIsAskedFor() {
+    func testWordFormsFollowTheLanguageTheEngineIsAskedFor() throws {
+        try MacOSRussianWordForms.require()
         let store = SettingsStore(defaults: defaults)
         let cases: [(DictationEngine, String, Bool)] = [
             (.parakeet, "auto", true), (.parakeet, "ru", true), (.parakeet, "", true),
@@ -874,6 +890,7 @@ final class DictationDictionaryTests: XCTestCase {
     private let claudeCode = DictionaryEntry(heard: ["клод код"], written: "Claude Code")
 
     func testDictationSavesAndPastesTheReplacedTextAndKeepsTheRecognizedOne() async throws {
+        try MacOSRussianWordForms.require()
         let fixture = try DictationPipelineFixture(text: " у клода кода готово ")
         defer { fixture.cleanup() }
         try fixture.settings.saveDictionary([claudeCode])
@@ -891,6 +908,7 @@ final class DictationDictionaryTests: XCTestCase {
 
     /// Without saved audio the line still carries both texts.
     func testRecognizedTextIsKeptWithDictationAudioOff() async throws {
+        try MacOSRussianWordForms.require()
         let fixture = try DictationPipelineFixture(text: "у клода кода")
         defer { fixture.cleanup() }
         fixture.settings.saveDictationAudio = false
@@ -1101,6 +1119,7 @@ final class DictionarySheetTests: XCTestCase {
     }
 
     func testPreviewFollowsALanguageChosenWhileTheSheetIsOpen() async throws {
+        try MacOSRussianWordForms.require()
         let settings = SettingsStore(defaults: defaults)
         // Ukrainian turns Russian word forms off: the example stays as it is.
         settings.dictationLanguage = "uk"

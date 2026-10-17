@@ -85,6 +85,10 @@ plain default window.
   `testCommandCommaOpensSettingsWithoutExistingWindow` skips itself; other UI
   tests open Settings from the menu bar and type only digits. After touching
   scenes or the Settings command, run the UI tests once on a Latin layout.
+- **Russian word forms need macOS's Russian language data.** The dictionary's
+  word forms come from `NLTagger`; on a Mac without that data (a fresh hosted
+  CI runner) the tests of those forms skip themselves (`MacOSRussianWordForms`)
+  and say why. There a skip is expected; on a Mac with Russian set up they run.
 - **`Timed out while enabling automation mode`** with no `Executed N tests` line
   at all is a hung `testmanagerd`, not a code problem. It ignores SIGTERM:
   `kill -9` it (launchd restarts it on demand) and check with `ps -p <pid>`.
