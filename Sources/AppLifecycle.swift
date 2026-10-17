@@ -27,6 +27,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case recordingToTranscribe
         case fileTranscription
         case unsavedFileText
+        /// A meeting's name, star or speakers' names the user set, still
+        /// being written to a folder that is not on this Mac.
+        case unsavedMeetingMark
+        /// A meeting's transcript being written to the file the user chose.
+        case transcriptFile
 
         /// Alone in the pill: what is lost and the way out.
         var warning: String {
@@ -41,6 +46,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 String(localized: "A file is being transcribed in Files — quit again to stop it")
             case .unsavedFileText:
                 String(localized: "Files has unsaved text — save it as .md, or quit again to discard it")
+            case .unsavedMeetingMark:
+                String(localized: "A meeting’s changes aren’t saved yet — quit again to lose them")
+            case .transcriptFile:
+                String(localized: "A transcript is being saved as a file — quit again to stop; the file may not be written")
             }
         }
 
@@ -52,6 +61,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             case .recordingToTranscribe: String(localized: "transcription of this meeting")
             case .fileTranscription: String(localized: "file transcription")
             case .unsavedFileText: String(localized: "unsaved Files text")
+            case .unsavedMeetingMark: String(localized: "changes to a meeting")
+            case .transcriptFile: String(localized: "a transcript being saved as a file")
             }
         }
     }
@@ -70,6 +81,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
     /// What Files would lose; empty until Files is wired in.
     var fileLosses: @MainActor () -> Set<QuitLoss> = { [] }
+    /// What the meetings window would lose: a meeting's changes not saved
+    /// yet, a transcript being saved as a file.
+    var meetingLosses: @MainActor () -> Set<QuitLoss> = { [] }
+    /// Opens or raises the main window; set by the menu bar label, which can
+    /// open windows. Nothing until then.
+    var showMainWindow: @MainActor () -> Void = {}
     /// A warned quit repeated within this time, losing nothing new, goes
     /// ahead. A consent that never expired would let a later quit end new work.
     var repeatWindow: Duration = .seconds(10)
@@ -107,6 +124,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         source.resume()
         signalSource = source
+    }
+
+    /// The app opened again while it runs (Finder, Launchpad, the Dock): the
+    /// main window, opened or raised, whatever else is on screen. Settings
+    /// open and the meetings out of sight is the case this is for. Handled
+    /// here, so SwiftUI opens nothing of its own.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows: Bool) -> Bool {
+        AppLog.info("app", "reopened; showing the main window")
+        showMainWindow()
+        return false
     }
 
     /// The chosen look for every window, sheet and menu, from now on. Called
@@ -201,7 +228,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func quitLosses() -> Set<QuitLoss> {
-        var losses = fileLosses()
+        var losses = fileLosses().union(meetingLosses())
         if let transcripts = meeting?.transcripts {
             if transcripts.isTranscribing || transcripts.pending.contains(where: \.transcribe) {
                 losses.insert(.meetingTranscription)
@@ -320,15 +347,24 @@ enum AppWindowController {
     /// A folder picked in a panel shown over every other app. After the menu
     /// has closed: an accessory app's panel would otherwise open behind other
     /// apps' windows. Not `runModal`: nested modal loops already cost the
-    /// quit path and the Files tab.
+    /// quit path and the Files tab. An accessory view is shown open, and the
+    /// delegate may refuse the choice; the caller keeps both alive until the
+    /// completion, which the panel holds. It needs no window: the menu asks
+    /// with none open. No test process opens it: `begin`, AppKit's last
+    /// call, comes only after this process's rule, which a test checks with
+    /// a `begin` that counts. `show` is a test's own stand-in for the whole
+    /// of it, to see the panel that would be shown.
     static func chooseFolder(
         message: String,
         prompt: String,
         directory: URL?,
+        accessory: NSView? = nil,
+        delegate: (any NSOpenSavePanelDelegate)? = nil,
+        begin: @escaping FolderPanel = AppWindowController.begin,
+        show: FolderPanel? = nil,
         completion: @escaping @MainActor (URL) -> Void
     ) {
         DispatchQueue.main.async {
-            enterRegular()
             let panel = NSOpenPanel()
             panel.canChooseDirectories = true
             panel.canChooseFiles = false
@@ -337,12 +373,31 @@ enum AppWindowController {
             panel.directoryURL = directory
             panel.message = message
             panel.prompt = prompt
-            panel.begin { response in
-                MainActor.assumeIsolated {
-                    defer { windowDidClose() }
-                    guard response == .OK, let url = panel.url else { return }
-                    completion(url)
-                }
+            panel.accessoryView = accessory
+            panel.isAccessoryViewDisclosed = accessory != nil
+            panel.delegate = delegate
+            (show ?? folderPanels(testProcess: TestIsolation.isTestProcess, begin: begin))(panel, completion)
+        }
+    }
+
+    /// Shows a folder panel and hands its folder on.
+    typealias FolderPanel = @MainActor (_ panel: NSOpenPanel, _ completion: @escaping @MainActor (URL) -> Void) -> Void
+
+    /// AppKit's panel outside tests; a test process never opens one,
+    /// whatever it was told.
+    static func folderPanels(testProcess: Bool, begin: @escaping FolderPanel) -> FolderPanel {
+        guard testProcess else { return begin }
+        return { panel, _ in AppLog.info("app", "no folder panel in a test process: \(panel.message ?? "")") }
+    }
+
+    /// The folder panel itself, over every other app.
+    static func begin(_ panel: NSOpenPanel, completion: @escaping @MainActor (URL) -> Void) {
+        enterRegular()
+        panel.begin { response in
+            MainActor.assumeIsolated {
+                defer { windowDidClose() }
+                guard response == .OK, let url = panel.url else { return }
+                completion(url)
             }
         }
     }

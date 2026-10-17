@@ -4,6 +4,7 @@ import SwiftUI
 
 struct MeetingsSettingsView: View {
     @EnvironmentObject private var settings: SettingsStore
+    @EnvironmentObject private var meetingTranscripts: MeetingTranscriptionQueue
     var automaticOnly = false
     /// Its number among the Getting Started steps.
     var step: Int?
@@ -46,7 +47,52 @@ struct MeetingsSettingsView: View {
                     ) { settings.meetingAfterStop = .transcribe }
                     .accessibilityIdentifier("meetingAfterStopTranscribe")
                 }
+                audioRule
             }
+        }
+        .sheet(item: Binding(
+            get: { automaticOnly ? nil : meetingTranscripts.audioQuestion },
+            set: { if $0 == nil { meetingTranscripts.cancelAudioQuestion() } }
+        )) { question in
+            AudioRuleQuestion(question: question)
+        }
+    }
+
+    /// Keep a meeting's audio, or delete it some days after its full
+    /// transcription. A choice that deletes is asked about first, always;
+    /// the setting changes only on yes.
+    private var audioRule: some View {
+        SettingsGroup("Meeting audio") {
+            ForEach(MeetingAudioRetention.allCases, id: \.self) { choice in
+                if choice != .keep { Divider().padding(.leading, SettingsChrome.dividerLeadingPadding) }
+                MeetingRadioRow(
+                    title: Self.title(of: choice),
+                    selected: settings.meetingAudioRetention == choice
+                ) {
+                    guard choice != settings.meetingAudioRetention else { return }
+                    meetingTranscripts.askAudioRetention(days: choice.rawValue)
+                }
+                .accessibilityIdentifier("meetingAudioRule.\(choice.rawValue)")
+            }
+            Group {
+                if let days = meetingTranscripts.countingAudioRule {
+                    Text("Counting what goes after \(days) days…")
+                }
+                Text("Only the audio of meetings transcribed in full goes, never a starred meeting’s, and for good, not to the Trash. Transcripts, names and stars stay.")
+            }
+            .font(.caption).foregroundStyle(.secondary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, SettingsChrome.rowHorizontalPadding)
+            .padding(.vertical, SettingsChrome.rowVerticalPadding)
+        }
+    }
+
+    private static func title(of choice: MeetingAudioRetention) -> LocalizedStringKey {
+        switch choice {
+        case .keep: "Keep"
+        case .week: "Delete 7 days after a full transcription"
+        case .month: "Delete 30 days after a full transcription"
+        case .quarter: "Delete 90 days after a full transcription"
         }
     }
 
@@ -86,7 +132,58 @@ struct MeetingsSettingsView: View {
             return bundleID.hasPrefix("com.apple.")
                 ? String(localized: "macOS process \(bundleID)") : bundleID
         }
-        return FileManager.default.displayName(atPath: url.path)
+        return FileManager.default.displayName(atPath: outermostApplication(url).path)
+    }
+
+    /// A helper that holds the microphone lives inside its app's bundle
+    /// (Arc's, Chrome's): the outermost `.app` on its path is the app the
+    /// user knows.
+    static func outermostApplication(_ url: URL) -> URL {
+        var outermost = url
+        var current = url
+        while current.pathComponents.count > 1 {
+            if current.pathExtension == "app" { outermost = current }
+            current = current.deletingLastPathComponent()
+        }
+        return outermost
+    }
+}
+
+/// What a rule that deletes would delete now, asked before it is set.
+private struct AudioRuleQuestion: View {
+    @EnvironmentObject private var meetingTranscripts: MeetingTranscriptionQueue
+    let question: MeetingTranscriptionQueue.AudioQuestion
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text(question.candidates.isEmpty
+                ? String(localized: "Nothing goes now. From now on a meeting’s audio is deleted \(question.days) days after its full transcription. Turn this on?")
+                : String(localized: "The audio of \(question.candidates.count) meetings goes now — for good, not to the Trash. Continue?"))
+                .font(.headline)
+                .fixedSize(horizontal: false, vertical: true)
+            if !question.candidates.isEmpty {
+                Text("Total: \(ByteCountFormatter.string(fromByteCount: question.bytes, countStyle: .file))")
+                    .foregroundStyle(.secondary)
+            }
+            if !question.complete {
+                Label("Not every meeting could be counted now: those not counted go by this rule once they can be read.", systemImage: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            HStack {
+                Spacer()
+                Button("Cancel") { meetingTranscripts.answerAudioQuestion(question, accepted: false) }
+                    .keyboardShortcut(.cancelAction)
+                    .accessibilityIdentifier("audioRuleCancel")
+                Button("Continue") { meetingTranscripts.answerAudioQuestion(question, accepted: true) }
+                    .keyboardShortcut(.defaultAction)
+                    .accessibilityIdentifier("audioRuleContinue")
+            }
+        }
+        .padding(20)
+        .frame(width: 440, alignment: .leading)
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("audioRuleQuestion")
     }
 }
 

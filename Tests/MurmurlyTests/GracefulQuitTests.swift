@@ -111,7 +111,7 @@ private actor FakeQuitMeetingCapture: MeetingCaptureBackend {
         self.behavior = behavior
     }
 
-    func start() async throws -> Date {
+    func start(in _: URL) async throws -> Date {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         return Date()
     }
@@ -333,6 +333,76 @@ final class GracefulQuitTests: XCTestCase {
         XCTAssertEqual(delivered, ["keep me"], "the paste begun before quit is not repeated")
     }
 
+    /// The text and the recognized text worked out before a failed save are
+    /// the ones the retry writes: a dictionary edited meanwhile is applied
+    /// neither to the recognized text nor to the finished one, there is one
+    /// line and one audio file, and no second paste.
+    func testRetriedSaveKeepsTheReplacedTextAndTheRecognizedOne() async throws {
+        let fixture = try DictationPipelineFixture(text: "клод код готов")
+        defer { fixture.cleanup() }
+        try fixture.settings.saveDictionary([DictionaryEntry(heard: ["клод код"], written: "Claude Code")])
+        let brokenIndex = fixture.root.appendingPathComponent(
+            DictationHistoryStore.historyFileName,
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: brokenIndex, withIntermediateDirectories: true)
+        let gate = TestGate()
+        fixture.deliveryHook.gate = { await gate.wait() }
+        fixture.coordinator.beginCaptureForTesting()
+        try await waitForDictation { fixture.coordinator.state == .recording }
+        fixture.coordinator.toggle()
+        try await waitForDictation { gate.entered }
+
+        let first = await result(of: fixture.coordinator.beginTermination())
+        XCTAssertEqual(first, false)
+        fixture.coordinator.cancelTermination()
+        // Recomputing from the recognized text would give "Claude готов",
+        // replacing the finished text again "Changed готов".
+        try fixture.settings.saveDictionary([
+            DictionaryEntry(heard: ["клод код"], written: "Claude"),
+            DictionaryEntry(heard: ["Claude Code"], written: "Changed"),
+        ])
+        gate.open()
+        try await Task.sleep(for: .milliseconds(200))
+        try FileManager.default.removeItem(at: brokenIndex)
+        let second = await result(of: fixture.coordinator.beginTermination())
+
+        XCTAssertEqual(second, true)
+        let lines = try historyLines(in: fixture.root)
+        XCTAssertEqual(lines.count, 1)
+        XCTAssertEqual(lines.first?["text"] as? String, "Claude Code готов")
+        XCTAssertEqual(lines.first?["raw_text"] as? String, "клод код готов")
+        XCTAssertEqual(audioFiles(under: fixture.root).count, 1)
+        let delivered = await fixture.probe.deliveredTexts
+        XCTAssertEqual(delivered, ["Claude Code готов"])
+    }
+
+    /// Quit takes the dictation while it is recognized; the late result,
+    /// replaced or not, writes and pastes nothing.
+    func testLateRecognitionWithADictionaryAfterQuitWritesNothing() async throws {
+        let fixture = try DictationPipelineFixture(text: "клод код")
+        defer { fixture.cleanup() }
+        try fixture.settings.saveDictionary([DictionaryEntry(heard: ["клод код"], written: "Claude Code")])
+        await fixture.engine.holdDecodes()
+        fixture.coordinator.beginCaptureForTesting()
+        try await waitForDictation { fixture.coordinator.state == .recording }
+        fixture.coordinator.toggle()
+        try await waitForDictation { await fixture.engine.isHoldingDecode() }
+
+        let saved = await result(of: fixture.coordinator.beginTermination())
+        await fixture.engine.releaseHeldDecode()
+        try await Task.sleep(for: .milliseconds(300))
+
+        XCTAssertEqual(saved, true)
+        let lines = try historyLines(in: fixture.root)
+        XCTAssertEqual(lines.count, 1)
+        XCTAssertEqual(lines.first?["recognition_skipped"] as? Bool, true)
+        XCTAssertEqual(lines.first?["text"] as? String, "")
+        XCTAssertNil(lines.first?["raw_text"])
+        let delivered = await fixture.probe.deliveredTexts
+        XCTAssertEqual(delivered, [])
+    }
+
     func testOnlyRemovingBlockedDictationLetsQuitGoWithoutIt() async throws {
         let fixture = try DictationPipelineFixture(text: "unused")
         defer { fixture.cleanup() }
@@ -463,6 +533,21 @@ final class GracefulQuitTests: XCTestCase {
         XCTAssertEqual(startsAfter, 2, "starts are allowed again once the work has ended")
     }
 
+    /// The app opened again while it runs (Finder, Launchpad, the Dock)
+    /// shows the main window, Settings on screen or not: Settings open and
+    /// the meetings out of sight is the very case. SwiftUI opens nothing of
+    /// its own.
+    func testReopenShowsTheMainWindowWhateverIsOnScreen() {
+        let delegate = AppDelegate()
+        var shown = 0
+        delegate.showMainWindow = { shown += 1 }
+
+        XCTAssertFalse(delegate.applicationShouldHandleReopen(NSApp, hasVisibleWindows: true))
+        XCTAssertFalse(delegate.applicationShouldHandleReopen(NSApp, hasVisibleWindows: false))
+
+        XCTAssertEqual(shown, 2)
+    }
+
     // MARK: Losses
 
     /// №4. A meeting transcription is work nothing redoes by itself: the
@@ -522,8 +607,8 @@ final class GracefulQuitTests: XCTestCase {
         queue.value = MeetingTranscriptionQueue(
             transcriber: MeetingTranscriber(
                 cache: WhisperKitCache(factory: ConstantEngineFactory()),
-                loadSpeechDetector: { { _ in [0..<16_000] } },
-                currentEngine: {
+                loadSpeechDetector: { _ in { _ in [0..<16_000] } },
+                currentEngine: { _ in
                     MeetingTranscriber.Engine(
                         descriptor: EngineDescriptor(engine: .whisper, modelPath: "/models/whisper"),
                         request: .whisper(WhisperDecodeRequest(language: nil)),
@@ -717,11 +802,11 @@ final class GracefulQuitTests: XCTestCase {
         // The fixture's own folder; its Dictations root is made only on demand.
         let target = fixture.parent.appendingPathComponent("talk.md")
         let files = FilesModel(
-            transcription: { { _, _ in
+            transcription: { _ in { _, _ in
                 await gate.wait()
                 return [TranscriptSegment(speaker: "", text: "text")]
             } },
-            saveDestination: { _ in target }
+            saveDestination: { _, _ in target }
         )
         let delegate = AppDelegate()
         delegate.finishTermination = { _ in XCTFail("nothing to finish: no recording runs") }
@@ -746,7 +831,7 @@ final class GracefulQuitTests: XCTestCase {
             .meetingFailure(message: AppDelegate.QuitLoss.unsavedFileText.warning)
         )
 
-        let saved = await files.saveTranscript()
+        let saved = await files.saveTranscript(owner: nil)
         XCTAssertTrue(saved)
         XCTAssertEqual(delegate.applicationShouldTerminate(NSApp), .terminateNow)
     }
@@ -862,7 +947,7 @@ final class GracefulQuitTests: XCTestCase {
         let detecting = QuitFlag()
         let transcriber = MeetingTranscriber(
             cache: WhisperKitCache(factory: NoQuitWhisperFactory()),
-            loadSpeechDetector: {
+            loadSpeechDetector: { _ in
                 { _ in
                     detecting.set()
                     while true {
@@ -871,7 +956,7 @@ final class GracefulQuitTests: XCTestCase {
                     }
                 }
             },
-            currentEngine: {
+            currentEngine: { _ in
                 MeetingTranscriber.Engine(
                     descriptor: EngineDescriptor(engine: .whisper, modelPath: "/models/whisper"),
                     request: .whisper(WhisperDecodeRequest(language: nil)),

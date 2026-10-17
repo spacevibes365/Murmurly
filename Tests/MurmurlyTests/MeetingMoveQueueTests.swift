@@ -16,7 +16,7 @@ private actor MovingMeetingCapture: MeetingCaptureBackend {
 
     func failNextStop() { failNext = true }
 
-    func start() async throws -> Date { Date(timeIntervalSinceReferenceDate: 1_000) }
+    func start(in _: URL) async throws -> Date { Date(timeIntervalSinceReferenceDate: 1_000) }
 
     func stop() async throws -> [URL] {
         stops += 1
@@ -44,7 +44,7 @@ private actor HeldStopCapture: MeetingCaptureBackend {
 
     func release() { released = true }
 
-    func start() async throws -> Date { Date(timeIntervalSinceReferenceDate: 1_000) }
+    func start(in _: URL) async throws -> Date { Date(timeIntervalSinceReferenceDate: 1_000) }
 
     func stop() async throws -> [URL] {
         let samples = [MeetingAudio.noise(count: 48_000, amplitude: 0.4, seed: 5)]
@@ -123,20 +123,20 @@ final class MeetingMoveQueueTests: XCTestCase {
 
         XCTAssertTrue(done)
         XCTAssertEqual(try names(in: moved), ["metadata.json", "microphone.m4a", "system.m4a", "transcript.md"])
+        // The attempt's record went with the meeting, and the copy took only the text.
+        XCTAssertEqual(try MeetingAttempt.entries(in: moved).map(\.attempt?.transcript), ["transcript.md"])
         XCTAssertEqual(try names(in: notes), ["2026-10-07 11-00-01 Meeting.md"])
         XCTAssertEqual(
             try Data(contentsOf: notes.appendingPathComponent("2026-10-07 11-00-01 Meeting.md")),
             try Data(contentsOf: moved.appendingPathComponent("transcript.md"))
         )
-        XCTAssertEqual(try names(in: local), [], "nothing left behind, not even hidden")
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: local.path), [], "nothing left behind, not even hidden")
         XCTAssertEqual(setup.queue.issues, [:])
 
-        setup.queue.revealOutcome()
-        setup.recorder.revealLastRecording()
-        XCTAssertEqual(setup.shown.get().map(\.path), [
-            moved.appendingPathComponent("transcript.md").path,
-            moved.path,
-        ])
+        // Where "Show Transcript" and "Show Last Recording…" open the window.
+        XCTAssertEqual(setup.queue.lastMeeting?.path, moved.path)
+        XCTAssertEqual(setup.queue.lastOutcome?.transcript?.lastPathComponent, "transcript.md")
+        XCTAssertEqual(setup.recorder.lastRecordingLocation?.path, moved.path)
     }
 
     /// Two calls in one minute: two notes, since the name keeps the seconds.
@@ -167,6 +167,7 @@ final class MeetingMoveQueueTests: XCTestCase {
         XCTAssertTrue(waiting)
         XCTAssertEqual(setup.queue.issues[folder.standardizedFileURL]?.lines, ["move: folder not available: \(target.path)"])
         XCTAssertEqual(try names(in: folder), ["metadata.json", "microphone.m4a", "system.m4a", "transcript.md"])
+        XCTAssertEqual(try MeetingAttempt.entries(in: folder).count, 1)
         XCTAssertFalse(exists(target), "the meetings folder is never created")
 
         try FileManager.default.createDirectory(at: target, withIntermediateDirectories: true)
@@ -218,14 +219,13 @@ final class MeetingMoveQueueTests: XCTestCase {
         XCTAssertTrue(moved)
         XCTAssertEqual(try names(in: target), [old.lastPathComponent, MovingMeetingCapture.name(1)])
         XCTAssertEqual(setup.transcriptions.get(), 0, "a scan never transcribes")
-        setup.recorder.revealWarnedRecording()
-        XCTAssertEqual(setup.shown.get().last?.path, target.appendingPathComponent(MovingMeetingCapture.name(1)).path)
+        XCTAssertEqual(setup.recorder.warnedRecordingLocation?.path, target.appendingPathComponent(MovingMeetingCapture.name(1)).path)
     }
 
     /// The panel opens in the chosen folder without checking it is there.
     func testPanelOpensInTheMeetingsFolderUnchecked() throws {
         let destinations = Box(MeetingTranscriptionQueue.Destinations())
-        let queue = makeQueue(destinations: { destinations.get() }, shown: Box([]), transcriptions: Box(0))
+        let queue = makeQueue(destinations: { destinations.get() }, transcriptions: Box(0))
         XCTAssertEqual(queue.panelDirectory, local)
 
         let away = base.appendingPathComponent("Unplugged/Meetings", isDirectory: true)
@@ -243,7 +243,7 @@ final class MeetingMoveQueueTests: XCTestCase {
         let transcriptions = Box(0)
         let target = self.target!
         let queue = makeQueue(
-            destinations: { .init(meetings: target, transcripts: nil) }, shown: Box([]), transcriptions: transcriptions
+            destinations: { .init(meetings: target, transcripts: nil) }, transcriptions: transcriptions
         )
 
         queue.enqueue(folder)
@@ -253,14 +253,16 @@ final class MeetingMoveQueueTests: XCTestCase {
         XCTAssertEqual(queue.lastOutcome, .saved(place.appendingPathComponent("transcript.md")))
         XCTAssertEqual(try names(in: place), ["metadata.json", "microphone.caf", "system.caf", "transcript.md"],
                        "outside the local root nothing is compressed or moved")
+        XCTAssertEqual(try MeetingAttempt.entries(in: place).map(\.attempt?.transcript), ["transcript.md"])
     }
 
     // MARK: - What a job must not touch
 
-    /// A recording in progress has no metadata yet. Asked for by hand, it
-    /// is transcribed as far as it goes; whatever the transcription ends in,
-    /// here a failure, no move follows: the live tracks stay where the
-    /// capture writes them.
+    /// A recording in progress has no metadata yet; without the recorder to
+    /// say so, it is a recording cut off before its stop. Asked for by hand,
+    /// it is transcribed as far as it goes; whatever the transcription ends
+    /// in, here a failure, no move follows: the tracks stay where the capture
+    /// wrote them, untouched, beside the attempt's record.
     func testRecordingInProgressAskedForByHandIsNeverMoved() async throws {
         let samples = [MeetingAudio.noise(count: 48_000, amplitude: 0.4, seed: 4)]
         let live = local.appendingPathComponent("2026-10-07 13-00-00 Meeting", isDirectory: true)
@@ -270,7 +272,7 @@ final class MeetingMoveQueueTests: XCTestCase {
         let before = try MeetingAudio.digests(of: live)
         let target = self.target!
         let queue = makeQueue(
-            destinations: { .init(meetings: target, transcripts: nil) }, shown: Box([]), transcriptions: Box(0),
+            destinations: { .init(meetings: target, transcripts: nil) }, transcriptions: Box(0),
             detector: { _ in throw CocoaError(.fileReadCorruptFile) }
         )
 
@@ -282,7 +284,8 @@ final class MeetingMoveQueueTests: XCTestCase {
             return XCTFail("unexpected outcome \(String(describing: queue.lastOutcome))")
         }
         XCTAssertEqual(folder.path, live.path)
-        XCTAssertEqual(try MeetingAudio.digests(of: live), before)
+        XCTAssertEqual(try MeetingAudio.digests(of: live).filter { MeetingAttempt.number(inName: $0.key) == nil }, before)
+        XCTAssertEqual(try MeetingAttempt.entries(in: live).map(\.attempt?.result), [.failed])
         XCTAssertEqual(try names(in: target), [])
         XCTAssertEqual(
             queue.issues[live.standardizedFileURL]?.lines,
@@ -449,10 +452,9 @@ final class MeetingMoveQueueTests: XCTestCase {
             fileURLWithPath: "/Volumes/Murmurly-test-\(UUID().uuidString)/2026-10-07 15-00-00 Meeting",
             isDirectory: true
         )
-        let shown = Box<[URL]>([])
         let target = self.target!
         let queue = makeQueue(
-            destinations: { .init(meetings: target, transcripts: nil) }, shown: shown, transcriptions: Box(0)
+            destinations: { .init(meetings: target, transcripts: nil) }, transcriptions: Box(0)
         )
 
         queue.enqueue(gone)
@@ -463,8 +465,7 @@ final class MeetingMoveQueueTests: XCTestCase {
             return XCTFail("unexpected outcome \(String(describing: queue.lastOutcome))")
         }
         XCTAssertEqual(folder.path, gone.path)
-        queue.revealOutcome()
-        XCTAssertEqual(shown.get().map(\.path), [gone.path])
+        XCTAssertEqual(queue.lastMeeting?.path, gone.path, "no disk was asked where it went")
     }
 
     // MARK: - Choosing the meetings folder
@@ -664,7 +665,7 @@ final class MeetingMoveQueueTests: XCTestCase {
         let shown = Box<[URL]>([])
         let transcriptions = Box(0)
         let queue = makeQueue(
-            destinations: { settings.meetingDestinations }, shown: shown, transcriptions: transcriptions
+            destinations: { settings.meetingDestinations }, transcriptions: transcriptions
         )
         let capture = MovingMeetingCapture(root: local)
         let recorder = MeetingRecorder(
@@ -696,18 +697,17 @@ final class MeetingMoveQueueTests: XCTestCase {
 
     private func makeQueue(
         destinations: @escaping @MainActor () -> MeetingTranscriptionQueue.Destinations,
-        shown: Box<[URL]>,
         transcriptions: Box<Int>,
         detector: MeetingTranscriber.SpeechDetector? = nil
     ) -> MeetingTranscriptionQueue {
         MeetingTranscriptionQueue(
             transcriber: MeetingTranscriber(
                 cache: WhisperKitCache(factory: SpeakingEngineFactory()),
-                loadSpeechDetector: {
+                loadSpeechDetector: { _ in
                     transcriptions.set(transcriptions.get() + 1)
                     return detector ?? { source in source.sampleCount >= 16_000 ? [0..<16_000] : [] }
                 },
-                currentEngine: {
+                currentEngine: { _ in
                     MeetingTranscriber.Engine(
                         descriptor: EngineDescriptor(engine: .whisper, modelPath: "/models/whisper"),
                         request: .whisper(WhisperDecodeRequest(language: "ru")),
@@ -717,8 +717,7 @@ final class MeetingMoveQueueTests: XCTestCase {
                 temporaryRoot: base
             ),
             meetingsRoot: local,
-            destinations: destinations,
-            fileViewer: { shown.append($0) }
+            destinations: destinations
         )
     }
 
@@ -735,8 +734,10 @@ final class MeetingMoveQueueTests: XCTestCase {
         FileManager.default.fileExists(atPath: url.path)
     }
 
+    /// Attempt records are checked on their own (`MeetingAttempt.entries`).
     private func names(in folder: URL) throws -> [String] {
-        try FileManager.default.contentsOfDirectory(atPath: folder.path).sorted()
+        try FileManager.default.contentsOfDirectory(atPath: folder.path)
+            .filter { MeetingAttempt.number(inName: $0) == nil }.sorted()
     }
 
     private func eventually(

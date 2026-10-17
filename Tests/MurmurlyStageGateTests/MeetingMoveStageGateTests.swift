@@ -70,12 +70,11 @@ final class MeetingMoveStageGateTests: XCTestCase {
         let queue = MeetingTranscriptionQueue(
             transcriber: MeetingTranscriber(
                 cache: WhisperKitCache(factory: LiveWhisperEngineFactory()),
-                loadSpeechDetector: { throw CocoaError(.featureUnsupported) },
-                currentEngine: { throw CocoaError(.featureUnsupported) }
+                loadSpeechDetector: { _ in throw CocoaError(.featureUnsupported) },
+                currentEngine: { _ in throw CocoaError(.featureUnsupported) }
             ),
             meetingsRoot: local,
-            destinations: { .init(meetings: target, transcripts: nil) },
-            fileViewer: { _ in }
+            destinations: { .init(meetings: target, transcripts: nil) }
         )
         queue.activate()
         let waited = await eventually(within: .seconds(60)) {

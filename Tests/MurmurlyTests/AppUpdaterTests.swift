@@ -196,7 +196,7 @@ final class AppUpdaterTests: XCTestCase {
     /// warns about the text and stays cancelled, so the text is not lost.
     func testNoRelaunchDuringAFilesRunAndItsUnsavedTextStopsTheQuit() async throws {
         let released = JobCounter()
-        let files = FilesModel(transcription: { { _, _ in
+        let files = FilesModel(transcription: { _ in { _, _ in
             while released.value == 0 { try await Task.sleep(for: .milliseconds(10)) }
             return [TranscriptSegment(speaker: "", text: "text")]
         } })
@@ -226,7 +226,7 @@ final class AppUpdaterTests: XCTestCase {
     /// follows is cancelled by its warning, and the menu and Settings must
     /// then say the update waits for the next quit.
     func testRelaunchCancelledByUnsavedFilesTextSaysTheUpdateInstallsAtQuit() async throws {
-        let files = FilesModel(transcription: { { _, _ in [TranscriptSegment(speaker: "", text: "text")] } })
+        let files = FilesModel(transcription: { _ in { _, _ in [TranscriptSegment(speaker: "", text: "text")] } })
         let app = makeApp(afterStop: .nothing, files: files)
         files.select(root.appendingPathComponent("talk.wav"))
         files.start()
@@ -253,6 +253,7 @@ final class AppUpdaterTests: XCTestCase {
         let settings: SettingsStore
         let dictation: DictationCoordinator
         let files: FilesModel
+        let library: MeetingLibrary
         /// Jobs that reached speech detection, and how many may go on past it.
         let entered: JobCounter
         let released: JobCounter
@@ -265,21 +266,21 @@ final class AppUpdaterTests: XCTestCase {
     private func makeApp(
         afterStop: MeetingAfterStop,
         transcripts: URL? = nil,
-        files: FilesModel = FilesModel(transcription: { nil })
+        files: FilesModel = FilesModel(transcription: { _ in { _, _ in [] } })
     ) -> App {
         let entered = JobCounter()
         let released = JobCounter()
         let queue = MeetingTranscriptionQueue(
             transcriber: MeetingTranscriber(
                 cache: WhisperKitCache(factory: ConstantEngineFactory()),
-                loadSpeechDetector: {
+                loadSpeechDetector: { _ in
                     entered.increment()
                     let job = entered.value
                     while released.value < job { try await Task.sleep(for: .milliseconds(10)) }
                     // Some speech on every track, so each job writes a transcript.
                     return { _ in [0..<16_000] }
                 },
-                currentEngine: {
+                currentEngine: { _ in
                     MeetingTranscriber.Engine(
                         descriptor: EngineDescriptor(engine: .whisper, modelPath: "/models/whisper"),
                         request: .whisper(WhisperDecodeRequest(language: "ru")),
@@ -303,14 +304,15 @@ final class AppUpdaterTests: XCTestCase {
         let dictation = DictationCoordinator(mic: SilentMic(), indicator: RecordingIndicator(renderingEnabled: false))
         recorder.transcripts = queue
         recorder.activate(settings: settings, permissions: PermissionManager(), dictation: dictation)
+        let library = MeetingLibrary(recorder: recorder, queue: queue, settings: settings)
         let updater = AppUpdater(busy: AppUpdater.busy(
-            meeting: recorder, dictation: dictation, transcripts: queue, files: files
+            meeting: recorder, dictation: dictation, transcripts: queue, files: files, library: library
         ))
         // The recorder holds settings and queue weakly, as the app's state
         // objects do; the returned value keeps them alive.
         return App(
             recorder: recorder, queue: queue, updater: updater, settings: settings,
-            dictation: dictation, files: files, entered: entered, released: released
+            dictation: dictation, files: files, library: library, entered: entered, released: released
         )
     }
 
@@ -336,7 +338,8 @@ final class AppUpdaterTests: XCTestCase {
         let clicks = Clicks()
         let root: URL = root
         clicks.subscription = AppUpdater.busy(
-            meeting: app.recorder, dictation: app.dictation, transcripts: app.queue, files: app.files
+            meeting: app.recorder, dictation: app.dictation, transcripts: app.queue, files: app.files,
+            library: app.library
         )
             .sink { _ in
                 Task { @MainActor in

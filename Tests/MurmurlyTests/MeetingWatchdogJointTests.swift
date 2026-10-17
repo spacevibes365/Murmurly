@@ -26,7 +26,7 @@ private actor JointCapture: MeetingCaptureBackend {
         self.notReadyStarts = notReadyStarts
     }
 
-    func start() async throws -> Date {
+    func start(in _: URL) async throws -> Date {
         starts += 1
         for _ in 0..<1_000 where holdsStart { try? await Task.sleep(for: .milliseconds(10)) }
         startWasCancelled = Task.isCancelled

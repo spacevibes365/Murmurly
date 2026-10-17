@@ -78,15 +78,18 @@ final class QuitProbe {
             feedbackPlayer: { _ in },
             beepPlayer: {}
         )
+        let session = root.appendingPathComponent("Meetings/probe", isDirectory: true)
         meeting = MeetingRecorder(
-            capture: QuitProbeMeetingCapture(
-                directory: root.appendingPathComponent("Meetings/probe", isDirectory: true)
-            ),
+            capture: QuitProbeMeetingCapture(),
             indicator: indicator,
             hasMicrophoneAccess: { true },
             permissionPromptDelay: .zero,
             watchdogSnapshotSource: { [] },
-            beepPlayer: {}
+            beepPlayer: {},
+            createSession: {
+                try FileManager.default.createDirectory(at: session, withIntermediateDirectories: true)
+                return session
+            }
         )
         Task { await self.run() }
     }
@@ -219,25 +222,24 @@ private struct QuitProbeEngineFactory: WhisperEngineFactory {
     func make(modelFolder: String, prewarm: Bool) async throws -> any WhisperEngine { engine }
 }
 
-/// Like the real backend, it writes `metadata.json` only in `stop()`.
+/// Like the real backend, it records into the recorder's folder and writes
+/// `metadata.json` only in `stop()`.
 private actor QuitProbeMeetingCapture: MeetingCaptureBackend {
-    let directory: URL
+    private var directory: URL?
     private var startedAt: Date?
 
-    init(directory: URL) { self.directory = directory }
-
-    func start() async throws -> Date {
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    func start(in directory: URL) async throws -> Date {
         for name in ["system.caf", "microphone.caf"] {
             try Data("probe".utf8).write(to: directory.appendingPathComponent(name))
         }
+        self.directory = directory
         let now = Date()
         startedAt = now
         return now
     }
 
     func stop() async throws -> [URL] {
-        guard let startedAt else { throw SystemAudioCaptureError.notRunning }
+        guard let startedAt, let directory else { throw SystemAudioCaptureError.notRunning }
         self.startedAt = nil
         let formatter = ISO8601DateFormatter()
         let metadata = MeetingMetadata(

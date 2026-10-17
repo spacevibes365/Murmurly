@@ -10,8 +10,8 @@ configFiles:
   Release: Signing.xcconfig
 settings:
   base:
-    MARKETING_VERSION: "0.1"
-    CURRENT_PROJECT_VERSION: "1"
+    MARKETING_VERSION: "0.2"
+    CURRENT_PROJECT_VERSION: "2"
     GENERATE_INFOPLIST_FILE: YES
     # The Core ML models need Apple Silicon; an Intel slice would only be dead weight.
     ARCHS: arm64
@@ -79,6 +79,11 @@ targets:
           # Ad-hoc and self-signed identities have no TeamIdentifier, so library
           # validation cannot establish the same-team relationship in Debug.
           ENABLE_HARDENED_RUNTIME: NO
+        Release:
+          # Xcode can otherwise inject get-task-allow, which permits debugger
+          # attachment and code injection, into an ordinary `xcodebuild build`.
+          # A shipped build must not carry it, and notarization refuses it.
+          CODE_SIGN_INJECT_BASE_ENTITLEMENTS: NO
   MurmurlyTests:
     type: bundle.unit-test
     platform: macOS

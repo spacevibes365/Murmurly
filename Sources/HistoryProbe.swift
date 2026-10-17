@@ -3,8 +3,8 @@ import Foundation
 
 /// UI-test harness for the open history window, enabled only together with
 /// `-HistoryProbeRoot <dir>` (which also moves the shared archive there). For
-/// each `append-request.json` holding `{"id": …, "text": …}` it appends one
-/// dictation through `DictationHistoryStore.shared` and confirms with
+/// each `append-request.json` holding `{"id": …, "text": …}`, optionally with
+/// `"raw_text"`, it appends one dictation through `DictationHistoryStore.shared` and confirms with
 /// `appended-<id>.json`. For each `change-request` it announces a change of
 /// the archive without making one, as the store does after every change, and
 /// removes the request once announced: the open window reads and counts
@@ -30,7 +30,7 @@ enum HistoryProbe {
                let id = json["id"].flatMap(UUID.init(uuidString:)),
                let text = json["text"] {
                 try? FileManager.default.removeItem(at: request)
-                await append(id: id, text: text, root: root)
+                await append(id: id, text: text, rawText: json["raw_text"], root: root)
             }
             if FileManager.default.fileExists(atPath: change.path) {
                 await DictationHistoryStore.shared.notifyChange()
@@ -40,7 +40,7 @@ enum HistoryProbe {
         }
     }
 
-    private static func append(id: UUID, text: String, root: URL) async {
+    private static func append(id: UUID, text: String, rawText: String?, root: URL) async {
         let entry = DictationHistoryEntry(
             id: id,
             at: Date(),
@@ -50,7 +50,8 @@ enum HistoryProbe {
             targetBundleID: nil,
             targetApplicationName: "History probe",
             audioPath: "probe/\(id.uuidString).caf",
-            text: text
+            text: text,
+            rawText: rawText
         )
         var result: [String: String] = ["id": id.uuidString]
         do {

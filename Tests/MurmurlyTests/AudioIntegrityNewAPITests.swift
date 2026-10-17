@@ -19,7 +19,7 @@ private actor ScriptedMeetingCapture: MeetingCaptureBackend {
         self.finishes = finishes
     }
 
-    func start() async throws -> Date {
+    func start(in _: URL) async throws -> Date {
         let directory = root.appendingPathComponent("meeting-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         self.directory = directory

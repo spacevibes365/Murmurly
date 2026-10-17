@@ -8,6 +8,12 @@ private struct HistoryRefreshKey: Equatable {
     let retry: Int
 }
 
+/// The count follows the archive and Try Again, not the search.
+private struct HistorySummaryKey: Equatable {
+    let revision: UInt64
+    let retry: Int
+}
+
 private struct DictationHistoryDay: Identifiable {
     let date: Date
     let entries: [DictationHistoryEntry]
@@ -16,7 +22,6 @@ private struct DictationHistoryDay: Identifiable {
 }
 
 struct DictationHistoryView: View {
-    @EnvironmentObject private var settings: SettingsStore
     @ObservedObject var dictation: DictationCoordinator
     @StateObject private var model: DictationHistoryViewModel
     @StateObject private var changes: DictationHistoryChanges
@@ -25,35 +30,35 @@ struct DictationHistoryView: View {
     @State private var showingClearConfirmation = false
     @State private var hoveredEntryID: UUID?
     @State private var selectedEntryID: UUID?
+    /// The dictation a dictionary entry is being made from; in memory only.
+    @State private var addingToDictionary: DictationHistoryEntry?
     /// The count for the current search only; without a search the total is shown.
     @State private var matchingCount: Int?
     /// Bumped by Try Again after a failed read: part of the refresh's identity.
     @State private var readRetry = 0
+    /// The error the alert shows: taken from the model only while the
+    /// section is shown, and let go only by OK, so a change of section with
+    /// the alert up never closes it.
+    @State private var shownError: String?
     private let store: DictationHistoryStore
-    let totalCount: Int?
-    /// The window's count failed: no count is running, so none is promised.
-    let countFailed: Bool
-    /// Lines or audio are in the archive. A clear that failed halfway leaves
-    /// audio without lines, and Clear All must stay there to finish the job.
-    let archiveHasFiles: Bool
-    /// Counts the archive again for the window.
-    let recount: () -> Void
+    /// The main window shows this section: hidden, the sound stops and an
+    /// error waits for it.
+    let isShown: Bool
+    /// The way to the Dictionary section, for an entry's sheet.
+    let openDictionary: () -> Void
 
     init(
         dictation: DictationCoordinator,
         store: DictationHistoryStore = .shared,
-        totalCount: Int? = nil,
-        countFailed: Bool = false,
-        archiveHasFiles: Bool = false,
-        recount: @escaping () -> Void = {}
+        isShown: Bool,
+        openDictionary: @escaping () -> Void
     ) {
         self.dictation = dictation
         self.store = store
-        self.totalCount = totalCount
-        self.countFailed = countFailed
-        self.archiveHasFiles = archiveHasFiles
-        self.recount = recount
+        self.isShown = isShown
+        self.openDictionary = openDictionary
         _model = StateObject(wrappedValue: DictationHistoryViewModel(store: store))
+        // Before the first read: no change of the archive is missed.
         _changes = StateObject(wrappedValue: DictationHistoryChanges(store: store))
     }
 
@@ -80,9 +85,20 @@ struct DictationHistoryView: View {
             await model.reload()
             await refreshMatchingCount()
         }
+        .task(id: HistorySummaryKey(revision: changes.revision, retry: readRetry)) {
+            await model.refreshSummary()
+        }
         .onChange(of: model.searchText) { matchingCount = nil }
-        .onChange(of: settings.settingsTab) { _, tab in
-            if tab != .history { model.stopAudio() }
+        // Sections are only hidden, never closed: nothing would stop playback
+        // in another one. The dictionary sheet stays over it with its draft
+        // until Cancel or Save, as the Dictionary section's own does.
+        .onChange(of: isShown) { _, shown in
+            if shown { showErrorIfShown() } else { model.stopAudio() }
+        }
+        .onChange(of: model.errorMessage) { showErrorIfShown() }
+        .onAppear { showErrorIfShown() }
+        .sheet(item: $addingToDictionary) { entry in
+            DictionaryEntrySheet(dictation: entry, openDictionary: openDictionary)
         }
         .onDisappear { model.stopAudio() }
         .confirmationDialog(
@@ -120,9 +136,9 @@ struct DictationHistoryView: View {
             Text("The whole archive and all dictation audio will be deleted.")
         }
         .alert("Error", isPresented: errorIsPresented) {
-            Button("OK") { model.errorMessage = nil }
+            Button("OK") { dismissError() }
         } message: {
-            Text(model.errorMessage ?? String(localized: "Unknown error"))
+            Text(shownError ?? String(localized: "Unknown error"))
         }
     }
 
@@ -142,7 +158,7 @@ struct DictationHistoryView: View {
                 .lineLimit(1)
                 .accessibilityIdentifier("historyResultCount")
 
-            let canClear = !model.isMutating && archiveHasFiles
+            let canClear = !model.isMutating && model.summary?.hasFiles == true
             Button {
                 showingClearConfirmation = true
             } label: {
@@ -266,6 +282,7 @@ struct DictationHistoryView: View {
         }
         if !entry.text.isEmpty {
             Button("Copy Text") { dictation.copyHistoryEntry(entry) }
+            Button("Add to Dictionary…") { addingToDictionary = entry }
         }
     }
 
@@ -362,10 +379,7 @@ struct DictationHistoryView: View {
                 .font(.callout)
                 .multilineTextAlignment(.center)
                 .fixedSize(horizontal: false, vertical: true)
-            Button("Try Again") {
-                readRetry += 1
-                recount()
-            }
+            Button("Try Again") { readRetry += 1 }
             .accessibilityIdentifier("historyRetry")
         }
     }
@@ -389,7 +403,9 @@ struct DictationHistoryView: View {
     /// task's start and could overwrite a newer one: "0 of 1" under "1 dictation".
     private var resultCountText: String {
         let searching = !model.searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        guard let totalCount else { return StorageSettingsView.pendingCountText(failed: countFailed) }
+        guard let totalCount = model.summary?.count else {
+            return StorageSettingsView.pendingCountText(failed: model.summaryFailed)
+        }
         guard let matching = searching ? matchingCount : totalCount else {
             return StorageSettingsView.pendingCountText(failed: model.readFailure != nil)
         }
@@ -430,13 +446,23 @@ struct DictationHistoryView: View {
         entry.targetApplicationName ?? entry.targetBundleID ?? String(localized: "Unknown app")
     }
 
-    /// Every Settings tab is built with the window, so the history is read
-    /// whichever tab is shown; its error waits for History instead of covering
-    /// another tab.
+    /// Every section is built with the window, so the history is read
+    /// whichever is shown; its error waits for Dictations instead of covering
+    /// another section, and once up it stays until answered.
     private var errorIsPresented: Binding<Bool> {
         Binding(
-            get: { model.errorMessage != nil && settings.settingsTab == .history },
-            set: { if !$0 { model.errorMessage = nil } }
+            get: { shownError != nil },
+            set: { if !$0 { dismissError() } }
         )
+    }
+
+    private func showErrorIfShown() {
+        guard isShown, shownError == nil, let message = model.errorMessage else { return }
+        shownError = message
+    }
+
+    private func dismissError() {
+        shownError = nil
+        model.errorMessage = nil
     }
 }

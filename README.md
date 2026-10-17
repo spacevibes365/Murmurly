@@ -27,13 +27,25 @@ on your Mac: Murmurly never uploads your recordings or text to be transcribed.
 - Your microphone and the call audio are saved as separate tracks, so the
   transcript can tell them apart.
 - Automatic transcription after meetings, on by default.
+- Transcribe a meeting again with another engine or language; earlier
+  transcripts are kept.
 - Transcription of audio and video files: mp3, m4a, wav, mp4, mov.
 - Dictation history with search.
+- A personal dictionary for the names and terms the engine gets wrong, in
+  dictation, meetings and files.
+- Listen to a meeting from any line of its transcript, and search the
+  transcripts of all meetings.
+- Put names in place of "Me" and "Others", save a transcript as Markdown, text
+  or SRT subtitles, and add a word the engine got wrong to the dictionary
+  right from the transcript.
 - Two speech engines: Parakeet (25 European languages) and Whisper (about 100
   languages).
 - Finished recordings are stored as 24-bit Apple Lossless.
 - Optional: move finished meetings to an external drive or a network folder, and
   copy each transcript into your notes folder.
+- Delete a meeting's audio or the whole meeting to the Trash, one or several at
+  once; optionally, delete the audio of fully transcribed meetings after 7, 30
+  or 90 days.
 - Interface in 12 languages.
 - Automatic updates.
 
@@ -63,8 +75,8 @@ dictation waits for it.
    [Releases](https://github.com/spacevibes365/Murmurly/releases) page.
 2. Open it and, in its window, drag the **Murmurly** icon onto the
    **Applications** icon.
-3. Open Murmurly from Applications. macOS blocks the first launch: see
-   [If macOS won't open the app](#if-macos-wont-open-the-app).
+3. Open Murmurly from Applications. The first time, macOS asks whether to open
+   an app downloaded from the internet: click **Open**.
 
 **On a standard (non-administrator) account**, copying into Applications asks
 for an administrator's name and password. Click **Cancel** and use an
@@ -74,40 +86,22 @@ and name it `Applications`. Drag **Murmurly** from the disk image into it and
 open it from there. Murmurly works the same from either folder.
 
 Murmurly lives in the menu bar. It has no Dock icon: one appears only while one
-of its windows is open.
+of its windows is open. Choose **Open Murmurly** at the top of the menu, or open
+the app again from Finder or Launchpad while it runs, to see your meetings.
 
 ### If macOS won't open the app
 
-Murmurly releases are not signed with a Developer ID or notarized by Apple yet;
-their file names end in `-unsigned`. macOS blocks the first launch of such an
-app. To allow it:
+Murmurly is signed with a Developer ID and notarized by Apple, so macOS only
+asks once whether to open it. If macOS refuses to open it instead, make sure
+your copy came from the
+[Releases](https://github.com/spacevibes365/Murmurly/releases) page, and that
+**System Settings → Privacy & Security → Allow applications from** is set to
+**App Store & Known Developers**.
 
-1. Open Murmurly once. macOS says *“Murmurly” Not Opened*: click **Done**.
-   Not **Move to Trash**: it is the default button, so pressing Return moves
-   the app to the Trash.
-2. Open **System Settings → Privacy & Security**, scroll down to *“Murmurly”
-   was blocked to protect your Mac.* and click **Open Anyway**.
-3. macOS asks *Open “Murmurly”?*: click **Open Anyway**. Here too, **Move to
-   Trash** is the default button.
-4. Enter your password. On a standard account, macOS asks for an
-   administrator's name and password instead.
-
-**Without an administrator password.** If you installed Murmurly in the
-Applications folder of your home folder, you can allow it in Terminal instead
-(**Applications → Utilities → Terminal**):
-
-```sh
-xattr -dr com.apple.quarantine ~/Applications/Murmurly.app
-```
-
-Then open Murmurly as usual. The command removes the mark that macOS puts on
-downloaded files and that makes it check the app before the first launch, so do
-this only with a copy from the Releases page.
-
-Without a Developer ID, macOS also treats each update as a new app. You may
-need to grant the microphone, Accessibility and system audio permissions again
-after an update: if recording or pasting stops working, check **System
-Settings → Privacy & Security**.
+Starting with 0.2, official releases are signed with the same Developer ID,
+so updates normally keep the permissions you granted. Updating from 0.1, or
+from a copy you built yourself, may require granting them again: if recording
+or pasting stops working, check **System Settings → Privacy & Security**.
 
 ### Updates
 
@@ -127,8 +121,9 @@ signed, and Murmurly refuses one whose signature does not match.
 
 **Installing during work.** If you choose **Install and Relaunch** while a
 meeting is being recorded or transcribed (its transcript copy included), a
-dictation is running or a file is being transcribed in **Settings → Files**,
-Murmurly does not restart. The update window closes, and the menu and
+dictation is running, a file is being transcribed in **Files**, a meeting's
+name, star or speakers' names are not saved yet, or a transcript is being
+written with **Save As**, Murmurly does not restart. The update window closes, and the menu and
 **Settings → Permissions → Updates** say "The update will be installed when you
 quit the app". It is installed the next time you quit Murmurly, or you can
 choose **Check for Updates…** again when the work is done and pick **Install and
@@ -170,9 +165,11 @@ used, macOS prepares it for your Mac, which takes a while. If that fails,
 and if it keeps failing, move the model folder (**Show in Finder**) to the
 Trash and download the model again.
 
-After an update, macOS may drop the Accessibility permission (see
-[If macOS won't open the app](#if-macos-wont-open-the-app)). If it did, Murmurly
-asks for it once, at the first launch of the new version.
+Updates normally keep the permissions you granted; updating from 0.1 or from a
+copy you built yourself may not (see
+[If macOS won't open the app](#if-macos-wont-open-the-app)). If Accessibility
+is missing after an update, Murmurly asks for it once, at the first launch of
+the new version.
 
 Murmurly starts when you log in. You can turn that off in **Settings →
 Permissions**.
@@ -197,8 +194,9 @@ Permissions**.
 - Choose the language in the menu (**Dictation Language**: Auto, the current
   language, **More Languages…**) or in **Settings → Dictation**, where you can
   search the list. **Auto** lets the engine decide.
-- The text of each recognized dictation is saved to the history (**Settings →
-  History**), where you can search it. **Clear history** (the trash button
+- The text of each recognized dictation is saved to the history
+  (**Dictations** in the Murmurly window; **Open Full History…** in the menu
+  opens it), where you can search it. **Clear history** (the trash button
   above the list) deletes all dictations and their audio.
 
 ### Dictation audio
@@ -211,7 +209,7 @@ when the recording is cut off, or when you quit during a dictation. A dictation
 that could not be recognized appears in the history as "— not recognized —"
 with its audio, so you can listen to it or transcribe it again: **Show in
 Finder** (the folder button in its row) shows the audio file, which you can drop
-into **Settings → Files**. Nothing is pasted in that case.
+into **Files** in the Murmurly window. Nothing is pasted in that case.
 
 If the history itself cannot be written, the dictation stays under **Unsaved
 Dictations** in the menu until you quit: a recognized one with its text, which
@@ -272,15 +270,17 @@ By default each meeting is a folder in
 | `system.m4a` (or `.caf`) | Everything your Mac played: the call |
 | `transcript.md` | The transcript, when speech was recognized and transcription finished. Check it for warnings about missing parts. |
 | `metadata.json` | Technical details of the recording |
+| `murmurly.json` | The meeting's star, your own name for it and the speakers' names |
+| `.attempt 0001 ….murmurly.json` (hidden) | What became of each transcription attempt: whether its transcript is complete, the engine and language. Leave them in the folder |
 
 Tracks are written as `.caf` during the call. Finished tracks are stored as
 24-bit Apple Lossless (`.m4a`); if compression cannot be completed safely, the
 original `.caf` is kept.
 
-**Show Last Recording…** in the menu opens the folder of the latest recording,
-and **Show Meetings Folder** opens the folder with all of them: the one you
-chose in **Settings → Storage**, or, if it is not available right now, Storage
-settings, so you can see why.
+**Show Last Recording…** in the menu opens the latest recording in the Murmurly
+window, and **Show Meetings Folder** opens the folder with all of them in
+Finder: the one you chose in **Settings → Storage**, or, if it is not available
+right now, Storage settings, so you can see why.
 
 In **Settings → Storage** you can have finished meetings moved to another
 folder, such as an external drive or a network share, and have each new
@@ -294,6 +294,110 @@ Recording itself always happens on your Mac. While the other folder
 is not available, meetings wait on your Mac and Storage says why; they move by
 themselves at launch, when a disk is connected and after each recording, and
 **Move Now** tries right away.
+
+### The Murmurly window
+
+**Open Murmurly** in the menu shows your meetings: those on this Mac and those
+in the meetings folder you chose in **Settings → Storage**, newest first, under
+Today, Yesterday, This Week and then by month. Each row shows when the meeting
+started, how long it lasted, which app started the recording (or "Manual"), how
+its transcription stands and its size. Meetings shorter than a minute are
+faded; a recording that broke off before it was saved (the app or the Mac
+stopped) says so, and the recording under way has its own row with a **Stop**
+button.
+
+A meeting's row shows **Fully transcribed** with a check mark only when Murmurly
+recorded that its transcription missed nothing; a transcript made before
+Murmurly kept such records says **completeness unknown**, and one with gaps or
+cut short shows a warning.
+
+The sidebar also holds **Dictations**, the dictation history, **Dictionary**,
+your personal dictionary, and **Files**, for transcribing a file; **Settings…**
+at its bottom opens the settings, and the button at the top of the window folds
+the sidebar away.
+
+Click the star of a meeting to find it under **Starred**, and click the pencil
+next to its title to give it a name of your own (press Return to save; an
+empty name shows the date again). Both are kept in the meeting's folder, in
+`murmurly.json`, so they go wherever the meeting goes; the folder itself is
+never renamed. A name is also saved when you click elsewhere or choose another
+meeting; Esc drops it. While a meeting is being moved to your meetings folder,
+its star and name cannot be changed; on a network share, quitting before they
+are saved asks first.
+
+Select a meeting to read its transcript. Select text across lines and copy it,
+press **⌘F** to search it, or use **Copy Text**. A meeting transcribed more than
+once keeps every transcript; choose one above the text. **Transcribe** makes the
+first transcript as your settings say; **Transcribe Again…** lets you pick the
+engine and language for this transcription only. The card also shows what went
+wrong: a recording saved with a warning, a transcript cut short or with gaps,
+a transcription that failed, and other files you put in the meeting's folder.
+**Show in Finder** shows the folder.
+
+The button with two people next to the star names the speakers: who speaks into
+your microphone, and who is heard from the call. The names take the place of
+"Me" and "Others" in the window, in **Copy Text** and in files you save, with a
+line under the header saying who is who; the transcript files themselves never
+change, and a new transcription keeps the names. They need the record Murmurly
+keeps of which track each line came from, so a transcript changed by hand or
+made before such records shows its own labels and says why. **Save As** saves
+the transcript shown as Markdown, plain text or SRT subtitles (subtitles need
+the same record, for each line's exact start and end), named after the
+meeting, for example `2026-10-15 10-31 Meeting.md`; never into a meeting's own
+folder. Select the words the engine got wrong and click **Add to Dictionary…**
+(or Control-click them) to make a dictionary entry from them.
+
+Below the transcript, a player plays the meeting's audio: both tracks
+together, 15 seconds back or on, at 0.75× to 2×, with your side (Me, or the
+name you gave) or the others muted if you like. Click a line's time to hear it from there; the line
+being said is highlighted, and Space plays and pauses while the card has the
+focus. Line times are exact while the transcript is the one Murmurly wrote;
+for a transcript changed by hand or made before Murmurly kept its records,
+they come from the timestamps in the text and are approximate. The player
+pauses when a dictation starts and stops when a meeting recording starts,
+since the recording takes all the sound the Mac plays; it closes the audio
+before the meeting is moved or deleted.
+
+**Search All Meetings** above the list searches the meetings' names and their
+newest transcripts (not the timestamps, the speaker labels or the header).
+The list keeps the meetings found, each with how many times; the transcript
+shows every match, and above it which one of how many is selected, with arrows
+to the previous and next. Return goes to the first, **⌘G** and **⇧⌘G** to the
+next and previous. Upper and lower case and the Russian ё and е are not told apart.
+A transcript not read yet, one that cannot be read, or a meetings folder that
+is not available is said above the list, never taken for "no match".
+
+The window reads the meetings folders when it opens, when you come back to
+Murmurly, when a disk is connected or ejected, after each recording and
+transcription, and when you click **Refresh** (**⌘R**). A meetings folder on a
+network share that does not answer is said to be not responding; the meetings
+on this Mac are shown meanwhile. "Show Transcript" and "Show Last Recording…"
+in the menu open their meeting in the window, even one in a folder you chose
+earlier.
+
+### Deleting meetings and their audio
+
+**Delete Audio…** removes a meeting's tracks and keeps its transcripts, name
+and star; **Delete Meeting…** removes its whole folder. Find both in the
+meeting's card under **Delete**, in a row's menu (Control-click), or, with
+several meetings selected (⌘-click or Shift-click), on the card that appears;
+**⌘⌫** in the list deletes the selected meetings. Murmurly first says how much
+goes, names any other files in the folders, and lists what cannot go now and
+why (a meeting being recorded, transcribed or moved, for example). Everything
+goes to the **Trash**, so you can put it back from there. If something changed
+in a folder after you confirmed, Murmurly asks again instead. A folder on a disk
+without a Trash, such as some network shares, is not deleted: Murmurly shows it
+in Finder for you to delete. Copies of transcripts in your transcripts folder
+are never touched.
+
+**Meeting audio** in **Settings → Meetings** can delete a meeting's audio 7, 30
+or 90 days after its first full transcription (the default keeps it). Before
+the setting changes, Murmurly says how many meetings lose their audio right
+away. This deletion is for good, not to the Trash, and only for a meeting whose
+last transcription missed nothing, whose transcript is unchanged since, which is
+not starred and whose recording was saved without a warning; anything else
+keeps its audio, and the meeting's card says why. **Settings → Storage** shows
+how much meeting audio there is and how many meetings have none left.
 
 ### Transcripts
 
@@ -326,15 +430,27 @@ transcript stays in the meeting folder.
 If no model is downloaded yet, the recording is still saved. Download a model,
 then use **Transcribe Meeting…** the same way.
 
+**Transcribing a meeting again.** Below the folders, the **Transcribe
+Meeting…** panel has **Engine** and **Language** for this transcription only;
+your settings stay as they are. An engine whose model is not downloaded is
+marked so, with a button that downloads it. **Transcribe Again…**, next to the
+last transcription's result in the menu, opens the panel inside that meeting's
+folder, wherever it is now. Each new transcript is saved in a separate file
+(`transcript 2.md`, `transcript 3.md` and so on, and, if you chose a
+transcripts folder, a copy such as `2026-10-09 14-30-00 Meeting 2.md` there);
+earlier transcripts are kept.
+
 ## Transcribing files
 
-Choose **Transcribe a File…** in the menu (it opens **Settings → Files**) and
-drop in an audio or video file (mp3, m4a, wav, mp4, mov), or click **Choose
-File…** or the drop area to choose one, then **Transcribe**. Murmurly uses the
-same engine and language as for dictation (the tab's header names them), shows
+Choose **Transcribe a File…** in the menu (it opens the Murmurly window on
+**Files**) and drop in an audio or video file (mp3, m4a, wav, mp4, mov), or
+click **Choose File…** or the drop area to choose one, then **Transcribe**.
+Murmurly uses the same engine and language as for dictation unless you pick
+others in the menu above the text, for every run until **As Dictation**, shows
 each step (the first preparation of a model can take a couple of minutes), and
 then the text with timestamps. To transcribe another file, drop it onto the
-text or choose it again.
+text or choose it again. If the engine picked in that menu has no model yet, a
+button under the menu downloads it.
 
 The result is not added to the dictation history or saved automatically. It is
 kept in the app until you quit, as the note under the text reminds you; save
@@ -353,6 +469,34 @@ transcription partway, the text recognized so far is kept, with a note at the
 top that says what is missing. If nothing was recognized yet, you see the error
 instead. Transcription never writes beside the input file; you choose where to
 save the `.md`.
+
+## Personal dictionary
+
+The engine may write a name or a term the wrong way, for example "mur merly"
+for "Murmurly". To fix it, open **Dictionary** in the Murmurly window and
+click **Add…**: under **Heard as**, list the spellings the engine writes,
+separated by commas; under **Write as**, how you want it written. **Try it**
+shows a sentence of yours with the dictionary applied. Each entry has its own
+switch, and **Where it applies** turns the dictionary on or off for dictation,
+meetings and files.
+
+To make an entry from a dictation, Control-click it in **Dictations** and
+choose **Add to Dictionary…**, then select the words the engine got wrong in
+the text as it was recognized and click **Use Selection**. From a meeting's
+transcript, see [The Murmurly window](#the-murmurly-window).
+
+The dictionary applies to new dictations, meeting transcripts and file
+transcripts; what is already saved does not change. Upper and lower case and
+the Russian ё and е are not told apart. With the language set to Auto or
+Russian, a spelling in Cyrillic letters for a word written in Latin ones also
+matches the other forms of that word that macOS knows; add the forms it
+misses, often of English terms, as more spellings. A form may also match a
+similar word.
+
+**Export…** saves the dictionary to a file, and **Import…** reads one, for
+example on another Mac: **Add to My Dictionary** keeps your entries and adds
+the file's new ones, and **Replace My Dictionary** takes the file's entries as
+they are.
 
 ## Languages
 
@@ -422,6 +566,10 @@ says so under the language list.
   is "Others".
 - Removing duplicated speech does not work for languages written without spaces
   between words, such as Chinese and Japanese.
+- The personal dictionary finds other forms of a word only in Russian, and only
+  for words macOS knows; add the forms you need as more spellings. It does not
+  support languages written without spaces between words, such as Chinese and
+  Japanese.
 - Dictation and meeting recording never run at the same time.
 - One dictation lasts at most 5 minutes; an automatic meeting recording at most
   4 hours.
@@ -456,8 +604,8 @@ says so under the language list.
   (for example `com.apple.WebKit.GPU` for Safari, or a Chrome helper). The menu
   may show that helper instead of the browser's name, and excluding it excludes
   every call in that browser.
-- Releases without a Developer ID may need the permissions granted again after
-  each update.
+- Murmurly 0.1 was not signed with a Developer ID: updating from it may require
+  granting the permissions again.
 
 ## Building from source
 

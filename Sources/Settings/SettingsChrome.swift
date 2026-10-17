@@ -65,6 +65,29 @@ enum SettingsChrome {
     static let storageLegendMarkerSize: CGFloat = 8
     static let storageLegendCornerRadius: CGFloat = 2
     static let storageBarSegmentSpacing: CGFloat = 2
+    static let dictionarySheetWidth: CGFloat = 480
+    static let dictionarySourceHeight: CGFloat = 76
+    static let dictionarySourcePadding: CGFloat = 4
+}
+
+extension SettingsChrome {
+    /// A section's content in a scroll view with Settings' margins. One
+    /// taller than the window shows its scroll bar for a moment, so the
+    /// cards below the edge are not taken for missing. Sections are built
+    /// with their window and only hidden, so appearing covers just the
+    /// window opening; a switch of sections needs the trigger.
+    static func scrolling<Trigger: Equatable, Content: View>(
+        trigger: Trigger, @ViewBuilder content: () -> Content
+    ) -> some View {
+        ScrollView {
+            content()
+                .padding(.top, contentTopPadding)
+                .padding(.horizontal, contentHorizontalPadding)
+                .padding(.bottom, contentBottomPadding)
+        }
+        .scrollIndicatorsFlash(onAppear: true)
+        .scrollIndicatorsFlash(trigger: trigger)
+    }
 }
 
 /// Titles are `LocalizedStringKey`, so a literal at the call site is looked

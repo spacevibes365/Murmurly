@@ -73,7 +73,7 @@ final class RealAudioStageGateTests: XCTestCase {
         try requireFile(source, label: "known Russian playback source")
 
         let capture = SystemAudioCapture()
-        _ = try await capture.start()
+        _ = try await capture.start(in: RecordingsStore().createSession())
         let tracks: [URL]
         do {
             let player = Process()
@@ -396,10 +396,10 @@ final class RealAudioStageGateTests: XCTestCase {
             )
             let transcriber = MeetingTranscriber(
                 cache: WhisperKitCache(factory: LiveWhisperEngineFactory(), parakeetFactory: LiveParakeetEngineFactory()),
-                loadSpeechDetector: {
+                loadSpeechDetector: { _ in
                     try await MeetingTranscriber.sileroDetector(modelPath: MeetingTranscriber.vadModelPath)
                 },
-                currentEngine: { choice }
+                currentEngine: { _ in choice }
             )
             let lines = try await transcriber.transcribeFile(file) { _ in }
             let text = lines.map(\.text).joined(separator: " ")

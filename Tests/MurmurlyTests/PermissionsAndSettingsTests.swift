@@ -134,6 +134,70 @@ final class PermissionsAndSettingsTests: XCTestCase {
         XCTAssertNotEqual(8_431.formatted(.number.locale(russian)), "8431", "the count lost its grouping")
     }
 
+    /// The count of pieces a transcription missed, in the forms of each
+    /// language that has them: 1, 2, 5 and 21 tell them all apart.
+    /// The deletion and audio-rule questions count meetings and days in each
+    /// language's own forms.
+    func testDeletionQuestionsTakeEachLanguagesPluralForms() throws {
+        func bundle(_ language: String) throws -> Bundle {
+            language == "en" ? Bundle.main : try XCTUnwrap(
+                Bundle.main.path(forResource: language, ofType: "lproj").flatMap(Bundle.init(path:)), "no \(language)"
+            )
+        }
+        func move(_ count: Int, _ language: String) throws -> String {
+            String(localized: "Move \(count) meetings to the Trash?", bundle: try bundle(language), locale: Locale(identifier: language))
+        }
+        func days(_ count: Int, _ language: String) throws -> String {
+            String(localized: "Counting what goes after \(count) days…", bundle: try bundle(language), locale: Locale(identifier: language))
+        }
+        XCTAssertEqual(try move(1, "en"), "Move 1 meeting to the Trash?")
+        XCTAssertEqual(try move(2, "en"), "Move 2 meetings to the Trash?")
+        XCTAssertEqual(try move(1, "ru"), "Переместить в Корзину 1 созвон?")
+        XCTAssertEqual(try move(3, "ru"), "Переместить в Корзину 3 созвона?")
+        XCTAssertEqual(try move(5, "ru"), "Переместить в Корзину 5 созвонов?")
+        XCTAssertEqual(try move(21, "ru"), "Переместить в Корзину 21 созвон?")
+        XCTAssertEqual(try move(2, "pl"), "Przenieść do Kosza 2 spotkania?")
+        XCTAssertEqual(try move(5, "pl"), "Przenieść do Kosza 5 spotkań?")
+        XCTAssertEqual(try days(7, "en"), "Counting what goes after 7 days…")
+        XCTAssertEqual(try days(30, "ru"), "Считаем, что удалится через 30 дней…")
+        XCTAssertEqual(try days(90, "uk"), "Рахуємо, що видалиться через 90 днів…")
+    }
+
+    func testMissedPiecesTakeEachLanguagesPluralForms() throws {
+        func missed(_ count: Int, _ language: String) throws -> String {
+            let bundle = language == "en" ? Bundle.main : try XCTUnwrap(
+                Bundle.main.path(forResource: language, ofType: "lproj").flatMap(Bundle.init(path:)), "no \(language)"
+            )
+            return String(
+                localized: "\(count) pieces of the last transcription weren’t recognized.",
+                bundle: bundle, locale: Locale(identifier: language)
+            )
+        }
+        let expected: [String: [Int: String]] = [
+            "en": [1: "1 piece of the last transcription wasn’t recognized.",
+                   2: "2 pieces of the last transcription weren’t recognized.",
+                   21: "21 pieces of the last transcription weren’t recognized."],
+            "ru": [1: "В последней расшифровке не распознан 1 кусок.",
+                   2: "В последней расшифровке не распознаны 2 куска.",
+                   5: "В последней расшифровке не распознано 5 кусков.",
+                   21: "В последней расшифровке не распознан 21 кусок."],
+            "uk": [1: "В останній розшифровці не розпізнано 1 фрагмент.",
+                   2: "В останній розшифровці не розпізнано 2 фрагменти.",
+                   5: "В останній розшифровці не розпізнано 5 фрагментів.",
+                   21: "В останній розшифровці не розпізнано 21 фрагмент."],
+            "pl": [1: "W ostatniej transkrypcji nie rozpoznano 1 fragmentu.",
+                   2: "W ostatniej transkrypcji nie rozpoznano 2 fragmentów.",
+                   5: "W ostatniej transkrypcji nie rozpoznano 5 fragmentów."],
+            "de": [1: "Im letzten Transkript wurde 1 Abschnitt nicht erkannt.",
+                   2: "Im letzten Transkript wurden 2 Abschnitte nicht erkannt."],
+        ]
+        for (language, forms) in expected {
+            for (count, text) in forms {
+                XCTAssertEqual(try missed(count, language), text, "\(language), \(count)")
+            }
+        }
+    }
+
     func testUnknownSettingsTabFallsBackToDictation() throws {
         let suiteName = "io.github.spacevibes365.MurmurlyTests.SettingsTab.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
@@ -141,6 +205,21 @@ final class PermissionsAndSettingsTests: XCTestCase {
         defaults.set("unknown", forKey: "ui.settingsTab")
 
         XCTAssertEqual(SettingsStore(defaults: defaults).settingsTab, .dictation)
+    }
+
+    /// History, Dictionary and Files left Settings for the main window: a
+    /// tab of theirs stored by an earlier version reads as the default, and
+    /// reading does not write the key.
+    func testOldSettingsTabsFallBackToDictation() throws {
+        for old in ["history", "dictionary", "files"] {
+            let suiteName = "io.github.spacevibes365.MurmurlyTests.SettingsTab.\(UUID().uuidString)"
+            let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+            defer { defaults.removePersistentDomain(forName: suiteName) }
+            defaults.set(old, forKey: "ui.settingsTab")
+
+            XCTAssertEqual(SettingsStore(defaults: defaults).settingsTab, .dictation, old)
+            XCTAssertEqual(defaults.string(forKey: "ui.settingsTab"), old, "reading \(old) wrote the key")
+        }
     }
 
     func testAppearanceDefaultsToSystemWithoutWritingAndPersists() throws {

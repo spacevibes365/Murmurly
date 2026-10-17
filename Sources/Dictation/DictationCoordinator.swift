@@ -33,6 +33,9 @@ final class DictationCoordinator: ObservableObject {
         var interruption: String?
         var actualLanguage = ""
         var text = ""
+        /// The text before the dictionary changed it, nil when it did not.
+        /// Worked out once, with the text, and carried as is to every retry.
+        var rawText: String?
         var recognitionFailed = false
         var recognitionSkipped = false
         /// Ended by the length limit, not by the person. Not archived.
@@ -58,6 +61,7 @@ final class DictationCoordinator: ObservableObject {
                 targetApplicationName: targetApplicationName,
                 audioPath: audioPath,
                 text: text,
+                rawText: rawText,
                 interrupted: interruption == nil ? nil : true,
                 recognitionFailed: recognitionFailed ? true : nil,
                 recognitionSkipped: recognitionSkipped ? true : nil
@@ -90,6 +94,7 @@ final class DictationCoordinator: ObservableObject {
 
         var record: DictationRecord
         let snapshot: SettingsSnapshot?
+        let dictionary: DictionarySnapshot?
         let target: NSRunningApplication?
         let stop: Task<StopOutcome, Never>
         var source: URL?
@@ -158,6 +163,12 @@ final class DictationCoordinator: ObservableObject {
     private let beepPlayer: @MainActor @Sendable () -> Void
     private let ownProcessIdentifier: pid_t
     private let maxRecordingSeconds: TimeInterval
+    /// How long after a dictation its engine stays held (`heldEngine`): the
+    /// next one often follows within it.
+    private let engineHold: Duration
+    /// When the last dictation ended; nil before the first, so a fresh
+    /// launch holds nothing.
+    private var finishedAt: ContinuousClock.Instant?
     private let startTimeout: TimeInterval
     private let hotkeyManager: HotkeyManager
     private weak var settings: SettingsStore?
@@ -168,6 +179,9 @@ final class DictationCoordinator: ObservableObject {
     private var injectTarget: NSRunningApplication?
     private var recordingStartedAt: Date?
     private var recordingSnapshot: SettingsSnapshot?
+    /// Taken with `recordingSnapshot`: an edit during the dictation applies
+    /// to the next one.
+    private var recordingDictionary: DictionarySnapshot?
     private var startAttempt: UInt = 0
     private var startTask: Task<Void, Never>?
     private var startWatchdogTask: Task<Void, Never>?
@@ -196,6 +210,7 @@ final class DictationCoordinator: ObservableObject {
         indicator: RecordingIndicator,
         startTimeout: TimeInterval = 8,
         maxRecordingSeconds: TimeInterval = 300,
+        engineHold: Duration = .seconds(30),
         hotkeyManager: HotkeyManager = HotkeyManager(),
         whisperCache: WhisperKitCache = .shared,
         models: ModelDownloader = ModelDownloader(),
@@ -215,6 +230,7 @@ final class DictationCoordinator: ObservableObject {
         self.indicator = indicator
         self.startTimeout = startTimeout
         self.maxRecordingSeconds = maxRecordingSeconds
+        self.engineHold = engineHold
         self.hotkeyManager = hotkeyManager
         self.whisperCache = whisperCache
         self.models = models
@@ -291,6 +307,16 @@ final class DictationCoordinator: ObservableObject {
 
     var isBusy: Bool { state != .idle }
 
+    /// The engine a meeting job leaves alone now: the dictation's while it
+    /// starts, records or is recognized, and for `engineHold` after it ends.
+    /// The cache holds one engine, and a job in another engine would make
+    /// each dictation load its model back. nil when nothing is held.
+    func heldEngine(at now: ContinuousClock.Instant = .now) -> EngineDescriptor? {
+        if state != .idle { return (recordingSnapshot ?? settings?.snapshot)?.dictationDescriptor }
+        guard let finishedAt, now < finishedAt + engineHold else { return nil }
+        return settings?.snapshot.dictationDescriptor
+    }
+
     func toggle() {
         guard !isTerminating else {
             AppLog.info("dictation", "quitting — toggle ignored")
@@ -336,6 +362,7 @@ final class DictationCoordinator: ObservableObject {
         startAttempt &+= 1
         let attempt = startAttempt
         recordingSnapshot = settings?.snapshot
+        recordingDictionary = settings?.dictionarySnapshot
         startInjectTarget = Self.preferredInjectionTarget(
             startedWith: nil,
             stoppedWith: frontmostApplication(),
@@ -413,6 +440,7 @@ final class DictationCoordinator: ObservableObject {
         startInjectTarget = nil
         injectTarget = nil
         recordingSnapshot = nil
+        recordingDictionary = nil
         if error is CancellationError {
             indicator.clearBase()
             return
@@ -432,6 +460,7 @@ final class DictationCoordinator: ObservableObject {
         startInjectTarget = nil
         injectTarget = nil
         recordingSnapshot = nil
+        recordingDictionary = nil
         indicator.finish(with: .microphoneTimedOut)
         AppLog.error("dictation", "microphone start timed out")
         _ = try? await mic.stop()
@@ -468,6 +497,7 @@ final class DictationCoordinator: ObservableObject {
         job = DictationJob(
             record: record,
             snapshot: recordingSnapshot,
+            dictionary: recordingDictionary,
             target: injectTarget,
             stop: Task { await Self.stopOutcome(of: mic) }
         )
@@ -517,19 +547,23 @@ final class DictationCoordinator: ObservableObject {
         }
 
         job?.phase = .recognizing
-        let recognition: Result<(text: String, language: String, decodeDuration: TimeInterval), any Error>
+        let recognition: Result<Recognized, any Error>
         do {
-            recognition = .success(try await transcribe(url: url, snapshot: snapshot))
+            recognition = .success(try await transcribe(url: url, snapshot: snapshot, dictionary: current.dictionary))
         } catch {
             recognition = .failure(error)
         }
         guard owns(entryID), var record = job?.record else { return }
         let decodeDuration: TimeInterval
+        var replacements = 0
         switch recognition {
         case let .success(result):
             record.text = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            let raw = result.rawText.trimmingCharacters(in: .whitespacesAndNewlines)
+            record.rawText = raw == record.text ? nil : raw
             record.actualLanguage = result.language
             decodeDuration = result.decodeDuration
+            replacements = result.replacements
         case let .failure(error):
             // Archived with a history line like any dictation, marked so the
             // error is never shown as silence: it can be found and tried again
@@ -588,11 +622,12 @@ final class DictationCoordinator: ObservableObject {
         }
         let audioDuration = saved?.duration ?? 0
         let rtfx = decodeDuration > 0 ? audioDuration / decodeDuration : 0
+        // The count only: the log never holds dictated words.
         AppLog.info(
             "dictation",
-            String(format: "engine=%@ audio=%.1fs decode=%.2fs rtfx=%.1fx",
+            String(format: "engine=%@ audio=%.1fs decode=%.2fs rtfx=%.1fx replacements=%d",
                    locale: Locale(identifier: "en_US_POSIX"),
-                   snapshot.dictationEngine.rawValue, audioDuration, decodeDuration, rtfx)
+                   snapshot.dictationEngine.rawValue, audioDuration, decodeDuration, rtfx, replacements)
         )
         if let interruption = record.interruption {
             if saved == nil { insertUnsaved(record, source: url) }
@@ -609,7 +644,7 @@ final class DictationCoordinator: ObservableObject {
             finishDictation()
             indicator.showFlash(.dictationFailure(message: saved == nil
                 ? String(localized: "Not recognized; the audio is kept in the “M” menu until you quit")
-                : String(localized: "Not recognized — the audio is in History; try it in Files")))
+                : String(localized: "Not recognized — the audio is in Dictations; try it in Files")))
             return
         }
         guard !text.isEmpty else {
@@ -758,11 +793,13 @@ final class DictationCoordinator: ObservableObject {
 
     private func finishDictation() {
         state = .idle
+        finishedAt = .now
         hotkeyManager.dictationDidBecomeIdle()
         startInjectTarget = nil
         injectTarget = nil
         recordingStartedAt = nil
         recordingSnapshot = nil
+        recordingDictionary = nil
         transcriptionTask = nil
         job = nil
         indicator.clearBase()
@@ -794,10 +831,17 @@ final class DictationCoordinator: ObservableObject {
         beepPlayer()
     }
 
+    /// `text` is after the personal dictionary, `rawText` the engine's
+    /// segments as joined, before it.
+    private typealias Recognized = (
+        text: String, rawText: String, language: String, decodeDuration: TimeInterval, replacements: Int
+    )
+
     private func transcribe(
         url: URL,
-        snapshot: SettingsSnapshot
-    ) async throws -> (text: String, language: String, decodeDuration: TimeInterval) {
+        snapshot: SettingsSnapshot,
+        dictionary: DictionarySnapshot?
+    ) async throws -> Recognized {
         let descriptor = snapshot.dictationDescriptor
         let progress = modelProgress(
             descriptor: descriptor,
@@ -810,8 +854,20 @@ final class DictationCoordinator: ObservableObject {
             request: snapshot.decodeRequest,
             progress: progress
         )
-        return (decoded.segments.map(\.text).joined(separator: " "),
-                decoded.language, decoded.decodeDuration)
+        let raw = decoded.segments.map(\.text).joined(separator: " ")
+        // Never throws: a dictionary problem is not a recognition failure.
+        let replaced = await Self.replacing(in: raw, dictionary: dictionary)
+        return (replaced.text, raw, decoded.language, decoded.decodeDuration, replaced.count)
+    }
+
+    /// Off the main actor: preparing the dictionary and the replacement both
+    /// call macOS's tagger.
+    private nonisolated static func replacing(
+        in text: String,
+        dictionary: DictionarySnapshot?
+    ) async -> (text: String, count: Int) {
+        guard !text.isEmpty, let replacer = dictionary?.replacer(for: .dictation) else { return (text, 0) }
+        return replacer.replacing(in: text)
     }
 
     func copyHistoryEntry(_ entry: DictationHistoryEntry) {
@@ -1070,6 +1126,17 @@ final class DictationCoordinator: ObservableObject {
         modelFailure = nil
         guard state == .idle else { return }
         startModelWarmup(descriptor: descriptor)
+    }
+
+    /// After meeting jobs or a Files run in an engine of their own, which
+    /// took the cache: the selected model goes back by the warm-up's own
+    /// rules. Only while idle (a dictation under way warms it as it ends),
+    /// only with its model there, and under the selection's generation, so a
+    /// later change of the settings wins over it. A failure shows as the
+    /// warm-up's would; the job's result is in already.
+    func prepareAfterOtherEngineJob() {
+        guard state == .idle, let engine = settings?.dictationEngine else { return }
+        startModelWarmup(descriptor: EngineDescriptor(engine: engine, modelPath: SettingsStore.modelPath(for: engine)))
     }
 
     /// Prepares the selected model again: after a download, which may be the

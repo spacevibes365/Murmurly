@@ -26,7 +26,7 @@ private actor TestMeetingCapture: MeetingCaptureBackend {
         self.startedAt = startedAt
     }
 
-    func start() async throws -> Date {
+    func start(in _: URL) async throws -> Date {
         startCalls += 1
         if startMode == .cancelOnce, startCalls == 1 { throw CancellationError() }
         return startedAt
@@ -53,6 +53,46 @@ private actor TestMeetingCapture: MeetingCaptureBackend {
     }
 
     func counts() -> (starts: Int, stops: Int) { (startCalls, stopCalls) }
+}
+
+/// Records into the folder the recorder made, as the real backend does: the
+/// tracks appear as the capture starts, `metadata.json` only at the stop. It
+/// can hold its start until the test lets it go, or refuse it.
+private actor FolderCapture: MeetingCaptureBackend {
+    static let startedAt = Date(timeIntervalSinceReferenceDate: 5_000)
+    private(set) var given: URL?
+    private var holding: Bool
+    private let refuses: Bool
+    private var directory: URL?
+
+    init(holdsStart: Bool = false, refuses: Bool = false) {
+        holding = holdsStart
+        self.refuses = refuses
+    }
+
+    func release() { holding = false }
+
+    func start(in directory: URL) async throws -> Date {
+        given = directory
+        while holding { try await Task.sleep(for: .milliseconds(5)) }
+        if refuses { throw SystemAudioCaptureError.microphoneUnavailable }
+        for name in ["system.caf", "microphone.caf"] {
+            try MeetingAudio.write([[Float](repeating: 0, count: 4_800)], to: directory.appendingPathComponent(name))
+        }
+        self.directory = directory
+        return Self.startedAt
+    }
+
+    func stop() async throws -> [URL] {
+        guard let directory else { throw SystemAudioCaptureError.notRunning }
+        self.directory = nil
+        let metadata = MeetingMetadata(
+            startedAt: "2026-10-15T10:00:00Z", endedAt: "2026-10-15T10:01:00Z",
+            sampleRate: 48_000, state: "done", segments: []
+        )
+        try JSONEncoder().encode(metadata).write(to: directory.appendingPathComponent("metadata.json"))
+        return ["system.caf", "microphone.caf"].map { directory.appendingPathComponent($0) }
+    }
 }
 
 private actor TestMeetingMic: MicCapturing {
@@ -95,6 +135,32 @@ final class MeetingRecorderTests: XCTestCase {
             watchdogSnapshotSource: snapshots,
             beepPlayer: beepPlayer
         )
+    }
+
+    /// A recorder whose sessions are made in `root`, as the app makes them.
+    private func folderRecorder(_ capture: FolderCapture, root: URL) -> MeetingRecorder {
+        MeetingRecorder(
+            capture: capture,
+            indicator: RecordingIndicator(renderingEnabled: false),
+            hasMicrophoneAccess: { true },
+            permissionPromptDelay: .zero,
+            watchdogSnapshotSource: { [] },
+            beepPlayer: {},
+            createSession: { try RecordingsStore().createSession(root: root) }
+        )
+    }
+
+    /// A settings store of its own; an absolute suite path keeps its file in `root`.
+    private func isolatedSettings(in root: URL) throws -> SettingsStore {
+        SettingsStore(defaults: try XCTUnwrap(UserDefaults(suiteName: root.appendingPathComponent("settings").path)))
+    }
+
+    private func waitUntilCapture(_ capture: FolderCapture, given: @Sendable (URL?) -> Bool) async throws {
+        for _ in 0..<100 {
+            if given(await capture.given) { return }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTFail("the capture was not given the session's folder")
     }
 
     private func waitUntil(_ done: @escaping @MainActor () -> Bool) async throws {
@@ -163,10 +229,120 @@ final class MeetingRecorderTests: XCTestCase {
         recorder.toggle()
         try await wait(recorder, for: .idle)
         XCTAssertEqual(recorder.lastRecordingDirectory?.path, directory.path)
-        XCTAssertNil(try metadata(in: directory).trigger)
+        XCTAssertEqual(try metadata(in: directory).trigger, "manual", "a recording started by hand says so")
         let calls = await capture.counts()
         XCTAssertEqual(calls.starts, 1)
         XCTAssertEqual(calls.stops, 1)
+    }
+
+    // MARK: - The session's folder
+
+    /// The recorder makes the folder before it awaits the start, so a folder
+    /// without metadata is known to be this recording from its first moment,
+    /// not taken for one that broke off.
+    func testSessionFolderIsKnownFromTheFirstMomentOfStarting() async throws {
+        let root = directory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let capture = FolderCapture(holdsStart: true)
+        let recorder = folderRecorder(capture, root: root)
+
+        recorder.toggle()
+
+        XCTAssertEqual(recorder.state, .starting)
+        let session = try XCTUnwrap(recorder.currentSession, "no session while the start is awaited")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: session.directory.path), "the folder is made before the start")
+        XCTAssertEqual(session.directory.deletingLastPathComponent().standardizedFileURL, root.standardizedFileURL)
+        XCTAssertNil(session.startedAt)
+        XCTAssertNil(session.trigger)
+        try await waitUntilCapture(capture) { $0 == session.directory }
+
+        await capture.release()
+        try await wait(recorder, for: .recording)
+        XCTAssertEqual(recorder.currentSession?.directory, session.directory)
+        XCTAssertEqual(recorder.currentSession?.startedAt, FolderCapture.startedAt)
+
+        recorder.toggle()
+        try await wait(recorder, for: .idle)
+        XCTAssertNil(recorder.currentSession)
+        XCTAssertEqual(recorder.lastRecordingDirectory?.path, session.directory.path)
+        XCTAssertEqual(try metadata(in: session.directory).trigger, "manual")
+    }
+
+    /// The session ends only once the stop's result is out: the folder has
+    /// its metadata, the recorder its last recording, and the queue its job,
+    /// so the window goes from the live row straight to the queued meeting.
+    func testSessionEndsOnlyOnceTheStopIsPublished() async throws {
+        let root = directory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let settings = try isolatedSettings(in: root)
+        settings.meetingAfterStop = .transcribe
+        let queue = MeetingTranscriptionQueue(
+            transcriber: MeetingTranscriber(
+                cache: WhisperKitCache(factory: ConstantEngineFactory()),
+                loadSpeechDetector: { _ in { _ in [] } },
+                currentEngine: { _ in throw TranscriptionError.engineUnavailable("not used: no speech") },
+                temporaryRoot: root
+            ),
+            meetingsRoot: root
+        )
+        let recorder = folderRecorder(FolderCapture(), root: root)
+        recorder.transcripts = queue
+        activate(recorder, settings: settings)
+        recorder.toggle()
+        try await wait(recorder, for: .recording)
+        let session = try XCTUnwrap(recorder.currentSession)
+        var atEnd: (state: MeetingRecorder.State, last: URL?, metadata: Bool, jobs: [URL])?
+        // `@Published` sends before the property changes: what is read here
+        // is everything published before the session ends.
+        let watch = recorder.$currentSession.dropFirst().sink { value in
+            guard value == nil, atEnd == nil else { return }
+            atEnd = (
+                recorder.state,
+                recorder.lastRecordingDirectory,
+                FileManager.default.fileExists(atPath: session.directory.appendingPathComponent("metadata.json").path),
+                (queue.pending.map(\.folder) + [queue.activeJob?.folder].compactMap { $0 }).map(\.standardizedFileURL)
+            )
+        }
+        defer { watch.cancel() }
+
+        recorder.toggle()
+        try await wait(recorder, for: .idle)
+
+        let end = try XCTUnwrap(atEnd, "the session never ended")
+        XCTAssertEqual(end.state, .idle)
+        XCTAssertEqual(end.last?.path, session.directory.path)
+        XCTAssertTrue(end.metadata, "the session ended before its metadata was written")
+        XCTAssertTrue(end.jobs.contains(session.directory.standardizedFileURL), "the session ended before the job was queued")
+        try await waitUntil { queue.activeJob == nil && queue.pending.isEmpty }
+    }
+
+    /// A start that never runs leaves no session behind: a capture that
+    /// refuses, and a folder that cannot be made, which no capture is asked
+    /// to record into.
+    func testFailedStartEndsTheSession() async throws {
+        let root = directory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let refusing = folderRecorder(FolderCapture(refuses: true), root: root)
+        refusing.toggle()
+        XCTAssertNotNil(refusing.currentSession)
+        try await waitUntil { if case .failed = refusing.state { true } else { false } }
+        XCTAssertNil(refusing.currentSession)
+
+        let capture = FolderCapture()
+        let noFolder = MeetingRecorder(
+            capture: capture,
+            indicator: RecordingIndicator(renderingEnabled: false),
+            hasMicrophoneAccess: { true },
+            permissionPromptDelay: .zero,
+            watchdogSnapshotSource: { [] },
+            beepPlayer: {},
+            createSession: { throw CocoaError(.fileWriteNoPermission) }
+        )
+        noFolder.toggle()
+        guard case .failed = noFolder.state else { return XCTFail("state \(noFolder.state)") }
+        XCTAssertNil(noFolder.currentSession)
+        let given = await capture.given
+        XCTAssertNil(given, "the capture was started without a folder")
     }
 
     func testMissingMicrophonePermissionDoesNotStartBackend() async {
@@ -345,16 +521,18 @@ final class MeetingRecorderTests: XCTestCase {
         let recorder = recorder(TestMeetingCapture(tracks: [directory.appendingPathComponent("system.caf")]))
         let settings = SettingsStore()
         let models = ModelDownloader(root: directory.appendingPathComponent("Models"))
+        let queue = MeetingTranscriptionQueue(transcriber: .live(settings: settings, models: models))
         let menu = NSHostingMenu(rootView: DictationMenuView(
             dictation: DictationCoordinator(
                 mic: TestMeetingMic(), indicator: RecordingIndicator(renderingEnabled: false), models: models
             ),
             meeting: recorder,
-            meetingTranscripts: MeetingTranscriptionQueue(transcriber: .live(settings: settings, models: models)),
+            meetingTranscripts: queue,
             permissions: PermissionManager(),
             settings: settings,
             models: models,
-            updater: AppUpdater(busy: Just(false))
+            updater: AppUpdater(busy: Just(false)),
+            library: MeetingLibrary(recorder: recorder, queue: queue, settings: settings)
         ))
         // SwiftUI rebuilds the items after a state change on a later turn.
         // A whole word: "Record Meeting" must not find "Record Meetings
@@ -376,6 +554,8 @@ final class MeetingRecorderTests: XCTestCase {
             }
         }
 
+        let open = try await item("Open Murmurly")
+        XCTAssertEqual(menu.items.first, open, "the window's item is not the menu's first")
         let record = try await item("Record Meeting")
         XCTAssertNotNil(record.image, "Record Meeting has no symbol")
         assertNoEmoji()

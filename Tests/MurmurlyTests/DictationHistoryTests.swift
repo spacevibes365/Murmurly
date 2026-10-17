@@ -56,6 +56,37 @@ final class DictationHistoryStoreTests: XCTestCase {
             XCTAssertEqual(decoded.schemaVersion, 1)
         }
     }
+    /// The exact bytes of a line, against a reference written out by hand.
+    /// Uses only API older than `raw_text`, so the same test runs against
+    /// code without it: a line without replacements must not change.
+    func testIndexLineIsByteForByteTheReference() async throws {
+        let root = try makeHistoryRoot()
+        defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
+        let store = DictationHistoryStore(root: root)
+        let entry = DictationHistoryEntry(
+            id: try XCTUnwrap(UUID(uuidString: "6F1C9E6A-5B0C-4F55-9C64-1D1B0B8F2A10")),
+            at: Date(timeIntervalSince1970: 1_700_000_000.25),
+            duration: 1.5,
+            selectedLanguage: "auto",
+            actualLanguage: "ru",
+            engine: "parakeet",
+            targetBundleID: "com.example.editor",
+            targetApplicationName: "Editor",
+            audioPath: "2023/11/6F1C9E6A-5B0C-4F55-9C64-1D1B0B8F2A10.m4a",
+            text: "привет, мир"
+        )
+
+        try await store.append(entry)
+
+        let reference = #"{"actual_language":"ru","at":"2023-11-14T22:13:20.250Z","#
+            + #""audio_path":"2023\/11\/6F1C9E6A-5B0C-4F55-9C64-1D1B0B8F2A10.m4a","duration_seconds":1.5,"#
+            + #""engine":"parakeet","id":"6F1C9E6A-5B0C-4F55-9C64-1D1B0B8F2A10","schema_version":1,"#
+            + #""selected_language":"auto","source":"dictation","target_app_name":"Editor","#
+            + #""target_bundle_id":"com.example.editor","text":"привет, мир"}"# + "\n"
+        let written = try Data(contentsOf: root.appendingPathComponent(DictationHistoryStore.historyFileName))
+        XCTAssertEqual(written, Data(reference.utf8), String(decoding: written, as: UTF8.self))
+    }
+
     func testHistorySummaryTable() async throws {
         let cases: [(name: String, entries: [DictationHistoryEntry], malformedMiddle: Bool, removeFinalNewline: Bool)] = [
             ("empty", [], false, false),
@@ -238,31 +269,26 @@ final class DictationHistoryStoreTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: note.path), "Clear All deleted a document")
     }
 
-    /// The same boundary decides whether there is anything to clear: other
-    /// files in the folder do not keep Clear All on for ever, an empty
-    /// dictation file does turn it on.
-    func testOnlyTheArchivesOwnFilesCountAsSomethingToClear() throws {
+    /// The same boundary decides whether Dictations' Clear All has anything
+    /// to clear: other files in the folder do not keep it on for ever, an
+    /// empty dictation file does turn it on.
+    func testOnlyTheArchivesOwnFilesCountAsSomethingToClear() async throws {
         let dictations = try makeHistoryRoot()
         let parent = dictations.deletingLastPathComponent()
         defer { try? FileManager.default.removeItem(at: parent) }
-        let meetings = parent.appendingPathComponent("Meetings", isDirectory: true)
-        try FileManager.default.createDirectory(at: meetings, withIntermediateDirectories: true)
+        let summarize = DictationHistoryViewModel.summarize(DictationHistoryStore(root: dictations))
         let foreign = dictations.appendingPathComponent("2026-10-10 10-00-00 Meeting", isDirectory: true)
         try FileManager.default.createDirectory(at: foreign, withIntermediateDirectories: true)
         try Data(repeating: 1, count: 64).write(to: foreign.appendingPathComponent("system.m4a"))
 
-        let foreignOnly = ArchiveSnapshot.local(
-            historyCount: 0, historyOldest: nil, dictationsRoot: dictations, meetingsRoot: meetings
-        )
-        XCTAssertFalse(foreignOnly.hasDictationFiles, "a meeting in the folder keeps Clear All on")
+        let foreignOnly = try await summarize()
+        XCTAssertFalse(foreignOnly.hasFiles, "a meeting in the folder keeps Clear All on")
 
         let month = dictations.appendingPathComponent("2026/10", isDirectory: true)
         try FileManager.default.createDirectory(at: month, withIntermediateDirectories: true)
         try Data().write(to: month.appendingPathComponent(UUID().uuidString.lowercased() + ".caf"))
-        let leftover = ArchiveSnapshot.local(
-            historyCount: 0, historyOldest: nil, dictationsRoot: dictations, meetingsRoot: meetings
-        )
-        XCTAssertTrue(leftover.hasDictationFiles, "an empty dictation file left by a failed clear is not seen")
+        let leftover = try await summarize()
+        XCTAssertTrue(leftover.hasFiles, "an empty dictation file left by a failed clear is not seen")
     }
 
     /// A month folder whose names can't be read is not
@@ -277,7 +303,6 @@ final class DictationHistoryStoreTests: XCTestCase {
             try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: month.path)
             try? FileManager.default.removeItem(at: parent)
         }
-        let meetings = parent.appendingPathComponent("Meetings", isDirectory: true)
         try FileManager.default.createDirectory(at: month, withIntermediateDirectories: true)
         let audio = month.appendingPathComponent(UUID().uuidString.lowercased() + ".caf")
         let note = month.appendingPathComponent("notes.md")
@@ -286,24 +311,21 @@ final class DictationHistoryStoreTests: XCTestCase {
         // Search and write, but no reading of the names inside.
         try FileManager.default.setAttributes([.posixPermissions: 0o300], ofItemAtPath: month.path)
         let store = DictationHistoryStore(root: dictations)
+        let summarize = DictationHistoryViewModel.summarize(store)
 
         var failed = false
         do { try await store.clearAll() } catch { failed = true }
         XCTAssertTrue(failed, "Clear All succeeded with a month it could not read")
-        let unreadable = ArchiveSnapshot.local(
-            historyCount: 0, historyOldest: nil, dictationsRoot: dictations, meetingsRoot: meetings
-        )
-        XCTAssertTrue(unreadable.hasDictationFiles, "a month that can't be read was taken for an empty one")
+        let unreadable = try await summarize()
+        XCTAssertTrue(unreadable.hasFiles, "a month that can't be read was taken for an empty one")
 
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: month.path)
         try await store.clearAll()
 
         XCTAssertFalse(FileManager.default.fileExists(atPath: audio.path), "the repeat left the dictation's audio")
         XCTAssertTrue(FileManager.default.fileExists(atPath: note.path), "the repeat deleted a document")
-        let cleared = ArchiveSnapshot.local(
-            historyCount: 0, historyOldest: nil, dictationsRoot: dictations, meetingsRoot: meetings
-        )
-        XCTAssertFalse(cleared.hasDictationFiles)
+        let cleared = try await summarize()
+        XCTAssertFalse(cleared.hasFiles)
     }
 
     /// A month is two ASCII digits, 01 to 12, and a
@@ -313,7 +335,6 @@ final class DictationHistoryStoreTests: XCTestCase {
         let dictations = try makeHistoryRoot()
         let parent = dictations.deletingLastPathComponent()
         defer { try? FileManager.default.removeItem(at: parent) }
-        let meetings = parent.appendingPathComponent("Meetings", isDirectory: true)
         let kept = ["2026/+1", "+026/01"].map {
             dictations.appendingPathComponent($0, isDirectory: true)
                 .appendingPathComponent(UUID().uuidString.lowercased() + ".caf")
@@ -326,12 +347,10 @@ final class DictationHistoryStoreTests: XCTestCase {
         }
         let store = DictationHistoryStore(root: dictations)
 
-        let snapshot = ArchiveSnapshot.local(
-            historyCount: 0, historyOldest: nil, dictationsRoot: dictations, meetingsRoot: meetings
-        )
+        let summary = try await DictationHistoryViewModel.summarize(store)()
         try await store.clearAll()
 
-        XCTAssertFalse(snapshot.hasDictationFiles, "a file outside the archive's months is something to clear")
+        XCTAssertFalse(summary.hasFiles, "a file outside the archive's months is something to clear")
         for file in kept {
             XCTAssertTrue(FileManager.default.fileExists(atPath: file.path), "Clear All deleted \(file.path)")
         }
@@ -379,6 +398,103 @@ final class DictationHistoryStoreTests: XCTestCase {
         let size = try handle.seekToEnd()
         XCTAssertGreaterThan(size, 0)
         try handle.truncate(atOffset: size - 1)
+    }
+}
+
+/// The Dictations section counts the history itself, in whatever window it
+/// is: lines, the audio a clear that failed halfway leaves without lines,
+/// and a failure that is not a zero.
+@MainActor
+final class DictationHistorySummaryTests: XCTestCase {
+    func testTheHistoryCountsItself() async throws {
+        let root = try makeHistoryRoot()
+        defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
+        let store = DictationHistoryStore(root: root)
+        let model = DictationHistoryViewModel(store: store)
+        await model.refreshSummary()
+        XCTAssertEqual(model.summary, .init(count: 0, hasFiles: false))
+
+        try await store.append(makeEntry(index: 0))
+        try await store.append(makeEntry(index: 1))
+        await model.refreshSummary()
+        XCTAssertEqual(model.summary, .init(count: 2, hasFiles: true))
+
+        // A clear that failed halfway: no lines, the audio still there.
+        try Data().write(to: root.appendingPathComponent(DictationHistoryStore.historyFileName))
+        let month = root.appendingPathComponent("2026/10", isDirectory: true)
+        try FileManager.default.createDirectory(at: month, withIntermediateDirectories: true)
+        try Data(repeating: 1, count: 16).write(to: month.appendingPathComponent(UUID().uuidString.lowercased() + ".m4a"))
+        await model.refreshSummary()
+        XCTAssertEqual(model.summary?.count, 0)
+        XCTAssertEqual(model.summary?.hasFiles, true, "Clear All has nothing left to finish with")
+        XCTAssertFalse(model.summaryFailed)
+
+        // An index that can't be read is a failure, not an empty history.
+        let index = root.appendingPathComponent(DictationHistoryStore.historyFileName)
+        try FileManager.default.removeItem(at: index)
+        try FileManager.default.createDirectory(at: index, withIntermediateDirectories: false)
+        await model.refreshSummary()
+        XCTAssertTrue(model.summaryFailed, "a history that can't be read passed for counted")
+        XCTAssertEqual(model.summary?.count, 0, "the last figures went with the failure")
+    }
+
+    /// A count started before a change of the archive or a Try Again, and
+    /// answered after the newer one, says nothing: neither its number, nor
+    /// its failure, nor what Clear All may do.
+    func testAnOlderCountSaysNothingOverANewerOne() async throws {
+        let root = try makeHistoryRoot()
+        defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
+        let answers = SummaryAnswers()
+        let model = DictationHistoryViewModel(store: DictationHistoryStore(root: root)) {
+            try await answers.next()
+        }
+        let older = Task { await model.refreshSummary() }
+        await answers.waitAsked(1)
+        let newer = Task { await model.refreshSummary() }
+        await answers.waitAsked(2)
+        answers.answer(2, with: .success(.init(count: 0, hasFiles: false)))
+        await newer.value
+        XCTAssertEqual(model.summary, .init(count: 0, hasFiles: false))
+
+        answers.answer(1, with: .success(.init(count: 7, hasFiles: true)))
+        await older.value
+        XCTAssertEqual(model.summary, .init(count: 0, hasFiles: false), "an older count took the newer one's place")
+
+        let failing = Task { await model.refreshSummary() }
+        await answers.waitAsked(3)
+        let last = Task { await model.refreshSummary() }
+        await answers.waitAsked(4)
+        answers.answer(4, with: .success(.init(count: 3, hasFiles: true)))
+        await last.value
+        answers.answer(3, with: .failure(CocoaError(.fileReadUnknown)))
+        await failing.value
+        XCTAssertFalse(model.summaryFailed, "an older count's failure was shown over a newer count")
+        XCTAssertEqual(model.summary, .init(count: 3, hasFiles: true))
+    }
+}
+
+/// Summaries answered by the test, each when it says, in any order.
+private final class SummaryAnswers: @unchecked Sendable {
+    private let lock = NSLock()
+    private var asked = 0
+    private var waiting: [Int: CheckedContinuation<DictationHistoryViewModel.Summary, any Error>] = [:]
+
+    func next() async throws -> DictationHistoryViewModel.Summary {
+        try await withCheckedThrowingContinuation { continuation in
+            lock.withLock {
+                asked += 1
+                waiting[asked] = continuation
+            }
+        }
+    }
+
+    func waitAsked(_ count: Int) async {
+        while lock.withLock({ asked < count }) { try? await Task.sleep(for: .milliseconds(5)) }
+    }
+
+    func answer(_ number: Int, with result: Result<DictationHistoryViewModel.Summary, any Error>) {
+        let continuation = lock.withLock { waiting.removeValue(forKey: number) }
+        continuation?.resume(with: result)
     }
 }
 
@@ -964,7 +1080,7 @@ final class DictationHistoryPipelineTests: XCTestCase {
         XCTAssertEqual(entries.map(\.recognitionFailed), [true])
         XCTAssertEqual(
             fixture.indicator.presentedState,
-            .dictationFailure(message: "Not recognized — the audio is in History; try it in Files")
+            .dictationFailure(message: "Not recognized — the audio is in Dictations; try it in Files")
         )
         XCTAssertEqual(fixture.coordinator.modelFailure, "the model could not be loaded")
         XCTAssertEqual(

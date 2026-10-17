@@ -1,7 +1,7 @@
 import AppKit
 import XCTest
 
-/// The history list in a real open Settings → History window. The app's DEBUG history
+/// The history list in the main window's Dictations section. The app's DEBUG history
 /// probe appends dictations through the shared store on request; it has no
 /// refresh logic, and the same probe is applied to the tree before the fix.
 @MainActor
@@ -47,13 +47,117 @@ final class HistoryProbeTests: XCTestCase {
         XCTAssertTrue(app.staticTexts[matching].waitForExistence(timeout: 5))
         XCTAssertTrue(waitForCount(in: app, 1, of: 2))
 
+        // One that does not match, then one that does: the list shows the
+        // second only from a read made after both, so what it leaves out is
+        // what that read filtered. The total comes first, from a count of its
+        // own, while the list may still be the old one or being read again.
         let other = "probe other"
         guard requestAppend(text: other, root: root) else { return }
         XCTAssertTrue(waitForCount(in: app, 1, of: 3), "total not refreshed")
+        let again = "probe 4242 again"
+        guard requestAppend(text: again, root: root) else { return }
+        XCTAssertTrue(app.staticTexts[again].waitForExistence(timeout: 5), "the list was not read again")
+        XCTAssertTrue(waitForCount(in: app, 2, of: 4))
         XCTAssertFalse(app.staticTexts[other].exists, "the filter was dropped on refresh")
         XCTAssertFalse(app.staticTexts[seed].exists, "the filter was dropped on refresh")
         XCTAssertTrue(app.staticTexts[matching].exists)
         XCTAssertEqual(search.value as? String, "4242")
+    }
+
+    /// Dictations and Storage, open together in their two windows, count
+    /// the archive each its own way and both follow every change: a new
+    /// dictation, a deletion, a clear, and a clear that failed after it
+    /// emptied the index, as the audio could not be removed: no lines, the
+    /// audio left still counted and Clear All still on, until a repeat
+    /// clears it. Dictations counts with Settings never opened.
+    func testBothWindowsSeeEveryChangeOfTheArchive() throws {
+        let root = try makeRoot()
+        let month = root.appendingPathComponent("2026/10", isDirectory: true)
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: month.path)
+            try? FileManager.default.removeItem(at: root)
+        }
+        let app = launch(root: root)
+        defer { app.terminate() }
+        guard app.openMainSection("dictations") else { return }
+        XCTAssertTrue(waitForCount(in: app, 0, of: 0), "Dictations did not count with Settings never opened")
+        guard openSettings(in: app) else { return }
+        app.windows["settings"].buttons["settingsTab.storage"].click()
+        XCTAssertTrue(waitForStorage(dictations: 0, in: app), "Storage did not count")
+        let empty = storageLine(in: app)
+
+        let text = "probe 7171"
+        guard requestAppend(text: text, root: root) else { return }
+        XCTAssertTrue(waitForCount(in: app, 1, of: 1), "Dictations missed the new dictation")
+        XCTAssertTrue(waitForStorage(dictations: 1, in: app), "Storage missed the new dictation")
+
+        let main = app.windows["main"]
+        main.descendants(matching: .any)["mainSection.dictations"].click()
+        main.staticTexts[text].rightClick()
+        app.menuItems[AppLanguage.text("Delete…")].click()
+        app.sheets.firstMatch.buttons[AppLanguage.text("Delete")].click()
+        XCTAssertTrue(waitForCount(in: app, 0, of: 0), "Dictations missed the deletion")
+        XCTAssertTrue(waitForStorage(dictations: 0, in: app), "Storage missed the deletion")
+
+        let clear = main.buttons["clearHistoryButton"]
+        func clearAll() {
+            clear.click()
+            app.sheets.firstMatch.buttons[AppLanguage.text("Clear All")].click()
+        }
+        guard requestAppend(text: "probe 7272", root: root) else { return }
+        XCTAssertTrue(waitForCount(in: app, 1, of: 1), "Dictations missed the dictation to clear")
+        XCTAssertTrue(waitForStorage(dictations: 1, in: app), "Storage missed the dictation to clear")
+        clearAll()
+        XCTAssertTrue(waitForCount(in: app, 0, of: 0), "Dictations missed the clear")
+        XCTAssertTrue(waitForStorage(dictations: 0, in: app), "Storage missed the clear")
+
+        // A dictation's audio in a month folder whose entries can't be
+        // removed: the clear empties the index, then fails on the audio.
+        try FileManager.default.createDirectory(at: month, withIntermediateDirectories: true)
+        let audio = month.appendingPathComponent(UUID().uuidString.lowercased() + ".caf")
+        try Data(repeating: 1, count: 64 * 1024).write(to: audio)
+        try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: month.path)
+        guard requestAppend(text: "probe 7373", root: root) else { return }
+        XCTAssertTrue(waitForCount(in: app, 1, of: 1), "Dictations missed the dictation to clear")
+        XCTAssertTrue(waitForStorage(dictations: 1, in: app), "Storage missed the dictation to clear")
+        clearAll()
+        let ok = app.sheets.firstMatch.buttons[AppLanguage.text("OK")]
+        XCTAssertTrue(ok.waitForExistence(timeout: 5), "the clear that failed said nothing")
+        ok.click()
+        XCTAssertTrue(FileManager.default.fileExists(atPath: audio.path), "the audio went — the check proves nothing")
+        XCTAssertTrue(waitForCount(in: app, 0, of: 0), "Dictations missed the emptied index")
+        XCTAssertTrue(waitForStorage(dictations: 0, in: app), "Storage missed the emptied index")
+        XCTAssertNotEqual(storageLine(in: app), empty, "Storage does not count the audio left")
+        XCTAssertTrue(waitUntil { clear.isEnabled }, "Clear All is off with the audio left")
+
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: month.path)
+        clearAll()
+        XCTAssertTrue(waitUntil { !FileManager.default.fileExists(atPath: audio.path) }, "the repeat left the audio")
+        XCTAssertTrue(waitUntil { storageLine(in: app) == empty }, "Storage still counts the audio: \(storageLine(in: app) ?? "")")
+        XCTAssertTrue(waitUntil { !clear.isEnabled }, "Clear All is on with nothing to clear")
+        XCTAssertFalse(app.sheets.firstMatch.exists, "the repeat failed")
+    }
+
+    /// Storage's legend line for dictations ends with their count.
+    private func waitForStorage(dictations count: Int, in app: XCUIApplication) -> Bool {
+        waitUntil(seconds: 10) { storageLine(in: app)?.hasSuffix(" · \(count)") == true }
+    }
+
+    /// Storage's legend line for dictations: their size and count.
+    private func storageLine(in app: XCUIApplication) -> String? {
+        let prefix = AppLanguage.text("Dictations") + " · "
+        let line = app.windows["settings"].staticTexts.matching(NSPredicate(format: "label BEGINSWITH %@ OR value BEGINSWITH %@", prefix, prefix)).firstMatch
+        guard line.exists else { return nil }
+        return (line.value as? String).flatMap { $0.isEmpty ? nil : $0 } ?? line.label
+    }
+
+    private func waitUntil(seconds: TimeInterval = 5, _ condition: () -> Bool) -> Bool {
+        let deadline = Date().addingTimeInterval(seconds)
+        repeat {
+            if condition() { return true }
+            Thread.sleep(forTimeInterval: 0.1)
+        } while Date() < deadline
+        return false
     }
 
     /// №9: a count that failed says so and can be repeated, instead of
@@ -66,18 +170,8 @@ final class HistoryProbeTests: XCTestCase {
         try FileManager.default.createDirectory(at: history, withIntermediateDirectories: false)
         let app = launch(root: root)
         defer { app.terminate() }
+        // Settings alone: the history is the main window's, never opened here.
         guard openSettings(in: app) else { return }
-        // The History tab reads the same file as Settings opens and reports
-        // it in an alert sheet, which holds the whole window until dismissed.
-        // Return presses its only button: a click goes to a point on screen,
-        // where another app's prompt may lie above the sheet; keys go to the
-        // active app.
-        let alert = app.sheets.firstMatch
-        if alert.waitForExistence(timeout: 5) {
-            app.activate()
-            app.typeKey(.return, modifierFlags: [])
-            XCTAssertTrue(alert.waitForNonExistence(timeout: 5), "the history alert stayed")
-        }
         let storageTab = app.buttons["settingsTab.storage"]
         XCTAssertTrue(storageTab.waitForExistence(timeout: 5))
         storageTab.click()
@@ -95,10 +189,10 @@ final class HistoryProbeTests: XCTestCase {
         XCTAssertTrue(retry.waitForNonExistence(timeout: 5), "Try Again did not count again")
     }
 
-    /// A history that cannot be read is reported in History, not as a sheet
-    /// over whatever tab Settings opens on: every tab is built at once, so the
-    /// read runs and fails with the window, whichever tab is shown. In History
-    /// it is a line with Try Again, not a sheet.
+    /// A history that cannot be read is reported in Dictations, not as a
+    /// sheet over whatever section the window opens on: every section is
+    /// built at once, so the read runs and fails with the window, whichever
+    /// is shown. In Dictations it is a line with Try Again, not a sheet.
     func testUnreadableHistoryIsReportedOnlyInHistory() throws {
         let root = try makeRoot()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -106,23 +200,17 @@ final class HistoryProbeTests: XCTestCase {
         try FileManager.default.createDirectory(at: history, withIntermediateDirectories: false)
         let app = launch(root: root)
         defer { app.terminate() }
-        guard openSettings(in: app) else { return }
-        XCTAssertTrue(
-            app.descendants(matching: .any)["settingsWindowContent"].waitForExistence(timeout: 5),
-            "Settings did not open"
-        )
-        // Only the shown tab is in the accessibility tree.
+        guard app.openMainSection("meetings") else { return }
+        // Only the shown section is in the accessibility tree.
         XCTAssertFalse(
-            app.descendants(matching: .any)["settingsContent.history"].exists,
-            "Settings opened on History — the check proves nothing"
+            app.descendants(matching: .any)["mainContent.dictations"].exists,
+            "the window opened on Dictations — the check proves nothing"
         )
 
-        XCTAssertFalse(app.sheets.firstMatch.waitForExistence(timeout: 3), "the history error covers another tab")
+        XCTAssertFalse(app.sheets.firstMatch.waitForExistence(timeout: 3), "the history error covers another section")
 
-        let historyTab = app.buttons["settingsTab.history"]
-        XCTAssertTrue(historyTab.waitForExistence(timeout: 5))
-        historyTab.click()
-        // Said in the tab itself, with Try Again; no sheet anywhere.
+        guard app.showMainSection("dictations") else { return }
+        // Said in the section itself, with Try Again; no sheet anywhere.
         XCTAssertTrue(app.buttons["historyRetry"].waitForExistence(timeout: 5), "History does not report the error")
         XCTAssertFalse(app.sheets.firstMatch.exists, "the read error came as a sheet")
     }
@@ -134,10 +222,7 @@ final class HistoryProbeTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         let app = launch(root: root)
         defer { app.terminate() }
-        guard openSettings(in: app) else { return }
-        let historyTab = app.buttons["settingsTab.history"]
-        XCTAssertTrue(historyTab.waitForExistence(timeout: 5))
-        historyTab.click()
+        guard app.openMainSection("dictations") else { return }
         XCTAssertTrue(waitForCount(in: app, 0, of: 0), "history did not settle")
 
         XCTAssertTrue(
@@ -166,7 +251,7 @@ final class HistoryProbeTests: XCTestCase {
         try openHistory(in: app, expectedCount: (0, 0), visibleText: "historyEmpty")
 
         // With an empty list the toolbar's trash is the tab's only button.
-        let clear = app.descendants(matching: .any)["settingsContent.history"].buttons.firstMatch
+        let clear = app.descendants(matching: .any)["mainContent.dictations"].buttons.firstMatch
         XCTAssertTrue(clear.waitForExistence(timeout: 5))
         XCTAssertTrue(clear.isEnabled, "Clear All is off while audio is still in the archive")
         clear.click()
@@ -191,7 +276,7 @@ final class HistoryProbeTests: XCTestCase {
         try openHistory(in: app, expectedCount: (0, 0), visibleText: "historyEmpty")
         // With an empty list the toolbar's trash is the tab's only button,
         // and it stays the first one once a dictation is listed below it.
-        let clear = app.descendants(matching: .any)["settingsContent.history"].buttons.firstMatch
+        let clear = app.descendants(matching: .any)["mainContent.dictations"].buttons.firstMatch
         XCTAssertTrue(clear.waitForExistence(timeout: 5))
         XCTAssertFalse(clear.isEnabled, "the trash is on with nothing to clear")
         let place = clear.frame
@@ -217,10 +302,7 @@ final class HistoryProbeTests: XCTestCase {
         try FileManager.default.createDirectory(at: history, withIntermediateDirectories: false)
         let app = launch(root: root)
         defer { app.terminate() }
-        guard openSettings(in: app) else { return }
-        let historyTab = app.buttons["settingsTab.history"]
-        XCTAssertTrue(historyTab.waitForExistence(timeout: 5))
-        historyTab.click()
+        guard app.openMainSection("dictations") else { return }
         // Older builds report the read error in a sheet; Return closes it.
         let sheet = app.sheets.firstMatch
         if sheet.waitForExistence(timeout: 3) {
@@ -354,21 +436,186 @@ final class HistoryProbeTests: XCTestCase {
         XCTAssertTrue(waitForCount(in: app, 1, of: 2), "Try Again did not count again")
     }
 
+    // MARK: Add to Dictionary
+
+    /// The whole way from a history row: the sheet shows the dictation as
+    /// recognized, a selection becomes one spelling, the entry is saved and
+    /// shows on the Dictionary tab, and the history line stays byte for byte,
+    /// typing in the sheet's copy included.
+    func testAddToDictionaryFromARowSavesTheSelectedWords() throws {
+        let root = try makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let app = launch(root: root)
+        defer { app.terminate() }
+        let shown = "Claude Code 4242"
+        let recognized = "клод код 4242"
+        guard requestAppend(text: shown, rawText: recognized, root: root) else { return }
+        try openHistory(in: app, expectedCount: (1, 1), visibleText: shown)
+        let index = root.appendingPathComponent("history.jsonl")
+        let before = try Data(contentsOf: index)
+
+        guard let source = openAddToDictionary(from: shown, in: app) else { return }
+        XCTAssertEqual(source.value as? String, recognized, "the sheet does not show the text as recognized")
+        selectWords(2, in: source)
+        let use = app.buttons["dictionaryUseSelection"]
+        XCTAssertTrue(use.isEnabled, "the selection did not reach the sheet")
+        use.click()
+        let heard = app.textFields["dictionaryHeardField"]
+        XCTAssertEqual(heard.value as? String, "клод код", "the selection is not the field")
+
+        let written = app.textFields["dictionaryWrittenField"]
+        written.click()
+        // Digits only: they do not depend on the active keyboard layout.
+        written.typeText("42")
+        source.click()
+        source.typeKey(.downArrow, modifierFlags: .command)
+        source.typeText("7")
+        XCTAssertEqual(source.value as? String, recognized + "7", "the copy took no typing — the check proves nothing")
+        app.buttons["dictionarySave"].click()
+        XCTAssertTrue(heard.waitForNonExistence(timeout: 5), "the sheet did not close after Save")
+
+        XCTAssertEqual(try Data(contentsOf: index), before, "the history line changed")
+        XCTAssertTrue(app.staticTexts[shown].exists, "the history row changed")
+        guard app.showMainSection("dictionary") else { return }
+        let entry = app.descendants(matching: .any)["dictionaryEntry"]
+        XCTAssertTrue(entry.waitForExistence(timeout: 5), "no entry in the Dictionary section")
+        XCTAssertTrue(entry.staticTexts["42"].exists, "the entry is not the one saved")
+        XCTAssertTrue(entry.staticTexts["клод код"].exists, "the selection was not saved as one spelling")
+    }
+
+    /// A comma in the selection would make two spellings of one phrase: the
+    /// field stays as it was and the reason shows, nothing is cut away.
+    func testAddToDictionaryRefusesASelectionWithAComma() throws {
+        let root = try makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let app = launch(root: root)
+        defer { app.terminate() }
+        let shown = "клод, код 77"
+        guard requestAppend(text: shown, root: root) else { return }
+        try openHistory(in: app, expectedCount: (1, 1), visibleText: shown)
+
+        guard let source = openAddToDictionary(from: shown, in: app) else { return }
+        selectWords(2, in: source)
+        app.buttons["dictionaryUseSelection"].click()
+        XCTAssertTrue(
+            app.staticTexts["dictionarySelectionError"].waitForExistence(timeout: 5),
+            "a selection with a comma was taken without a word"
+        )
+        let heard = app.textFields["dictionaryHeardField"].value as? String ?? ""
+        XCTAssertFalse(heard.contains("клод") || heard.contains("код"), "the field took “\(heard)”")
+        app.buttons["dictionaryCancel"].click()
+    }
+
+    /// The Dictionary tab locks editing until the dictionary is cleared
+    /// there; from the history the sheet says so and leads to the tab.
+    func testAddToDictionaryLeadsToTheTabWhileTheDictionaryCannotBeRead() throws {
+        let root = try makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        // Not a dictionary document: the store reads the key as damaged.
+        let app = launch(root: root, extra: ["-dictionary.entries", "damaged"])
+        defer { app.terminate() }
+        let shown = "клод код 55"
+        guard requestAppend(text: shown, root: root) else { return }
+        try openHistory(in: app, expectedCount: (1, 1), visibleText: shown)
+
+        app.staticTexts[shown].rightClick()
+        let add = app.menuItems[AppLanguage.text("Add to Dictionary…")]
+        XCTAssertTrue(add.waitForExistence(timeout: 5), "the row offers no Add to Dictionary…")
+        add.click()
+        XCTAssertTrue(
+            app.descendants(matching: .any)["dictionaryUnreadableNote"].waitForExistence(timeout: 5),
+            "the sheet does not say the dictionary can’t be read"
+        )
+        XCTAssertFalse(app.textFields["dictionaryHeardField"].exists, "the sheet offers fields it could not save")
+        app.buttons["dictionaryOpenTab"].click()
+        XCTAssertTrue(
+            app.windows["main"].descendants(matching: .any)["mainContent.dictionary"].waitForExistence(timeout: 5),
+            "Open Dictionary did not lead to the Dictionary section"
+        )
+        XCTAssertFalse(app.windows["settings"].exists, "Open Dictionary opened Settings")
+        XCTAssertTrue(app.buttons["dictionaryClear"].waitForExistence(timeout: 5), "the tab offers no way to clear")
+    }
+
+    /// Tabs are only hidden, never closed: the sheet stays over a tab changed
+    /// from the menu bar, with its draft, until it is answered there. Cancel
+    /// saves nothing, and the next sheet's fields start empty. The Dictionary
+    /// tab's own sheet is checked in `DictionaryTransferTests`.
+    func testATabChangedFromTheMenuBarKeepsTheDictionarySheet() throws {
+        let root = try makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let app = launch(root: root)
+        defer { app.terminate() }
+        let shown = "клод код 66"
+        guard requestAppend(text: shown, root: root) else { return }
+        try openHistory(in: app, expectedCount: (1, 1), visibleText: shown)
+
+        guard let source = openAddToDictionary(from: shown, in: app) else { return }
+        selectWords(1, in: source)
+        app.buttons["dictionaryUseSelection"].click()
+        let heard = app.textFields["dictionaryHeardField"]
+        XCTAssertEqual(heard.value as? String, "клод")
+        guard app.transcribeAFileFromMenuBar() else { return }
+        // Long enough for the change to have gone through the tab it left.
+        let gone = heard.waitForNonExistence(timeout: 2)
+        XCTAssertEqual(app.state, .runningForeground, "the app did not survive the tab change")
+        guard !gone else { return XCTFail("the sheet went away with the tab") }
+        XCTAssertEqual(heard.value as? String, "клод", "the draft changed with the tab")
+        app.buttons["dictionaryCancel"].click()
+        XCTAssertTrue(heard.waitForNonExistence(timeout: 5), "the sheet stayed after Cancel")
+
+        guard app.showMainSection("dictionary") else { return }
+        XCTAssertTrue(app.buttons["dictionaryAdd"].waitForExistence(timeout: 5), "the Dictionary section did not show")
+        XCTAssertFalse(app.descendants(matching: .any)["dictionaryEntry"].exists, "Cancel saved the draft")
+        guard app.showMainSection("dictations") else { return }
+        guard openAddToDictionary(from: shown, in: app) != nil else { return }
+        XCTAssertEqual(heard.value as? String ?? "", "", "the draft came back")
+        XCTAssertEqual(app.textFields["dictionaryWrittenField"].value as? String ?? "", "", "the draft came back")
+        app.buttons["dictionaryCancel"].click()
+        XCTAssertTrue(heard.waitForNonExistence(timeout: 5))
+    }
+
+    /// The row's context menu → the sheet; nil, after failing the test, when
+    /// it did not open on the dictation's text.
+    private func openAddToDictionary(from text: String, in app: XCUIApplication) -> XCUIElement? {
+        app.staticTexts[text].firstMatch.rightClick()
+        let add = app.menuItems[AppLanguage.text("Add to Dictionary…")]
+        guard add.waitForExistence(timeout: 5) else {
+            XCTFail("the row offers no Add to Dictionary…")
+            return nil
+        }
+        add.click()
+        // The identifier may land on the editor's scroll view or on its text
+        // view; the text view is what takes clicks, keys and the value.
+        let tagged = app.descendants(matching: .any)["dictionarySourceText"].firstMatch
+        guard tagged.waitForExistence(timeout: 5) else {
+            XCTFail("the sheet shows no text from the dictation")
+            return nil
+        }
+        return tagged.elementType == .textView ? tagged : tagged.textViews.firstMatch
+    }
+
+    /// From the start of the text, word by word: arrow keys with modifiers
+    /// are key codes, so the active keyboard layout does not matter.
+    private func selectWords(_ count: Int, in source: XCUIElement) {
+        source.click()
+        source.typeKey(.upArrow, modifierFlags: .command)
+        for _ in 0..<count {
+            source.typeKey(.rightArrow, modifierFlags: [.option, .shift])
+        }
+    }
+
     // MARK: Helpers
 
-    private func launch(root: URL) -> XCUIApplication {
+    private func launch(root: URL, extra: [String] = []) -> XCUIApplication {
         let app = XCUIApplication()
         app.launchArguments = ["-UITesting", "-UITestSettingsStore", "-HistoryProbeRoot", root.path]
-            + AppLanguage.launchArguments
+            + extra + AppLanguage.launchArguments
         app.launch()
         return app
     }
 
     private func openHistory(in app: XCUIApplication, expectedCount: (Int, Int), visibleText: String) throws {
-        guard openSettings(in: app) else { return }
-        let historyTab = app.buttons["settingsTab.history"]
-        XCTAssertTrue(historyTab.waitForExistence(timeout: 5))
-        historyTab.click()
+        guard app.openMainSection("dictations") else { return }
         XCTAssertTrue(app.staticTexts[visibleText].waitForExistence(timeout: 5), "history did not settle")
         XCTAssertTrue(waitForCount(in: app, expectedCount.0, of: expectedCount.1), "count did not settle")
     }
@@ -439,10 +686,11 @@ final class HistoryProbeTests: XCTestCase {
 
     /// Asks the probe to append and returns once it confirmed. A missing
     /// confirmation fails the run as inconclusive, not as a red.
-    private func requestAppend(text: String, root: URL) -> Bool {
+    private func requestAppend(text: String, rawText: String? = nil, root: URL) -> Bool {
         let id = UUID().uuidString
         let marker = root.appendingPathComponent("appended-\(id).json")
-        let request: [String: String] = ["id": id, "text": text]
+        var request: [String: String] = ["id": id, "text": text]
+        request["raw_text"] = rawText
         guard let data = try? JSONSerialization.data(withJSONObject: request),
               (try? data.write(to: root.appendingPathComponent("append-request.json"), options: .atomic)) != nil
         else {

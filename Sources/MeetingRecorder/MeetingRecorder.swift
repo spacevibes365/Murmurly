@@ -4,7 +4,9 @@ import Combine
 import Foundation
 
 protocol MeetingCaptureBackend: Sendable {
-    func start() async throws -> Date
+    /// Records into `directory`, which the recorder has just made for this
+    /// session. A start that fails or is cancelled removes it.
+    func start(in directory: URL) async throws -> Date
     func stop() async throws -> [URL]
 }
 
@@ -61,7 +63,22 @@ final class MeetingRecorder: ObservableObject {
         case failed(directory: URL?, reason: String)
     }
 
+    /// The session under way, from the moment its folder exists until the
+    /// result of its stop is published, the queue's job included: a folder
+    /// without `metadata.json` is this recording, not one that broke off.
+    struct Session: Equatable, Sendable {
+        let directory: URL
+        /// The folder itself, read as it is made (on this Mac): a deletion
+        /// of it at any other address is refused while it lives.
+        var identity: FolderIdentity? = nil
+        /// Set once the capture runs.
+        var startedAt: Date?
+        /// The automatic recording's app or `pid:<n>`; nil when started by hand.
+        let trigger: String?
+    }
+
     @Published private(set) var state: State = .idle
+    @Published private(set) var currentSession: Session?
     @Published private(set) var lastRecordingDirectory: URL?
     @Published private(set) var unconfirmedRecording: UnconfirmedRecording?
 
@@ -80,13 +97,21 @@ final class MeetingRecorder: ObservableObject {
     private let indicator: RecordingIndicator
     private let beepPlayer: @MainActor @Sendable () -> Void
     private let fileViewer: @MainActor @Sendable (URL) -> Void
+    private let createSession: @MainActor () throws -> URL
     private weak var settings: SettingsStore?
     private weak var permissions: PermissionManager?
     private weak var dictation: DictationCoordinator?
     /// Set only on the recorder the app builds, not the quit probe's, so a
     /// probe's stop never starts a real transcription or compression.
     weak var transcripts: MeetingTranscriptionQueue? {
-        didSet { transcripts?.isRecorderBusy = { [weak self] in self?.isBusy ?? false } }
+        didSet {
+            transcripts?.isRecorderBusy = { [weak self] in self?.isBusy ?? false }
+            transcripts?.currentRecording = { [weak self] in self?.currentSession?.directory }
+            transcripts?.currentRecordingIdentity = { [weak self] in self?.currentSession?.identity }
+            // The dictation as `activate` hands it over, whichever comes first.
+            transcripts?.heldByDictation = { [weak self] in self?.dictation?.heldEngine() }
+            transcripts?.prepareDictationEngine = { [weak self] in self?.dictation?.prepareAfterOtherEngineJob() }
+        }
     }
     private var activated = false
     private var operationTask: Task<Void, Never>?
@@ -111,7 +136,8 @@ final class MeetingRecorder: ObservableObject {
         beepPlayer: @escaping @MainActor @Sendable () -> Void = { NSSound.beep() },
         fileViewer: @escaping @MainActor @Sendable (URL) -> Void = {
             NSWorkspace.shared.activateFileViewerSelecting([$0])
-        }
+        },
+        createSession: @escaping @MainActor () throws -> URL = { try RecordingsStore().createSession() }
     ) {
         self.capture = capture
         self.indicator = indicator
@@ -120,6 +146,7 @@ final class MeetingRecorder: ObservableObject {
         self.watchdogSnapshotSource = watchdogSnapshotSource
         self.beepPlayer = beepPlayer
         self.fileViewer = fileViewer
+        self.createSession = createSession
     }
 
     var isBusy: Bool { state.isBusy }
@@ -178,9 +205,9 @@ final class MeetingRecorder: ObservableObject {
         }
     }
 
-    func revealLastRecording() {
-        guard let lastRecordingDirectory else { return }
-        reveal(lastRecordingDirectory)
+    /// Where the last recording is now, for "Show Last Recording…".
+    var lastRecordingLocation: URL? {
+        lastRecordingDirectory.map(location(of:))
     }
 
     var automaticRecordingBundleID: String? {
@@ -202,11 +229,11 @@ final class MeetingRecorder: ObservableObject {
     /// A recording may have moved to the meetings folder since it was saved.
     /// The queue moved the folder and knows where to; without it, the
     /// current meetings folder is the guess.
-    private func reveal(_ directory: URL) {
-        fileViewer(transcripts?.location(of: directory) ?? RecordingsStore.currentLocation(
+    private func location(of directory: URL) -> URL {
+        transcripts?.location(of: directory) ?? RecordingsStore.currentLocation(
             of: directory,
             meetingsFolder: settings?.meetingDestinations.meetings
-        ))
+        )
     }
 
     @discardableResult
@@ -226,9 +253,22 @@ final class MeetingRecorder: ObservableObject {
             }
             return false
         }
+        // Made here, on the main actor and before any wait, so the window
+        // knows the folder from the first moment of the start.
+        let directory: URL
+        do {
+            directory = try createSession()
+        } catch {
+            state = .failed(error.localizedDescription)
+            if trigger != nil { watchdog?.automaticStartFailed() }
+            indicator.finish(with: .meetingFailure(message: error.localizedDescription))
+            AppLog.error("meeting", "start failed: no session folder: \(error.localizedDescription)")
+            return true
+        }
         recordingTrigger = trigger
         stopAutomaticWhenStarted = false
         state = .starting
+        currentSession = Session(directory: directory, identity: FolderIdentity.of(directory), trigger: trigger)
         lastRecordingDirectory = nil
         if trigger == nil {
             // Before any await: a tick must not treat this session as the
@@ -243,18 +283,20 @@ final class MeetingRecorder: ObservableObject {
             // system-audio consent dialog.
             if trigger == nil { try? await Task.sleep(for: self.permissionPromptDelay) }
             do {
-                let startedAt = try await self.capture.start()
+                let startedAt = try await self.capture.start(in: directory)
                 if Task.isCancelled {
                     // The session did start, so its stop is the only proof
                     // that what it captured was saved.
                     await self.stopCancelledStart()
                     self.state = .idle
+                    self.currentSession = nil
                     self.recordingTrigger = nil
                     self.indicator.clearBase()
                     self.watchdog?.automaticStartCancelled()
                     return
                 }
                 self.state = .recording
+                self.currentSession?.startedAt = startedAt
                 self.playBeepIfEnabled()
                 self.indicator.setBase(.recordingMeeting(
                     startedAt: startedAt,
@@ -269,12 +311,14 @@ final class MeetingRecorder: ObservableObject {
             } catch is CancellationError {
                 _ = try? await self.capture.stop()
                 self.state = .idle
+                self.currentSession = nil
                 self.recordingTrigger = nil
                 self.indicator.clearBase()
                 self.watchdog?.automaticStartCancelled()
             } catch {
                 let cause = error as? SystemAudioCaptureError
                 self.state = .failed(error.localizedDescription, cause: cause)
+                self.currentSession = nil
                 self.recordingTrigger = nil
                 // A stop already ordered for this call (automatic recording
                 // turned off, its app excluded) outranks the retry a passing
@@ -309,6 +353,9 @@ final class MeetingRecorder: ObservableObject {
         operationTask = Task { [weak self] in
             guard let self else { return }
             defer {
+                // After everything the stop publishes, the queue's job
+                // included: the session's folder now speaks for itself.
+                self.currentSession = nil
                 self.recordingTrigger = nil
                 self.watchdog?.recordingDidEnd()
                 self.operationTask = nil
@@ -409,13 +456,21 @@ final class MeetingRecorder: ObservableObject {
         if terminationTask == nil { isTerminating = false }
     }
 
-    func revealWarnedRecording() {
-        guard let directory = recordingWarning?.directory else { return }
-        reveal(directory)
+    /// Where the recording a warning is about is now.
+    var warnedRecordingLocation: URL? {
+        recordingWarning.map { location(of: $0.directory) }
     }
 
     func dismissRecordingWarning() {
         recordingWarning = nil
+    }
+
+    /// A meeting the window deleted, or the audio of it: the warning about
+    /// its tracks goes, and, with the whole meeting, "Show Last Recording…".
+    func forget(_ folder: URL, wholeMeeting: Bool) {
+        let path = folder.standardizedFileURL.path
+        if warnedRecordingLocation?.standardizedFileURL.path == path { recordingWarning = nil }
+        if wholeMeeting, lastRecordingLocation?.standardizedFileURL.path == path { lastRecordingDirectory = nil }
     }
 
     /// The user's explicit choice to quit without proof for this recording.
@@ -423,9 +478,10 @@ final class MeetingRecorder: ObservableObject {
         unconfirmedRecording = nil
     }
 
+    /// In Finder, not the window: the folder may hold no metadata at all.
     func revealUnconfirmedRecording() {
         guard let directory = unconfirmedRecording?.directory else { return }
-        reveal(directory)
+        fileViewer(location(of: directory))
     }
 
     /// True only with proof that every started session was saved: a clean stop,
@@ -473,14 +529,16 @@ final class MeetingRecorder: ObservableObject {
         return ["done", "suspect", "failed"].contains(metadata.state) && !metadata.endedAt.isEmpty
     }
 
+    /// Names who started the recording in its metadata: the automatic
+    /// recording's app, or `manual`. Only there: `recordingTrigger` stays nil
+    /// for a manual recording, which is how the watchdog tells the two apart.
     private func metadata(in directory: URL, applying trigger: String?) -> MeetingMetadata? {
         let url = directory.appendingPathComponent("metadata.json")
         guard var metadata = try? JSONDecoder().decode(
             MeetingMetadata.self,
             from: Data(contentsOf: url)
         ) else { return nil }
-        guard let trigger else { return metadata }
-        metadata.trigger = trigger
+        metadata.trigger = trigger ?? MeetingMetadata.manualTrigger
         do {
             try RecordingsStore().writeMetadata(metadata, to: directory)
         } catch {

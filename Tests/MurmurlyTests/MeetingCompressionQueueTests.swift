@@ -19,7 +19,7 @@ private actor CompressibleMeetingCapture: MeetingCaptureBackend {
         root.appendingPathComponent("2026-10-06 16-00-0\(index) Meeting", isDirectory: true)
     }
 
-    func start() async throws -> Date { Date(timeIntervalSinceReferenceDate: 1_000) }
+    func start(in _: URL) async throws -> Date { Date(timeIntervalSinceReferenceDate: 1_000) }
 
     func stop() async throws -> [URL] {
         stops += 1
@@ -308,7 +308,7 @@ final class MeetingCompressionQueueTests: XCTestCase {
         queue.enqueue(second, transcribe: false)
         queue.enqueue(second, transcribe: false)
         queue.enqueue(second)
-        XCTAssertEqual(queue.pending, [.init(folder: second.standardizedFileURL, transcribe: true)])
+        XCTAssertEqual(queue.pending.map(\.withoutIdentity), [.init(folder: second.standardizedFileURL, transcribe: true)])
         release.increment()
         let done = await eventually { queue.activeFolder == nil && queue.pending.isEmpty }
 
@@ -349,11 +349,11 @@ final class MeetingCompressionQueueTests: XCTestCase {
         MeetingTranscriptionQueue(
             transcriber: MeetingTranscriber(
                 cache: WhisperKitCache(factory: SilentEngineFactory()),
-                loadSpeechDetector: {
+                loadSpeechDetector: { _ in
                     transcriptions.increment()
                     return detector ?? { _ in [] }
                 },
-                currentEngine: { throw TranscriptionError.engineUnavailable("not used: no speech") },
+                currentEngine: { _ in throw TranscriptionError.engineUnavailable("not used: no speech") },
                 temporaryRoot: root
             ),
             meetingsRoot: root

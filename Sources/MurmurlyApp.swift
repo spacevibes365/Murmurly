@@ -10,6 +10,7 @@ struct MurmurlyApp: App {
     @StateObject private var meetingTranscripts: MeetingTranscriptionQueue
     @StateObject private var models: ModelDownloader
     @StateObject private var files: FilesModel
+    @StateObject private var library: MeetingLibrary
     @StateObject private var permissions = PermissionManager()
     @StateObject private var loginItem = LoginItemManager()
     @StateObject private var updater: AppUpdater
@@ -28,6 +29,8 @@ struct MurmurlyApp: App {
             transcriber: .live(settings: settings, models: models),
             destinations: { settings.meetingDestinations }
         )
+        transcripts.audioRetention = { (settings.meetingAudioRetention.rawValue, settings.retentionGeneration) }
+        transcripts.writeAudioRetention = { settings.meetingAudioRetention = MeetingAudioRetention(rawValue: $0) ?? .keep }
         let recorders = Self.makeRecorders(
             settings: settings,
             indicator: indicator,
@@ -38,11 +41,24 @@ struct MurmurlyApp: App {
         _models = StateObject(wrappedValue: models)
         // Here rather than in the window, so a Files run and its unsaved text
         // outlive the window.
-        let files = FilesModel.live(settings: settings, models: models)
+        let files = FilesModel.live(settings: settings, models: models, dictation: recorders.dictation)
         _files = StateObject(wrappedValue: files)
         _dictation = StateObject(wrappedValue: recorders.dictation)
         _meeting = StateObject(wrappedValue: recorders.meeting)
         _meetingTranscripts = StateObject(wrappedValue: transcripts)
+        // Here rather than in the window, like Files: a closed window keeps
+        // its last snapshot, and nothing it asked for stops.
+        var reader = MeetingLibrary.Reader.disk
+        #if DEBUG
+        // A UI test holds a write of a meeting's marks, as a slow network volume would.
+        if let write = FileProbe.marksWrite() { reader.writeMarks = write }
+        // And a read of a transcript.
+        if let read = FileProbe.textRead() { reader.text = read }
+        #endif
+        let library = MeetingLibrary(
+            recorder: recorders.meeting, queue: transcripts, settings: settings, reader: reader, dictation: recorders.dictation
+        )
+        _library = StateObject(wrappedValue: library)
         AppLog.rotateIfNeeded()
         // An isolated launch keeps its log, archives and settings in one
         // folder and names it, so the runner removes exactly what it created.
@@ -55,7 +71,8 @@ struct MurmurlyApp: App {
         // StateObject would defer an inline AppUpdater() to first use; built
         // here, the updater starts and schedules its daily check at launch.
         let updater = AppUpdater(busy: AppUpdater.busy(
-            meeting: recorders.meeting, dictation: recorders.dictation, transcripts: transcripts, files: files
+            meeting: recorders.meeting, dictation: recorders.dictation, transcripts: transcripts, files: files,
+            library: library
         ))
         _updater = StateObject(wrappedValue: updater)
     }
@@ -94,7 +111,8 @@ struct MurmurlyApp: App {
                 permissions: permissions,
                 settings: settings,
                 models: models,
-                updater: updater
+                updater: updater,
+                library: library
             )
         } label: {
             MenuBarLabel(
@@ -104,11 +122,35 @@ struct MurmurlyApp: App {
                 settings: settings,
                 loginItem: loginItem,
                 files: files,
+                library: library,
                 appDelegate: appDelegate
             )
         }
         .menuBarExtraStyle(.menu)
-        .commands { SettingsCommands() }
+        .commands {
+            SettingsCommands()
+            // Find in a transcript (⌘F) goes through these items.
+            TextEditingCommands()
+        }
+
+        // Never opened by a launch or restored: a launch at login stays in
+        // the menu bar, and the stage gate's cold launch checks it.
+        Window(Text(verbatim: "Murmurly"), id: "main") {
+            // The app's own Files and dictation: the section shows the run
+            // and the text that outlive the window.
+            MainWindow()
+                .environmentObject(library)
+                .environmentObject(settings)
+                .environmentObject(meeting)
+                .environmentObject(meetingTranscripts)
+                .environmentObject(models)
+                .environmentObject(files)
+                .environmentObject(dictation)
+        }
+        .windowResizability(.contentMinSize)
+        .defaultSize(width: 1100, height: 720)
+        .defaultLaunchBehavior(.suppressed)
+        .restorationBehavior(.disabled)
 
         // A regular, single-instance window avoids the special Settings scene's
         // activation race when opened from a menu-bar-only app.
@@ -123,7 +165,6 @@ struct MurmurlyApp: App {
                 .environmentObject(meetingTranscripts)
                 .environmentObject(models)
                 .environmentObject(updater)
-                .environmentObject(files)
                 .onAppear { AppWindowController.enterRegular() }      // Dock icon while Settings open
                 .onDisappear { AppWindowController.windowDidClose() } // back to accessory when closed
         }

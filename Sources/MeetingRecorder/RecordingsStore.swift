@@ -28,9 +28,15 @@ struct MeetingMetadata: Codable, Sendable, Equatable {
     var sampleRate: Double
     var state: String              // recording / processing / done / suspect / interrupted / failed
     var segments: [SegmentMeta]
+    /// Who started the recording: the app an automatic recording was started
+    /// for (its bundle ID, or `pid:<n>` without one), or `manual`. Absent in
+    /// recordings made before it was written.
     var trigger: String? = nil
     /// Why the state is `suspect` or `failed`, naming the track.
     var issues: [String]? = nil
+
+    /// `trigger` of a recording started by hand. Never translated.
+    static let manualTrigger = "manual"
 }
 
 /// Owns the meeting recordings directory: creates per-session folders and reads/writes
@@ -40,9 +46,31 @@ final class RecordingsStore: ObservableObject {
     /// `~/Library/Application Support/Murmurly/Meetings`.
     /// `nonisolated` — pure path computation, usable as a default-arg / off the main actor.
     nonisolated static func meetingsRoot() -> URL {
-        if TestIsolation.isEnabled {
-            return TestIsolation.root.appendingPathComponent("Meetings", isDirectory: true)
+        meetingsRoot(
+            arguments: ProcessInfo.processInfo.arguments, isolated: TestIsolation.isEnabled,
+            isolatedRoot: TestIsolation.root, owners: ownersMeetingsRoot()
+        )
+    }
+
+    /// `owners` only for a launch that is not isolated and was not given a
+    /// seeded root.
+    nonisolated static func meetingsRoot(arguments: [String], isolated: Bool, isolatedRoot: URL, owners: URL) -> URL {
+        #if DEBUG
+        // UI-test harness only: `-MeetingsProbeRoot <dir>` puts the meetings
+        // where the test seeded them before launch.
+        if let index = arguments.firstIndex(of: "-MeetingsProbeRoot"), index + 1 < arguments.count {
+            return URL(fileURLWithPath: arguments[index + 1], isDirectory: true)
         }
+        #endif
+        if isolated {
+            return isolatedRoot.appendingPathComponent("Meetings", isDirectory: true)
+        }
+        return owners
+    }
+
+    /// The meetings of the person using this Mac, whatever a test process
+    /// was told: what a test must never reach.
+    nonisolated static func ownersMeetingsRoot() -> URL {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         return base.appendingPathComponent("Murmurly/Meetings", isDirectory: true)
     }

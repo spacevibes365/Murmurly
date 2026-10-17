@@ -22,7 +22,7 @@ actor SavingMeetingCapture: MeetingCaptureBackend {
         root.appendingPathComponent("2026-10-06 13-00-0\(index) Meeting", isDirectory: true)
     }
 
-    func start() async throws -> Date { Date(timeIntervalSinceReferenceDate: 1_000) }
+    func start(in _: URL) async throws -> Date { Date(timeIntervalSinceReferenceDate: 1_000) }
 
     func stop() async throws -> [URL] {
         stops += 1
@@ -44,7 +44,7 @@ actor SavingMeetingCapture: MeetingCaptureBackend {
         return tracks
     }
 
-    private static func writeSilence(to url: URL) throws {
+    static func writeSilence(to url: URL) throws {
         guard let format = AVAudioFormat(
             commonFormat: .pcmFormatFloat32, sampleRate: 48_000, channels: 1, interleaved: false
         ), let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 144_000) else { return }
@@ -54,6 +54,31 @@ actor SavingMeetingCapture: MeetingCaptureBackend {
             forWriting: url, settings: format.settings, commonFormat: .pcmFormatFloat32, interleaved: false
         )
         try file.write(from: buffer)
+    }
+}
+
+/// Records silence into the folder the recorder made, the tracks there from
+/// the start on, as the real backend writes them.
+private actor LiveFolderCapture: MeetingCaptureBackend {
+    private var directory: URL?
+
+    func start(in directory: URL) async throws -> Date {
+        for name in ["system.caf", "microphone.caf"] {
+            try SavingMeetingCapture.writeSilence(to: directory.appendingPathComponent(name))
+        }
+        self.directory = directory
+        return Date(timeIntervalSinceReferenceDate: 1_000)
+    }
+
+    func stop() async throws -> [URL] {
+        guard let directory else { throw SystemAudioCaptureError.notRunning }
+        self.directory = nil
+        let metadata = MeetingMetadata(
+            startedAt: "2026-10-15T10:00:00Z", endedAt: "2026-10-15T10:01:00Z",
+            sampleRate: 48_000, state: "done", segments: []
+        )
+        try JSONEncoder().encode(metadata).write(to: directory.appendingPathComponent("metadata.json"))
+        return ["system.caf", "microphone.caf"].map { directory.appendingPathComponent($0) }
     }
 }
 
@@ -195,8 +220,8 @@ final class MeetingAutoTranscriptionTests: XCTestCase {
         let calls = JobCounter()
         let queue = MeetingTranscriptionQueue(transcriber: MeetingTranscriber(
             cache: WhisperKitCache(factory: ConstantEngineFactory()),
-            loadSpeechDetector: { { _ in [0..<16_000, 32_000..<48_000] } },
-            currentEngine: {
+            loadSpeechDetector: { _ in { _ in [0..<16_000, 32_000..<48_000] } },
+            currentEngine: { _ in
                 calls.increment()
                 if calls.value > 2 { throw TranscriptionError.engineUnavailable("model removed") }
                 return MeetingTranscriber.Engine(
@@ -238,8 +263,8 @@ final class MeetingAutoTranscriptionTests: XCTestCase {
         let queue = MeetingTranscriptionQueue(
             transcriber: MeetingTranscriber(
                 cache: WhisperKitCache(factory: ConstantEngineFactory()),
-                loadSpeechDetector: { { _ in [0..<16_000] } },
-                currentEngine: {
+                loadSpeechDetector: { _ in { _ in [0..<16_000] } },
+                currentEngine: { _ in
                     MeetingTranscriber.Engine(
                         descriptor: EngineDescriptor(engine: .whisper, modelPath: "/models/whisper"),
                         request: .whisper(WhisperDecodeRequest(language: "ru")),
@@ -249,8 +274,7 @@ final class MeetingAutoTranscriptionTests: XCTestCase {
                 temporaryRoot: work
             ),
             meetingsRoot: root,
-            destinations: { settings.meetingDestinations },
-            fileViewer: { shown.urls.append($0) }
+            destinations: { settings.meetingDestinations }
         )
         let recorder = MeetingRecorder(
             capture: SavingMeetingCapture(root: root),
@@ -281,13 +305,141 @@ final class MeetingAutoTranscriptionTests: XCTestCase {
         }
 
         settings.meetingsFolderPath = nil
-        recorder.revealLastRecording()
-        queue.revealOutcome()
 
-        XCTAssertEqual(shown.urls.map(\.standardizedFileURL.path), [
-            moved.standardizedFileURL.path,
-            moved.appendingPathComponent("transcript.md").standardizedFileURL.path,
-        ])
+        XCTAssertEqual(recorder.lastRecordingLocation?.standardizedFileURL.path, moved.standardizedFileURL.path)
+        XCTAssertEqual(queue.lastMeeting?.standardizedFileURL.path, moved.standardizedFileURL.path)
+        XCTAssertEqual(queue.lastOutcome?.transcript?.lastPathComponent, "transcript.md")
+    }
+
+    /// "Transcribe Meeting…" on the folder being recorded: it has no
+    /// `metadata.json` until its stop, so the folder alone looks like a
+    /// recording cut off by a crash, and the job would transcribe half a
+    /// call into it. The queue knows it from the recorder and leaves it.
+    func testFolderBeingRecordedIsNotTranscribed() async throws {
+        let jobs = JobCounter()
+        let queue = MeetingTranscriptionQueue(
+            transcriber: MeetingTranscriber(
+                cache: WhisperKitCache(factory: ConstantEngineFactory()),
+                // Speech in every track and an engine that hears it: a job
+                // that ran would write a transcript into the folder.
+                loadSpeechDetector: { _ in
+                    jobs.increment()
+                    return { _ in [0..<16_000] }
+                },
+                currentEngine: { _ in
+                    MeetingTranscriber.Engine(
+                        descriptor: EngineDescriptor(engine: .whisper, modelPath: "/models/whisper"),
+                        request: .whisper(WhisperDecodeRequest(language: "ru")),
+                        label: "Whisper (whisper)"
+                    )
+                },
+                temporaryRoot: root
+            ),
+            meetingsRoot: root
+        )
+        let recorder = MeetingRecorder(
+            capture: LiveFolderCapture(),
+            indicator: RecordingIndicator(renderingEnabled: false),
+            hasMicrophoneAccess: { true },
+            permissionPromptDelay: .zero,
+            watchdogSnapshotSource: { [] },
+            beepPlayer: {},
+            createSession: { [root] in try RecordingsStore().createSession(root: root!) }
+        )
+        recorder.transcripts = queue
+        recorder.toggle()
+        try await waitUntil { recorder.state == .recording }
+        let live = try XCTUnwrap(recorder.currentSession?.directory)
+
+        queue.enqueue(live)
+        let answered = await eventually { queue.lastOutcome != nil && queue.activeFolder == nil }
+
+        XCTAssertTrue(answered, "the job never ended")
+        XCTAssertEqual(
+            try FileManager.default.contentsOfDirectory(atPath: live.path).sorted(), ["microphone.caf", "system.caf"],
+            "the job wrote into the recording's folder"
+        )
+        guard case let .failed(folder, reason)? = queue.lastOutcome else {
+            return XCTFail("the recording was transcribed: \(String(describing: queue.lastOutcome))")
+        }
+        XCTAssertEqual(folder.standardizedFileURL.path, live.standardizedFileURL.path)
+        XCTAssertEqual(reason, MeetingTranscriber.Failure.stillRecording(live.lastPathComponent).localizedDescription)
+        XCTAssertEqual(jobs.value, 0, "the job read the recording")
+        recorder.toggle()
+        try await waitUntil { recorder.state == .idle }
+    }
+
+    /// A refusal that left no record goes with the meeting when the queue
+    /// moves it, and the next attempt at the meeting, wherever it is now,
+    /// clears it: an old "still recording" never outranks a transcript made
+    /// since. Another folder of the same name keeps its own.
+    func testRefusalWithoutARecordFollowsTheMeetingTheQueueMoves() async throws {
+        let target = root.appendingPathComponent("Disk/Meetings", isDirectory: true)
+        try FileManager.default.createDirectory(at: target, withIntermediateDirectories: true)
+        let local = root.appendingPathComponent("Meetings", isDirectory: true)
+        let settings = SettingsStore(defaults: defaults)
+        settings.meetingAfterStop = .nothing
+        settings.meetingsFolderPath = target.path
+        let queue = MeetingTranscriptionQueue(
+            transcriber: MeetingTranscriber(
+                cache: WhisperKitCache(factory: ConstantEngineFactory()),
+                loadSpeechDetector: { _ in { _ in [0..<16_000] } },
+                currentEngine: { _ in
+                    MeetingTranscriber.Engine(
+                        descriptor: EngineDescriptor(engine: .whisper, modelPath: "/models/whisper"),
+                        request: .whisper(WhisperDecodeRequest(language: "ru")),
+                        label: "Whisper (whisper)"
+                    )
+                },
+                temporaryRoot: root
+            ),
+            meetingsRoot: local,
+            destinations: { settings.meetingDestinations }
+        )
+        let recorder = MeetingRecorder(
+            capture: LiveFolderCapture(),
+            indicator: RecordingIndicator(renderingEnabled: false),
+            hasMicrophoneAccess: { true },
+            permissionPromptDelay: .zero,
+            watchdogSnapshotSource: { [] },
+            beepPlayer: {},
+            createSession: { try RecordingsStore().createSession(root: local) }
+        )
+        recorder.transcripts = queue
+        recorder.activate(
+            settings: settings,
+            permissions: PermissionManager(),
+            dictation: DictationCoordinator(mic: SilentMic(), indicator: RecordingIndicator(renderingEnabled: false))
+        )
+        recorder.toggle()
+        try await waitUntil { recorder.state == .recording }
+        let live = try XCTUnwrap(recorder.currentSession?.directory).standardizedFileURL
+        let moved = target.appendingPathComponent(live.lastPathComponent, isDirectory: true).standardizedFileURL
+        // Same name, someone else's folder: refused as not a meeting.
+        let namesake = root.appendingPathComponent("Elsewhere/\(live.lastPathComponent)", isDirectory: true)
+        try FileManager.default.createDirectory(at: namesake, withIntermediateDirectories: true)
+        queue.enqueue(namesake)
+        queue.enqueue(live)
+        let refused = await eventually { queue.unrecordedOutcomes.count == 2 && queue.activeFolder == nil }
+        XCTAssertTrue(refused, "\(queue.unrecordedOutcomes)")
+        let stillRecording = try XCTUnwrap(queue.unrecordedOutcomes[live.path])
+
+        recorder.toggle()
+        let wentAway = await eventually(within: .seconds(10)) {
+            FileManager.default.fileExists(atPath: moved.path) && queue.activeFolder == nil && queue.pending.isEmpty
+        }
+        XCTAssertTrue(wentAway, "the meeting was not moved — the check proves nothing")
+        XCTAssertNil(queue.unrecordedOutcomes[live.path])
+        XCTAssertEqual(queue.unrecordedOutcomes[moved.path], stillRecording, "the refusal stayed at the old address")
+
+        queue.enqueue(moved)
+        let transcribed = await eventually(within: .seconds(10)) {
+            if case .saved? = queue.lastOutcome { queue.activeFolder == nil } else { false }
+        }
+        XCTAssertTrue(transcribed, "\(String(describing: queue.lastOutcome))")
+        XCTAssertNil(queue.unrecordedOutcomes[moved.path], "the old refusal outlived the transcript made since")
+        XCTAssertNotNil(queue.unrecordedOutcomes[namesake.standardizedFileURL.path], "another folder of the same name lost its own")
+        XCTAssertEqual(try MeetingAttempt.entries(in: moved).map(\.attempt?.result), [.complete])
     }
 
     // MARK: - Helpers
@@ -304,11 +456,11 @@ final class MeetingAutoTranscriptionTests: XCTestCase {
         let jobs = JobCounter()
         let queue = MeetingTranscriptionQueue(transcriber: MeetingTranscriber(
             cache: WhisperKitCache(factory: ConstantEngineFactory()),
-            loadSpeechDetector: {
+            loadSpeechDetector: { _ in
                 jobs.increment()
                 return detector ?? { _ in [] }
             },
-            currentEngine: { throw TranscriptionError.engineUnavailable("not used: no speech") },
+            currentEngine: { _ in throw TranscriptionError.engineUnavailable("not used: no speech") },
             temporaryRoot: root
         ))
         let settings = SettingsStore(defaults: defaults)

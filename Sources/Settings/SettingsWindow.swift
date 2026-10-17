@@ -131,18 +131,6 @@ struct SettingsWindow: View {
                     }
                 }
                 tabLayer(.meetings) { standardContent { MeetingsSettingsView() } }
-                tabLayer(.history) {
-                    DictationHistoryView(
-                        dictation: dictation,
-                        totalCount: archiveSnapshot?.dictationCount,
-                        countFailed: archiveFailure != nil,
-                        archiveHasFiles: archiveSnapshot?.hasDictationFiles ?? false,
-                        recount: {
-                            archiveFailure = nil
-                            archiveRetry += 1
-                        }
-                    )
-                }
                 tabLayer(.storage) {
                     standardContent {
                         StorageSettingsView(
@@ -157,7 +145,6 @@ struct SettingsWindow: View {
                     }
                 }
                 tabLayer(.permissions) { standardContent { PermissionsSettingsView() } }
-                tabLayer(.files) { ContentView() }
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -167,18 +154,7 @@ struct SettingsWindow: View {
     private func standardContent<Content: View>(
         @ViewBuilder content: () -> Content
     ) -> some View {
-        ScrollView {
-            content()
-                .padding(.top, SettingsChrome.contentTopPadding)
-                .padding(.horizontal, SettingsChrome.contentHorizontalPadding)
-                .padding(.bottom, SettingsChrome.contentBottomPadding)
-        }
-        // A tab taller than the window shows its scroll bar for a moment, so
-        // the cards below the edge are not taken for missing. Every tab is
-        // built with the window and only hidden, so onAppear covers just the
-        // window opening; a switch of tabs needs the trigger.
-        .scrollIndicatorsFlash(onAppear: true)
-        .scrollIndicatorsFlash(trigger: settings.settingsTab)
+        SettingsChrome.scrolling(trigger: settings.settingsTab, content: content)
     }
 
     private func tabLayer<Content: View>(
@@ -247,17 +223,9 @@ struct SettingsWindow: View {
             return missing == 0 ? String(localized: "Main permissions granted") : String(localized: "\(missing) not granted")
         case .meetings:
             return String(localized: "\(settings.meetingExcludedBundleIDs.count) excluded")
-        case .history:
-            guard let archiveSnapshot else {
-                return StorageSettingsView.pendingCountText(failed: archiveFailure != nil)
-            }
-            return String(localized: "\(archiveSnapshot.dictationCount) dictations")
         case .storage:
             return archiveSnapshot.map { StorageSettingsView.byteText($0.totalBytes) }
                 ?? StorageSettingsView.pendingCountText(failed: archiveFailure != nil)
-        case .files:
-            // Files transcribes with the dictation engine and language.
-            return "\(settings.dictationEngine.title) · \(languageName)"
         case .gettingStarted:
             return String(localized: "Speech is recognized on this Mac")
         }
@@ -341,11 +309,6 @@ struct SettingsWindow: View {
             String(localized: "recording exclusions apps microphone", comment: "Search words for the Meetings tab"),
             "waveform.and.mic", .red
         )
-        case .history: (
-            String(localized: "History"),
-            String(localized: "archive search dictations", comment: "Search words for the History tab"),
-            "clock.arrow.circlepath", .orange
-        )
         case .storage: (
             String(localized: "Storage"),
             String(localized: "space folder size move", comment: "Search words for the Storage tab"),
@@ -358,11 +321,6 @@ struct SettingsWindow: View {
                 comment: "Search words for the Permissions tab"
             ),
             "hand.raised.fill", .indigo
-        )
-        case .files: (
-            String(localized: "Files"),
-            String(localized: "audio video transcription transcript", comment: "Search words for the Files tab"),
-            "waveform.badge.magnifyingglass", .purple
         )
         }
     }

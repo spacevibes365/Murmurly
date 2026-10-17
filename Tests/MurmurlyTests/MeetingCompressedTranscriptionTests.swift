@@ -107,8 +107,8 @@ final class MeetingCompressedTranscriptionTests: XCTestCase {
         }
         let transcriber = MeetingTranscriber(
             cache: WhisperKitCache(factory: GainLevelEngineFactory()),
-            loadSpeechDetector: { detector },
-            currentEngine: {
+            loadSpeechDetector: { _ in detector },
+            currentEngine: { _ in
                 MeetingTranscriber.Engine(
                     descriptor: EngineDescriptor(engine: .whisper, modelPath: "/models/whisper"),
                     request: .whisper(WhisperDecodeRequest(language: "ru")),

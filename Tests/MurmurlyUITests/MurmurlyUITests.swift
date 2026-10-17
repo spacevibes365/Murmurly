@@ -77,7 +77,10 @@ final class MurmurlyUITests: XCTestCase {
         XCTAssertEqual(app.windows.count, 1)
         guard app.settingsSidebarSearchIsEmpty() else { return }
 
-        let tabs = ["gettingStarted", "dictation", "meetings", "history", "storage", "permissions", "files"]
+        let tabs = ["gettingStarted", "dictation", "meetings", "storage", "permissions"]
+        for gone in ["dictionary", "history", "files"] {
+            XCTAssertFalse(app.buttons["settingsTab.\(gone)"].exists, "Settings still has the \(gone) tab")
+        }
         for tab in tabs {
             let button = app.buttons["settingsTab.\(tab)"]
             XCTAssertTrue(button.waitForExistence(timeout: 5))
@@ -108,27 +111,93 @@ final class MurmurlyUITests: XCTestCase {
                     app.descendants(matching: .any)["launchAtLoginToggle"]
                         .waitForExistence(timeout: 5)
                 )
-            case "files":
-                XCTAssertTrue(
-                    app.descendants(matching: .any)["fileDropZonePrompt"]
-                        .waitForExistence(timeout: 5)
-                )
-                XCTAssertFalse(app.descendants(matching: .any)["localDiarizationToggle"].exists)
             default:
                 break
             }
         }
+    }
 
-        app.buttons["settingsTab.history"].click()
-        let search = app.textFields["historySearchField"]
+    /// The main window's sections are built with it and only hidden: only
+    /// the shown one is in the accessibility tree, and the history's search
+    /// typed there is still there after another section.
+    func testMainWindowContainsExclusivePersistentSections() {
+        let app = XCUIApplication()
+        app.launchArguments = ["-UITesting", "-UITestSettingsStore"] + AppLanguage.launchArguments
+        app.launch()
+        defer { app.terminate() }
+        guard app.openMainSection("meetings") else { return }
+        let window = app.windows["main"]
+        // Meetings and Starred share one list.
+        let contents = ["meetings", "dictations", "dictionary", "files"]
+        for (section, content) in [("meetings", "meetings"), ("starred", "meetings"), ("dictations", "dictations"),
+                                   ("dictionary", "dictionary"), ("files", "files")] {
+            let row = window.descendants(matching: .any)["mainSection.\(section)"]
+            XCTAssertTrue(row.waitForExistence(timeout: 5), section)
+            row.click()
+            XCTAssertTrue(window.descendants(matching: .any)["mainContent.\(content)"].waitForExistence(timeout: 5), section)
+            for hidden in contents where hidden != content {
+                XCTAssertFalse(
+                    window.descendants(matching: .any)["mainContent.\(hidden)"].exists,
+                    "a hidden section leaked into the accessibility tree on \(section)"
+                )
+            }
+            switch section {
+            case "files":
+                XCTAssertTrue(window.descendants(matching: .any)["fileDropZonePrompt"].waitForExistence(timeout: 5))
+            case "dictionary":
+                XCTAssertTrue(window.buttons["dictionaryAdd"].waitForExistence(timeout: 5))
+            case "dictations":
+                XCTAssertTrue(window.textFields["historySearchField"].waitForExistence(timeout: 5))
+            default:
+                XCTAssertTrue(window.descendants(matching: .any)["meetingList"].waitForExistence(timeout: 5))
+            }
+        }
+
+        guard app.showMainSection("dictations") else { return }
+        let search = window.textFields["historySearchField"]
         XCTAssertTrue(search.waitForExistence(timeout: 5))
         search.click()
         let searchQuery = "12345"
         search.typeText(searchQuery)
-        app.buttons["settingsTab.files"].click()
+        guard app.showMainSection("files") else { return }
         XCTAssertFalse(search.exists)
-        app.buttons["settingsTab.history"].click()
-        XCTAssertEqual(app.textFields["historySearchField"].value as? String, searchQuery)
+        guard app.showMainSection("dictations") else { return }
+        XCTAssertEqual(window.textFields["historySearchField"].value as? String, searchQuery)
+    }
+
+    /// What VoiceOver says for the dictionary's switches and the entry
+    /// sheet's fields: their visible titles stand beside them, not in them.
+    func testDictionaryControlsHaveSpokenNames() {
+        let app = XCUIApplication()
+        app.launchArguments = ["-UITesting", "-UITestSettingsStore"] + AppLanguage.launchArguments
+        app.launch()
+        defer { app.terminate() }
+
+        guard app.openMainSection("dictionary") else { return }
+        for (identifier, name) in [
+            ("dictionaryInDictation", "Dictation"),
+            ("dictionaryInMeetings", "Meetings"),
+            ("dictionaryInFiles", "Files"),
+        ] {
+            let control = app.descendants(matching: .any)[identifier]
+            XCTAssertTrue(control.waitForExistence(timeout: 5), identifier)
+            XCTAssertEqual(control.label, AppLanguage.text(name), identifier)
+        }
+
+        let add = app.buttons["dictionaryAdd"]
+        XCTAssertTrue(add.waitForExistence(timeout: 5))
+        add.click()
+        for (identifier, name) in [
+            ("dictionaryHeardField", "Heard as"),
+            ("dictionaryWrittenField", "Write as"),
+            ("dictionaryExampleField", "Try it"),
+        ] {
+            let field = app.textFields[identifier]
+            XCTAssertTrue(field.waitForExistence(timeout: 5), identifier)
+            XCTAssertEqual(field.label, AppLanguage.text(name), identifier)
+        }
+        app.buttons["dictionaryCancel"].click()
+        XCTAssertTrue(app.textFields["dictionaryHeardField"].waitForNonExistence(timeout: 5), "the sheet stayed")
     }
 
     /// A test copy must leave the app's shortcut preferences exactly as they
@@ -148,9 +217,10 @@ final class MurmurlyUITests: XCTestCase {
         )
         app.terminate()
 
-        // cfprefsd writes to disk asynchronously: give a seeded value time to land.
+        // cfprefsd writes to disk asynchronously: give a seeded value time to
+        // land, as long as every check of the owner's domain does.
         var after = shortcutPreferences(keys)
-        let deadline = Date().addingTimeInterval(3)
+        let deadline = Date().addingTimeInterval(5)
         while after == before, Date() < deadline {
             Thread.sleep(forTimeInterval: 0.2)
             after = shortcutPreferences(keys)
@@ -160,10 +230,11 @@ final class MurmurlyUITests: XCTestCase {
     }
 
     /// Files once put its buttons into a window toolbar: on that tab alone
-    /// the window grew and the title and the sidebar moved down. Every tab now
-    /// keeps the window, the title's place and the sidebar, there and back.
-    /// The title is compared by origin only: its width is the tab's name.
-    func testFilesTabKeepsTheWindowAndItsChrome() {
+    /// the window grew and the title and the sidebar moved down. Files is
+    /// the main window's now; every tab of Settings keeps the window, the
+    /// title's place and the sidebar, there and back, with no toolbar. The
+    /// title is compared by origin only: its width is the tab's name.
+    func testSettingsTabsKeepTheWindowAndItsChrome() {
         let app = XCUIApplication()
         app.launchArguments = ["-UITesting", "-UITestSettingsStore"] + AppLanguage.launchArguments
         app.launch()
@@ -199,7 +270,7 @@ final class MurmurlyUITests: XCTestCase {
         }
 
         guard let start = show("dictation") else { return }
-        for tab in ["files", "dictation", "permissions", "files", "dictation"] {
+        for tab in ["storage", "dictation", "permissions", "storage", "dictation"] {
             guard let now = show(tab) else { return }
             let place = "\(tab) after dictation"
             XCTAssertEqual(now.window.minX, start.window.minX, accuracy: 1, "REGRESSION: the window moved on \(place)")

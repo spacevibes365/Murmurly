@@ -14,8 +14,11 @@ final class FilesModel: ObservableObject {
     /// What waits for the user's answer before it may replace unsaved text.
     struct Replacement: Equatable {
         enum Action: Equatable {
+            /// Only picks the file; its run is a Transcribe of its own.
             case file(URL)
-            case rerun
+            /// The run asked for, with the engine and language it was asked
+            /// in: an answer that comes later never reads the menu again.
+            case rerun(SettingsSnapshot.Choice?)
         }
 
         let action: Action
@@ -24,9 +27,10 @@ final class FilesModel: ObservableObject {
         let revision: Int
     }
 
-    /// Where to save a .md, given the name to suggest; nil when the user
-    /// cancelled. The real one is a panel, a stand-in in tests.
-    typealias SaveDestination = @MainActor (_ suggestedName: String) async -> URL?
+    /// Where to save a .md, given the name to suggest and the window the
+    /// save was asked from; nil when the user cancelled. The real one is a
+    /// panel on that window, a stand-in in tests.
+    typealias SaveDestination = @MainActor (_ suggestedName: String, _ owner: NSWindow?) async -> URL?
 
     /// Text, name and revision taken together before the panel: whatever
     /// lands while it is up, this save belongs to the result shown when asked.
@@ -48,9 +52,15 @@ final class FilesModel: ObservableObject {
     @Published private(set) var resultRevision = 0
     @Published private(set) var savedRevision = 0
     @Published private(set) var savedName: String?
+    /// The engine and language of the next run; nil runs as the settings
+    /// say, chunk by chunk. In memory only and never written to the
+    /// settings: kept across runs, files and the window, until the user
+    /// picks "As Dictation".
+    @Published var choice: SettingsSnapshot.Choice?
 
-    private let makeTranscription: @MainActor () -> FileTranscription?
+    private let makeTranscription: @MainActor (SettingsSnapshot.Choice?) throws -> FileTranscription
     private let saveDestination: SaveDestination
+    private let returnDictationEngine: @MainActor () -> Void
     private var currentTask: Task<Void, Never>?
     private var runToken = 0
     private var activeRunToken: Int?
@@ -63,43 +73,63 @@ final class FilesModel: ObservableObject {
     /// The message of the last save that failed, while it is shown.
     private var saveFailure: String?
 
-    /// `transcription` is asked at the start of every run; nil means the model
-    /// is not downloaded.
+    /// `transcription` is asked, with the run's choice, as a run is asked
+    /// for and again before it starts, before any text is dropped; it throws
+    /// when the run cannot start. `returnDictationEngine` comes after a run
+    /// with a choice, whatever its end.
     init(
-        transcription: @escaping @MainActor () -> FileTranscription?,
-        saveDestination: @escaping SaveDestination = FilesModel.askWhereToSave
+        transcription: @escaping @MainActor (SettingsSnapshot.Choice?) throws -> FileTranscription,
+        saveDestination: @escaping SaveDestination = FilesModel.askWhereToSave,
+        returnDictationEngine: @escaping @MainActor () -> Void = {}
     ) {
         makeTranscription = transcription
         self.saveDestination = saveDestination
+        self.returnDictationEngine = returnDictationEngine
     }
 
-    /// The dictation's engine through the meeting pipeline, so a file gets the
-    /// same model, chunking and timecodes as a call, and nothing evicts the
-    /// model the dictation keeps warm.
-    static func live(settings: SettingsStore, models: ModelDownloader) -> FilesModel {
-        #if DEBUG
-        let saveDestination = FileProbe.saveDestination() ?? askWhereToSave
-        #else
-        let saveDestination: SaveDestination = askWhereToSave
-        #endif
-        return FilesModel(transcription: {
-            #if DEBUG
-            if let probe = FileProbe.transcription() { return probe }
-            #endif
-            guard models.missing(settings.dictationEngine).isEmpty else { return nil }
-            AppLog.info("run", "engine=\(settings.dictationEngine.rawValue)")
-            return Self.transcription(MeetingTranscriber.live(settings: settings, models: models))
-        }, saveDestination: saveDestination)
-    }
-
-    nonisolated static func transcription(_ transcriber: MeetingTranscriber) -> FileTranscription {
-        { url, progress in
-            try await transcriber.transcribeFile(url, report: progress).map(TranscriptSegment.init)
+    /// A run refused before it starts: the engine it would use misses a
+    /// file, its tokenizer and the VAD included.
+    struct ModelMissing: LocalizedError {
+        let engine: DictationEngine
+        var errorDescription: String? {
+            String(localized: "The \(engine.modelName) model is not downloaded. Download it above, or choose another engine.")
         }
     }
 
-    static var modelMissingText: String {
-        String(localized: "Model not downloaded: “M” menu → “Download Model…”")
+    /// The meeting pipeline on one file, so it gets the same model, chunking
+    /// and timecodes as a call. A run in another engine than the dictation's
+    /// leaves the dictation its engine, as a meeting job does, and gives it
+    /// back afterwards. `transcriber` is the test's own, wired the same.
+    static func live(
+        settings: SettingsStore,
+        models: ModelDownloader,
+        dictation: DictationCoordinator,
+        transcriber: MeetingTranscriber? = nil,
+        saveDestination: @escaping SaveDestination = FilesModel.askWhereToSave
+    ) -> FilesModel {
+        var transcriber = transcriber ?? .live(settings: settings, models: models)
+        transcriber.heldByDictation = { await dictation.heldEngine() }
+        return FilesModel(transcription: { choice in
+            #if DEBUG
+            if let probe = FileProbe.transcription(choice: choice) { return probe }
+            #endif
+            // The same check as the transcriber's when it starts: a refusal
+            // here leaves the shown text alone.
+            let engine = settings.snapshot.applying(choice).dictationEngine
+            guard models.missing(engine).isEmpty else { throw ModelMissing(engine: engine) }
+            return Self.transcription(transcriber, choice: choice)
+        }, saveDestination: saveDestination, returnDictationEngine: {
+            dictation.prepareAfterOtherEngineJob()
+        })
+    }
+
+    nonisolated static func transcription(
+        _ transcriber: MeetingTranscriber,
+        choice: SettingsSnapshot.Choice?
+    ) -> FileTranscription {
+        { url, progress in
+            try await transcriber.transcribeFile(url, choice: choice, report: progress).map(TranscriptSegment.init)
+        }
     }
 
     var hasUnsavedText: Bool { !segments.isEmpty && savedRevision != resultRevision }
@@ -128,10 +158,16 @@ final class FilesModel: ObservableObject {
 
     func start() {
         guard !isTranscribing, fileURL != nil else { return }
+        // The run's own from here: a change of the menu while the question
+        // or the save panel is up is the next run's.
+        let choice = choice
+        // Before the question: a run that cannot start asks nothing and
+        // drops nothing.
+        guard let transcribe = readyTranscription(choice) else { return }
         if hasUnsavedText {
-            pendingReplacement = Replacement(action: .rerun, revision: resultRevision)
+            pendingReplacement = Replacement(action: .rerun(choice), revision: resultRevision)
         } else {
-            run()
+            run(transcribe, choice: choice)
         }
     }
 
@@ -147,8 +183,11 @@ final class FilesModel: ObservableObject {
         case .file(let url):
             guard !isTranscribing else { return }
             apply(url)
-        case .rerun:
-            run()
+        case .rerun(let choice):
+            // Asked again: the model may have gone while the question or
+            // the save panel was up.
+            guard !isTranscribing, let transcribe = readyTranscription(choice) else { return }
+            run(transcribe, choice: choice)
         }
     }
 
@@ -157,8 +196,8 @@ final class FilesModel: ObservableObject {
     /// write stops here; a result that landed while the panel was up fails the
     /// revision check in `replace`, and the save, taken before the panel,
     /// holds the agreed result, never the newer one.
-    func saveThenReplace(_ replacement: Replacement) async {
-        guard await saveTranscript() else { return }
+    func saveThenReplace(_ replacement: Replacement, owner: NSWindow?) async {
+        guard await saveTranscript(owner: owner) else { return }
         replace(with: replacement)
     }
 
@@ -173,7 +212,19 @@ final class FilesModel: ObservableObject {
         status = ""
     }
 
-    private func run() {
+    /// The run's transcription; without one the reason goes over the text,
+    /// which stays as it is.
+    private func readyTranscription(_ choice: SettingsSnapshot.Choice?) -> FileTranscription? {
+        do {
+            return try makeTranscription(choice)
+        } catch {
+            errorText = error.localizedDescription
+            AppLog.info("run", "refused: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    private func run(_ transcribe: @escaping FileTranscription, choice: SettingsSnapshot.Choice?) {
         guard !isTranscribing, let url = fileURL else { return }   // no overlapping runs
         // All before the task starts: a drop answered from here on is stale,
         // and the run keeps the file it was started for.
@@ -187,15 +238,24 @@ final class FilesModel: ObservableObject {
         runToken &+= 1
         let token = runToken
         activeRunToken = token
-        currentTask = Task { await runTranscription(url: url, token: token) }
+        currentTask = Task {
+            await runTranscription(transcribe, url: url, choice: choice, token: token)
+            // After the result is shown and apart from it: the dictation's
+            // own warm-up, whose failure is the dictation's.
+            if choice != nil { returnDictationEngine() }
+        }
     }
 
-    private func runTranscription(url: URL, token: Int) async {
-        guard let transcribe = makeTranscription() else {
-            finish(token: token, url: url, segments: [], status: "", error: Self.modelMissingText)
-            return
-        }
-        AppLog.info("run", "start file=\(url.lastPathComponent)")
+    private func runTranscription(
+        _ transcribe: FileTranscription,
+        url: URL,
+        choice: SettingsSnapshot.Choice?,
+        token: Int
+    ) async {
+        // The language as a code: what was said never goes to the log.
+        AppLog.info("run", "start file=\(url.lastPathComponent) " + (choice.map {
+            "engine=\($0.engine.rawValue) language=\($0.language)"
+        } ?? "as the settings say"))
         do {
             let result = try await transcribe(url) { [weak self] step in
                 guard let text = Self.statusText(for: step) else { return }
@@ -249,7 +309,7 @@ final class FilesModel: ObservableObject {
         case .preparingModel: String(localized: "Preparing the model — the first time takes a few minutes")
         case .waitingForEngine: String(localized: "Waiting for the engine…")
         case let .recognizing(_, done, total): String(localized: "Recognizing: \(done) of \(total)")
-        case .compressing, .moving: nil
+        case .compressing, .moving, .removingAudio: nil
         }
     }
 
@@ -333,7 +393,7 @@ final class FilesModel: ObservableObject {
         return true
     }
 
-    func pickFile() async {
+    func pickFile(owner: NSWindow?) async {
         guard !isTranscribing else { return }
         let panel = NSOpenPanel()
         panel.allowedContentTypes = [.audio, .movie, .mpeg4Movie, .mp3, .wav]
@@ -341,33 +401,91 @@ final class FilesModel: ObservableObject {
         // A drop still being resolved must not land on top of this explicit
         // choice.
         selectionToken &+= 1
-        guard let url = await Self.present(panel) else { return }
+        guard let url = await Self.present(panel, on: owner, as: .fileToTranscribe) else { return }
         AppLog.info("ui", "file picked: \(url.lastPathComponent)")
         select(url)
     }
 
-    /// The real save panel. Neither panel runs a nested modal loop: each is a
-    /// sheet on the tab's window (the window itself when nothing is key), and
-    /// its answer comes back here.
-    static func askWhereToSave(_ name: String) async -> URL? {
+    /// The real save panel, on the window the save was asked from.
+    static func askWhereToSave(_ name: String, _ owner: NSWindow?) async -> URL? {
         let panel = NSSavePanel()
         panel.allowedContentTypes = [UTType(filenameExtension: "md") ?? .plainText]
         panel.nameFieldStringValue = name
-        return await present(panel)
+        return await present(panel, on: owner, as: .filesTranscript)
     }
 
-    private static func present(_ panel: NSSavePanel) async -> URL? {
+    /// What a panel is for: the probe answers by it, and the log names it.
+    enum PanelPurpose: String, Sendable {
+        case fileToTranscribe = "a file to transcribe"
+        case filesTranscript = "a file's transcript"
+        case dictionaryImport = "a dictionary to import"
+        case dictionaryExport = "the dictionary's export"
+        case meetingTranscript = "a meeting's transcript"
+    }
+
+    /// The panel's last call, given its window: AppKit's sheet outside tests.
+    typealias PanelSheet = @MainActor @Sendable (_ panel: NSSavePanel, _ owner: NSWindow) async -> URL?
+    /// Where a panel's answer comes from.
+    typealias PanelBackend = @MainActor @Sendable (_ panel: NSSavePanel, _ owner: NSWindow, _ purpose: PanelPurpose) async -> URL?
+
+    /// Every open and save panel of the app's windows: the Files tab's, the
+    /// dictionary's and a meeting's Save As. Each is a sheet on the window it
+    /// was asked from, taken by the view at the click, never the window
+    /// that happens to be key when the panel comes: an owner closed by then
+    /// cancels the choice, and no panel goes on another window or on none.
+    /// None runs a nested modal loop, and no test process opens one: `sheet`,
+    /// AppKit's last call, comes only after this process's rule, which a
+    /// test checks with a `sheet` that counts.
+    static func present(
+        _ panel: NSSavePanel, on owner: NSWindow?, as purpose: PanelPurpose,
+        sheet: @escaping PanelSheet = FilesModel.sheet
+    ) async -> URL? {
+        let backend = panelBackend(
+            arguments: ProcessInfo.processInfo.arguments, testProcess: TestIsolation.isTestProcess, sheet: sheet
+        )
+        return await present(panel, on: owner, as: purpose, backend: backend)
+    }
+
+    /// The same, with where the answer comes from given: a test's own.
+    /// `probe`: the DEBUG probe's root, which may hold the panel.
+    static func present(
+        _ panel: NSSavePanel, on owner: NSWindow?, as purpose: PanelPurpose, backend: @escaping PanelBackend,
+        probe: URL? = nil
+    ) async -> URL? {
         #if DEBUG
-        if let folder = FileProbe.panelFolder { panel.directoryURL = folder }
+        // A UI test holds the panel between the click and its coming.
+        let held = await FileProbe.holdPresent(root: probe.flatMap { FileProbe.isTemporary($0) ? $0 : nil } ?? FileProbe.root)
+        guard held.comes else { return nil }
         #endif
-        // From the replace sheet the key window is that sheet, on its way out.
-        let response: NSApplication.ModalResponse
-        if let window = NSApp.keyWindow.map({ $0.sheetParent ?? $0 }) {
-            response = await panel.beginSheetModal(for: window)
-        } else {
-            response = await panel.begin()
+        guard let owner, owner.isVisible else {
+            AppLog.info("ui", "no panel for \(purpose.rawValue): the window it was asked from is gone")
+            #if DEBUG
+            FileProbe.presented(held.shown, on: nil)
+            #endif
+            return nil
         }
-        return response == .OK ? panel.url : nil
+        #if DEBUG
+        FileProbe.presented(held.shown, on: owner)
+        #endif
+        return await backend(panel, owner, purpose)
+    }
+
+    /// The panel outside tests. A test process never opens one, whatever it
+    /// was told (the stage gate's opt-out included): a DEBUG test with
+    /// `-FileProbeRoot` gets the probe's answer, any other none.
+    static func panelBackend(arguments: [String], testProcess: Bool, sheet: @escaping PanelSheet) -> PanelBackend {
+        guard testProcess else { return { panel, owner, _ in await sheet(panel, owner) } }
+        #if DEBUG
+        if let root = FileProbe.root(in: arguments) {
+            return { panel, _, purpose in await FileProbe.answer(panel, for: purpose, root: root) }
+        }
+        #endif
+        return { _, _, _ in nil }
+    }
+
+    /// AppKit's panel, a sheet on its window.
+    static func sheet(_ panel: NSSavePanel, on owner: NSWindow) async -> URL? {
+        await panel.beginSheetModal(for: owner) == .OK ? panel.url : nil
     }
 
     // MARK: - copy and save
@@ -380,9 +498,9 @@ final class FilesModel: ObservableObject {
     /// True when this result's text was written; the name is the result's
     /// file, not whatever is selected now.
     @discardableResult
-    func saveTranscript() async -> Bool {
+    func saveTranscript(owner: NSWindow?) async -> Bool {
         guard let request = saveRequest(),
-              let url = await saveDestination(request.name) else { return false }
+              let url = await saveDestination(request.name, owner) else { return false }
         return save(request, to: url)
     }
 
@@ -441,16 +559,58 @@ final class FilesModel: ObservableObject {
     }
 }
 
+/// The window a view is in, read at the moment of an action: the owner of
+/// the panel that action shows. A view inside a sheet answers with the
+/// window the sheet is on.
+@MainActor
+final class WindowAnchor {
+    fileprivate weak var view: NSView?
+
+    var window: NSWindow? { view?.window.map { $0.sheetParent ?? $0 } }
+
+    /// Put in the view's background: it is in the view's window.
+    struct Reader: NSViewRepresentable {
+        let anchor: WindowAnchor
+
+        func makeNSView(context: Context) -> NSView {
+            let spot = Spot()
+            spot.anchor = anchor
+            return spot
+        }
+
+        func updateNSView(_ view: NSView, context: Context) {}
+    }
+
+    /// Marks the anchor as it joins a window and lets go as it leaves, only
+    /// if the anchor is still its: as the content changes, SwiftUI brings
+    /// the new view in and updates the old one last before taking it away.
+    private final class Spot: NSView {
+        weak var anchor: WindowAnchor?
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            if window != nil {
+                anchor?.view = self
+            } else if anchor?.view === self {
+                anchor?.view = nil
+            }
+        }
+    }
+}
+
 struct ContentView: View {
     @EnvironmentObject var settings: SettingsStore
     @EnvironmentObject var models: ModelDownloader
     @EnvironmentObject var files: FilesModel
 
     @State private var isTargeted = false
+    /// The tab's window, for the panels its actions show.
+    @State private var anchor = WindowAnchor()
 
     var body: some View {
         VStack(spacing: 0) {
             actionRow
+            optionsRow
             Divider()
             mainArea
             Divider()
@@ -459,6 +619,7 @@ struct ContentView: View {
         // The whole tab takes a drop, not just the zone: once a result is
         // shown the zone is gone, and a new file is dropped onto the text.
         .contentShape(Rectangle())
+        .background(WindowAnchor.Reader(anchor: anchor))
         .onDrop(of: [.fileURL], isTargeted: $isTargeted) { providers in
             files.handleDrop(providers)
         }
@@ -477,7 +638,9 @@ struct ContentView: View {
             presenting: files.pendingReplacement
         ) { replacement in
             Button("Save .md…") {
-                Task { await files.saveThenReplace(replacement) }
+                // The tab's window, not the question's, which is on its way out.
+                let owner = anchor.window
+                Task { await files.saveThenReplace(replacement, owner: owner) }
             }
             .accessibilityIdentifier("fileReplaceSave")
             Button("Replace", role: .destructive) { files.replace(with: replacement) }
@@ -487,6 +650,12 @@ struct ContentView: View {
         }
         // A question nobody answered is not asked again when the window reopens.
         .onDisappear { files.pendingReplacement = nil }
+    }
+
+    /// The window is taken at the click, before anything waits.
+    private func pickFile() {
+        let owner = anchor.window
+        Task { await files.pickFile(owner: owner) }
     }
 
     /// Inside the tab rather than in a window toolbar, which made the window
@@ -509,7 +678,7 @@ struct ContentView: View {
             }
             Spacer(minLength: 0)
 
-            Button("Choose File…") { Task { await files.pickFile() } }
+            Button("Choose File…") { pickFile() }
                 .disabled(files.isTranscribing)
                 .accessibilityIdentifier("fileChooseButton")
             if files.isTranscribing {
@@ -532,12 +701,71 @@ struct ContentView: View {
             Button("Copy") { files.copyTranscript() }
                 .disabled(files.segments.isEmpty)
                 .accessibilityIdentifier("fileCopyButton")
-            Button("Save .md") { Task { await files.saveTranscript() } }
+            Button("Save .md") {
+                let owner = anchor.window
+                Task { await files.saveTranscript(owner: owner) }
+            }
                 .disabled(files.segments.isEmpty)
                 .accessibilityIdentifier("fileSaveButton")
         }
         .padding(.horizontal, SettingsChrome.contentHorizontalPadding)
-        .padding(.vertical, 10)
+        .padding(.top, 10)
+        .padding(.bottom, 6)
+    }
+
+    /// The engine and language of the next run, and whether that model is
+    /// there: above the area the text takes over, so they stay at hand to run
+    /// a file again. A choice runs nothing and drops nothing.
+    private var optionsRow: some View {
+        let label = FilesChoiceMenu.label(of: files.choice, settings: settings.snapshot)
+        let engine = settings.snapshot.applying(files.choice).dictationEngine
+        let missing = models.missing(engine)
+        // The model's state takes a line of its own under the menu: beside
+        // the menu and the download button there was no room left for it at
+        // the window's usual width, least of all in Russian.
+        return VStack(alignment: .leading, spacing: 6) {
+            Menu {
+                FilesChoiceMenu(files: files, settings: settings, models: models)
+            } label: {
+                Text(label)
+            }
+            .fixedSize()
+            // The run keeps the choice it started with whatever the menu
+            // says; off while it runs so the menu never looks like the run's.
+            .disabled(files.isTranscribing)
+            .accessibilityLabel(Text("Transcription options"))
+            .accessibilityValue(Text(label))
+            .accessibilityIdentifier("fileChoiceMenu")
+            // One download at a time: while any runs, it shows under its own
+            // name, never as this engine's.
+            if let download = models.download {
+                Text("\(download.engine.modelName) · downloading \(download.progressText)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else if !missing.isEmpty {
+                HStack(spacing: SettingsChrome.compactSpacing) {
+                    Text("\(engine.title) · not downloaded")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .accessibilityIdentifier("fileModelState")
+                    Button("Download Model \(engine.modelName) (\(ModelDownloader.sizeText(missing.reduce(0) { $0 + $1.bytes })))…") {
+                        models.start(engine)
+                    }
+                    .fixedSize()
+                    .accessibilityIdentifier("fileDownloadButton")
+                }
+                if let failure = models.failure, failure.engine == engine {
+                    Text("Download failed: \(failure.message)")
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, SettingsChrome.contentHorizontalPadding)
+        .padding(.bottom, 10)
     }
 
     private var bottomBar: some View {
@@ -603,17 +831,14 @@ struct ContentView: View {
                 .font(.headline)
                 .accessibilityIdentifier("fileDropZonePrompt")
             // Checked on macOS 26: AVAudioFile opens all five, video included.
-            Text("mp3 · m4a · wav · mp4 · mov — same engine as dictation")
+            // The engine is the options row's to say.
+            Text(verbatim: "mp3 · m4a · wav · mp4 · mov")
                 .font(.caption).foregroundStyle(.secondary)
-            if !models.missing(settings.dictationEngine).isEmpty {
-                Text(FilesModel.modelMissingText)
-                    .font(.caption2).foregroundStyle(.orange)
-            }
         }
         .padding(24)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .contentShape(Rectangle())
-        .onTapGesture { Task { await files.pickFile() } }
+        .onTapGesture { pickFile() }
     }
 
     private var transcript: some View {
@@ -649,5 +874,61 @@ struct ContentView: View {
             .padding(.horizontal, SettingsChrome.contentHorizontalPadding)
             .padding(.vertical, 16)
         }
+    }
+}
+
+/// The Files tab's engines and languages: "As Dictation", then each engine
+/// with Auto and its languages. A view of its own, so a test sees the items as
+/// AppKit gets them (`NSHostingMenu`). Every item sets engine and language
+/// together, so there is no draft to keep.
+struct FilesChoiceMenu: View {
+    @ObservedObject var files: FilesModel
+    @ObservedObject var settings: SettingsStore
+    @ObservedObject var models: ModelDownloader
+
+    var body: some View {
+        let dictation = Self.names(of: nil, settings: settings.snapshot)
+        Picker("Transcription options", selection: $files.choice) {
+            Text("As Dictation (\(dictation.engine) · \(dictation.language))")
+                .tag(SettingsSnapshot.Choice?.none)
+        }
+        .pickerStyle(.inline)
+        .labelsHidden()
+        Divider()
+        ForEach(DictationEngine.allCases, id: \.self) { engine in
+            Menu(models.missing(engine).isEmpty ? engine.title : String(localized: "\(engine.title) · not downloaded")) {
+                Picker("Language", selection: $files.choice) {
+                    Text("Auto").tag(Optional(SettingsSnapshot.Choice(engine: engine, language: "auto")))
+                    Divider()
+                    ForEach(engine.languageChoices, id: \.code) { language in
+                        Text(language.name).tag(Optional(SettingsSnapshot.Choice(engine: engine, language: language.code)))
+                    }
+                }
+                .pickerStyle(.inline)
+                .labelsHidden()
+            }
+        }
+    }
+
+    /// "As Dictation · Parakeet · Auto" or the choice alone: the two differ
+    /// even when they would ask the engine the same, as only the first
+    /// follows the settings.
+    static func label(of choice: SettingsSnapshot.Choice?, settings: SettingsSnapshot) -> String {
+        let names = names(of: choice, settings: settings)
+        return choice == nil
+            ? String(localized: "As Dictation · \(names.engine) · \(names.language)")
+            : "\(names.engine) · \(names.language)"
+    }
+
+    /// The engine and language a run would take, the language by the
+    /// settings' rule: a code the engine does not know is Auto.
+    private static func names(
+        of choice: SettingsSnapshot.Choice?,
+        settings: SettingsSnapshot
+    ) -> (engine: String, language: String) {
+        let run = settings.applying(choice)
+        let code = run.dictationEngine.language(for: run.dictationLanguage)
+        let language = code.flatMap { code in run.dictationEngine.languageChoices.first { $0.code == code }?.name }
+        return (run.dictationEngine.title, language ?? String(localized: "Auto"))
     }
 }

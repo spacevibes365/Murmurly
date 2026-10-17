@@ -1,4 +1,5 @@
 import AVFoundation
+import CryptoKit
 import XCTest
 @testable import Murmurly
 
@@ -292,6 +293,415 @@ final class MeetingStorageTests: XCTestCase {
         XCTAssertEqual(try names(in: unknownState), ["metadata.json", "microphone.caf", "system.caf"])
     }
 
+    /// A meeting is a folder named as recordings are named, with metadata or
+    /// a track in it: a recording cut off before its stop counts, a folder of
+    /// notes with someone's `metadata.json` does not.
+    func testMeetingFoldersAreNamedOnesWithMetadataOrATrack() throws {
+        let expected = try seedMixedMeetingsRoot()
+
+        XCTAssertEqual(try MeetingStorage.meetingFolders(in: root).map(\.lastPathComponent).sorted(), expected)
+        XCTAssertEqual(try MeetingStorage.meetingFolders(in: root.appendingPathComponent("absent")), [])
+    }
+
+    /// A meeting whose folder cannot be listed inside a root that can is
+    /// still a meeting: it does not vanish from the list and the count.
+    func testMeetingWhoseFolderCannotBeReadIsStillListed() throws {
+        let readable = try MeetingAudio.folder("2026-10-06 10-00-00 Meeting", in: root, microphone: [[0, 0]], system: [[0, 0]])
+        let locked = try MeetingAudio.folder("2026-10-06 11-00-00 Meeting", in: root, microphone: [[0, 0]], system: [[0, 0]])
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: locked.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: locked.path) }
+
+        XCTAssertEqual(
+            try MeetingStorage.meetingFolders(in: root).map(\.lastPathComponent).sorted(),
+            [readable.lastPathComponent, locked.lastPathComponent]
+        )
+    }
+
+    /// A root that cannot be listed is not an empty one.
+    func testUnreadableRootThrowsInsteadOfPassingForEmpty() throws {
+        let locked = root.appendingPathComponent("Locked", isDirectory: true)
+        try FileManager.default.createDirectory(at: locked, withIntermediateDirectories: true)
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: locked.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: locked.path) }
+
+        XCTAssertThrowsError(try MeetingStorage.meetingFolders(in: locked))
+    }
+
+    /// Storage counts the meetings the window lists: it used to count any
+    /// folder with a `metadata.json` and miss recordings cut off before
+    /// their stop.
+    func testStorageCountsTheMeetingsTheWindowLists() throws {
+        let expected = try seedMixedMeetingsRoot()
+
+        let snapshot = ArchiveSnapshot.local(
+            historyCount: 0, historyOldest: nil,
+            dictationsRoot: root.appendingPathComponent("absent-dictations", isDirectory: true),
+            meetingsRoot: root
+        )
+
+        XCTAssertEqual(snapshot.meetingCount, expected.count)
+        XCTAssertEqual(snapshot.meetingOldest, MeetingTranscriber.Folder.date(fromFolderName: "2026-07-14 09-00-00 Meeting"))
+    }
+
+    /// The app's own files in a meeting's folder, and what it only shows:
+    /// the user's notes, and nothing of Finder's bookkeeping.
+    func testOwnFilesOfAMeetingAndEveryoneElses() {
+        let tracks = ["mic-1.caf", "system.m4a"]
+        let own = [
+            "metadata.json", "murmurly.json", "system.caf", "microphone.m4a", "mic-1.caf", "mic-1.m4a",
+            "transcript.md", "transcript 12.md", MeetingAttempt.fileName(number: 3),
+            ".transcript-\(UUID().uuidString).tmp", ".system.partial.m4a",
+        ]
+        let theirs = ["tasks.md", "transcript 1.md", "transcript-notes.md", ".attempt notes", "photo.png"]
+
+        for name in own { XCTAssertTrue(MeetingStorage.isOwnFile(name, tracks: tracks), name) }
+        for name in theirs { XCTAssertFalse(MeetingStorage.isOwnFile(name, tracks: tracks), name) }
+        XCTAssertTrue(MeetingStorage.isSystemFile(".DS_Store"))
+        XCTAssertTrue(MeetingStorage.isSystemFile("._system.m4a"))
+        XCTAssertFalse(MeetingStorage.isSystemFile("tasks.md"))
+        XCTAssertEqual(["transcript.md", "transcript 2.md", "transcript 10.md", "transcript 1.md"].map(MeetingStorage.transcriptNumber), [1, 2, 10, nil])
+    }
+
+    /// murmurly.json is written only over a file proven to be this version:
+    /// every other key survives, a title set to none is taken out, and any
+    /// other file (no version, version 0, another type, a later version,
+    /// not JSON) is left byte for byte.
+    func testMarksAreWrittenOnlyOverAProvenVersionAndKeepEveryOtherKey() throws {
+        let folder = root.appendingPathComponent("2026-10-15 10-00-00 Meeting", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let file = folder.appendingPathComponent(MeetingMarks.fileName)
+        XCTAssertEqual(MeetingMarks.read(in: folder), .none)
+
+        try MeetingMarks.write(MeetingMarks.Change(title: .some("Планёрка"), starred: true), in: folder, expecting: FolderIdentity.of(folder))
+        XCTAssertEqual(MeetingMarks.read(in: folder), .read(MeetingMarks(title: "Планёрка", starred: true)))
+
+        try Data(#"{"version":1,"title":"Старое","starred":false,"speakers":{"microphone":"Денис"},"later":[1,2]}"#.utf8).write(to: file)
+        try MeetingMarks.write(MeetingMarks.Change(title: .some(nil), starred: true), in: folder, expecting: FolderIdentity.of(folder))
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: file)) as? [String: Any])
+        XCTAssertEqual(object["speakers"] as? [String: String], ["microphone": "Денис"])
+        XCTAssertEqual(object["later"] as? [Int], [1, 2])
+        XCTAssertNil(object["title"], "an empty name stays in the file")
+        XCTAssertEqual(object["starred"] as? Bool, true)
+
+        let refused: [(String, Bool)] = [
+            (#"{"title":"x"}"#, false), (#"{"version":0}"#, false), (#"{"version":"1"}"#, false),
+            (#"{"version":1,"starred":"yes"}"#, false), ("[1]", false), ("{broken", false),
+            (#"{"version":2,"title":"из будущего"}"#, true),
+        ]
+        for (body, newer) in refused {
+            try Data(body.utf8).write(to: file)
+            switch MeetingMarks.read(in: folder) {
+            case .newer: XCTAssertTrue(newer, body)
+            case .unreadable: XCTAssertFalse(newer, body)
+            default: XCTFail("\(body) read as \(MeetingMarks.read(in: folder))")
+            }
+            XCTAssertThrowsError(try MeetingMarks.write(MeetingMarks.Change(title: .some("новое"), starred: true), in: folder, expecting: FolderIdentity.of(folder)), body)
+            XCTAssertEqual(try Data(contentsOf: file), Data(body.utf8), "\(body) was written over")
+        }
+    }
+
+    /// The file is read once: what is checked is what is changed. A second
+    /// read that failed or found another file would otherwise stand in for
+    /// it, losing every other key or writing version 1 over a later one.
+    /// A read that fails writes nothing; only a file that is not there is new.
+    func testMarksAreReadOnceAndThatObjectIsChanged() throws {
+        let folder = root.appendingPathComponent("2026-10-15 10-00-00 Meeting", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let file = folder.appendingPathComponent(MeetingMarks.fileName)
+        let first = #"{"version":1,"title":"Старое","speakers":{"microphone":"Денис"}}"#
+        for later in ["{broken", #"{"version":2,"title":"из будущего","later":true}"#] {
+            var reads = 0
+            let written = try MeetingMarks.write(MeetingMarks.Change(starred: true), in: folder, expecting: FolderIdentity.of(folder)) { _ in
+                reads += 1
+                return Data((reads == 1 ? first : later).utf8)
+            }
+            XCTAssertEqual(reads, 1, "the file was read again after it was checked")
+            XCTAssertEqual(written, MeetingMarks(title: "Старое", starred: true, speakers: [.microphone: "Денис"]))
+            let object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: file)) as? [String: Any])
+            XCTAssertEqual(object["speakers"] as? [String: String], ["microphone": "Денис"], later)
+            XCTAssertEqual(object["version"] as? Int, 1, later)
+            XCTAssertNil(object["later"], "a file read later was written as version 1")
+        }
+
+        try Data(first.utf8).write(to: file)
+        XCTAssertThrowsError(try MeetingMarks.write(MeetingMarks.Change(starred: true), in: folder, expecting: FolderIdentity.of(folder)) { _ in
+            throw CocoaError(.fileReadUnknown)
+        })
+        XCTAssertEqual(try Data(contentsOf: file), Data(first.utf8), "a failed read passed for no file")
+
+        try FileManager.default.removeItem(at: file)
+        XCTAssertEqual(try MeetingMarks.write(MeetingMarks.Change(starred: true), in: folder, expecting: FolderIdentity.of(folder)), MeetingMarks(starred: true))
+    }
+
+    /// The speakers' names live in `speakers`, changed in place: every other
+    /// key, at the top and inside it, survives, whatever its type; an empty
+    /// name takes its own key out, and `speakers` goes only once nothing is
+    /// left in it. A `speakers` that is not an object, or a name of this
+    /// version that is not a string, makes the file unreadable: nothing is
+    /// written over it, the star included.
+    func testSpeakerNamesKeepEveryOtherKey() throws {
+        let folder = root.appendingPathComponent("2026-10-15 10-00-00 Meeting", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let file = folder.appendingPathComponent(MeetingMarks.fileName)
+        func object() throws -> [String: Any] {
+            try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: file)) as? [String: Any])
+        }
+        func names(_ change: [MeetingAttempt.Source: String?]) -> MeetingMarks.Change {
+            var names = MeetingMarks.Change()
+            for (source, name) in change { names.speakers.updateValue(name, forKey: source) }
+            return names
+        }
+
+        try Data(#"{"version":1,"title":"Планёрка","later":{"a":1},"speakers":{"room":{"seats":[1,2]},"guest":7}}"#.utf8).write(to: file)
+        let written = try MeetingMarks.write(names([.microphone: "Денис", .system: "Команда"]), in: folder, expecting: FolderIdentity.of(folder))
+        XCTAssertEqual(written, MeetingMarks(title: "Планёрка", speakers: [.microphone: "Денис", .system: "Команда"]))
+        XCTAssertEqual(MeetingMarks.read(in: folder), .read(written))
+        var speakers = try XCTUnwrap(try object()["speakers"] as? [String: Any])
+        XCTAssertEqual(speakers["microphone"] as? String, "Денис")
+        XCTAssertEqual(speakers["system"] as? String, "Команда")
+        XCTAssertEqual((speakers["room"] as? [String: Any])?["seats"] as? [Int], [1, 2], "a key of a later version inside speakers was lost")
+        XCTAssertEqual(speakers["guest"] as? Int, 7)
+        XCTAssertEqual((try object()["later"] as? [String: Any])?["a"] as? Int, 1)
+
+        // One name out, the other changed, in one change.
+        try MeetingMarks.write(names([.microphone: nil, .system: "Подрядчик"]), in: folder, expecting: FolderIdentity.of(folder))
+        speakers = try XCTUnwrap(try object()["speakers"] as? [String: Any])
+        XCTAssertNil(speakers["microphone"], "an empty name stays in the file")
+        XCTAssertEqual(speakers["system"] as? String, "Подрядчик")
+        // Both out: what is not ours stays in speakers.
+        try MeetingMarks.write(names([.system: nil]), in: folder, expecting: FolderIdentity.of(folder))
+        speakers = try XCTUnwrap(try object()["speakers"] as? [String: Any])
+        XCTAssertEqual(Set(speakers.keys), ["room", "guest"])
+        XCTAssertEqual(MeetingMarks.read(in: folder), .read(MeetingMarks(title: "Планёрка")))
+        // Nothing left in speakers: the key goes.
+        try Data(#"{"version":1,"speakers":{"microphone":"Денис"}}"#.utf8).write(to: file)
+        try MeetingMarks.write(names([.microphone: nil]), in: folder, expecting: FolderIdentity.of(folder))
+        XCTAssertNil(try object()["speakers"])
+        // A change of the star leaves the names alone.
+        try Data(#"{"version":1,"speakers":{"microphone":"Денис"}}"#.utf8).write(to: file)
+        try MeetingMarks.write(MeetingMarks.Change(starred: true), in: folder, expecting: FolderIdentity.of(folder))
+        XCTAssertEqual(MeetingMarks.read(in: folder), .read(MeetingMarks(starred: true, speakers: [.microphone: "Денис"])))
+
+        for body in [
+            #"{"version":1,"speakers":["Денис"]}"#, #"{"version":1,"speakers":"Денис"}"#,
+            #"{"version":1,"speakers":{"microphone":7}}"#, #"{"version":1,"speakers":{"system":{"name":"x"}}}"#,
+        ] {
+            try Data(body.utf8).write(to: file)
+            guard case .unreadable = MeetingMarks.read(in: folder) else {
+                XCTFail("\(body) read as \(MeetingMarks.read(in: folder))")
+                continue
+            }
+            for change in [names([.microphone: "Денис"]), MeetingMarks.Change(starred: true)] {
+                XCTAssertThrowsError(try MeetingMarks.write(change, in: folder, expecting: FolderIdentity.of(folder)), body)
+            }
+            XCTAssertEqual(try Data(contentsOf: file), Data(body.utf8), "\(body) was written over")
+        }
+    }
+
+    /// A folder's identity is the folder itself, whatever path reaches it; a
+    /// link at its address is not it. Marks are written only into the folder
+    /// they were meant for: another folder at that address, or a link, takes
+    /// nothing.
+    func testMarksGoOnlyIntoTheFolderTheyWereMeantFor() throws {
+        let folder = root.appendingPathComponent("2026-10-15 10-00-00 Meeting", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let identity = try XCTUnwrap(FolderIdentity.of(folder))
+        let parentLink = root.appendingPathComponent("Parent link", isDirectory: true)
+        try FileManager.default.createSymbolicLink(at: parentLink, withDestinationURL: root)
+        XCTAssertEqual(FolderIdentity.of(parentLink.appendingPathComponent(folder.lastPathComponent)), identity)
+        let folderLink = root.appendingPathComponent("2026-10-15 11-00-00 Meeting", isDirectory: true)
+        try FileManager.default.createSymbolicLink(at: folderLink, withDestinationURL: folder)
+        XCTAssertNil(FolderIdentity.of(folderLink), "a link passed for the folder it points to")
+
+        XCTAssertThrowsError(try MeetingMarks.write(MeetingMarks.Change(starred: true), in: folderLink, expecting: identity))
+        try FileManager.default.moveItem(at: folder, to: root.appendingPathComponent("Old", isDirectory: true))
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        XCTAssertThrowsError(try MeetingMarks.write(MeetingMarks.Change(starred: true), in: folder, expecting: identity))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: folder.appendingPathComponent(MeetingMarks.fileName).path))
+        XCTAssertNoThrow(try MeetingMarks.write(MeetingMarks.Change(starred: true), in: folder, expecting: FolderIdentity.of(folder)))
+    }
+
+    // MARK: - The audio rule
+
+    /// Anything not proven keeps the audio: each case starts from a meeting
+    /// the rule takes and changes one thing.
+    func testTheAudioRuleKeepsAudioUnlessEverythingIsProven() throws {
+        let ended = Date().addingTimeInterval(-40 * 86_400)
+        let outside = root.appendingPathComponent("outside", isDirectory: true)
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        func record(_ change: @escaping (inout MeetingAttempt) -> Void) -> (URL) throws -> Void {
+            { folder in
+                var attempt = RetentionFixture.complete(number: 2, ended: ended)
+                change(&attempt)
+                try RetentionFixture.write(attempt, in: folder)
+            }
+        }
+        let cases: [(String, (URL) throws -> Void)] = [
+            ("starred", { try MeetingMarks.write(.init(starred: true), in: $0, expecting: FolderIdentity.of($0)) }),
+            ("marks damaged", { try Data("{broken".utf8).write(to: $0.appendingPathComponent(MeetingMarks.fileName)) }),
+            ("marks of a later version", {
+                try Data(#"{"version":2}"#.utf8).write(to: $0.appendingPathComponent(MeetingMarks.fileName))
+            }),
+            ("marks a link", { folder in
+                let file = outside.appendingPathComponent(UUID().uuidString)
+                try Data(#"{"version":1,"starred":false}"#.utf8).write(to: file)
+                try FileManager.default.createSymbolicLink(at: folder.appendingPathComponent(MeetingMarks.fileName), withDestinationURL: file)
+            }),
+            ("marks unreadable", { folder in
+                let file = folder.appendingPathComponent(MeetingMarks.fileName)
+                try Data(#"{"version":1,"starred":false}"#.utf8).write(to: file)
+                try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: file.path)
+            }),
+            ("no records", { folder in
+                for name in try FileManager.default.contentsOfDirectory(atPath: folder.path) where name.hasPrefix(MeetingAttempt.namePrefix) {
+                    try FileManager.default.removeItem(at: folder.appendingPathComponent(name))
+                }
+            }),
+            ("a record unreadable", { try Data("{".utf8).write(to: $0.appendingPathComponent(MeetingAttempt.fileName(number: 2))) }),
+            ("two records of one number", { try RetentionFixture.write(RetentionFixture.complete(number: 1, ended: ended), in: $0) }),
+            ("the last failed", record { $0.result = .failed }),
+            ("the last incomplete", record { $0.result = .incomplete }),
+            ("the last found no speech", record { $0.result = .noSpeech }),
+            ("the last never ended", record { $0.result = .inProgress }),
+            ("the last complete with a missed piece", record { $0.failedChunks = 1 }),
+            ("the last complete cut short", record { $0.cutShort = true }),
+            ("the last complete without a track", record { $0.missingTracks = [.microphone] }),
+            ("the last complete ending before it began", record { $0.endedAt = $0.startedAt.addingTimeInterval(-1) }),
+            ("the last complete without a fingerprint", record { $0.fingerprint = nil }),
+            ("the transcript deleted", { try FileManager.default.removeItem(at: $0.appendingPathComponent("transcript.md")) }),
+            ("the transcript edited", { try Data((RetentionFixture.text + "!").utf8).write(to: $0.appendingPathComponent("transcript.md")) }),
+            ("the transcript a link to the same text outside", { folder in
+                let file = outside.appendingPathComponent(UUID().uuidString)
+                try Data(RetentionFixture.text.utf8).write(to: file)
+                try FileManager.default.removeItem(at: folder.appendingPathComponent("transcript.md"))
+                try FileManager.default.createSymbolicLink(at: folder.appendingPathComponent("transcript.md"), withDestinationURL: file)
+            }),
+            ("a record a link", { folder in
+                let file = outside.appendingPathComponent(UUID().uuidString)
+                try RetentionFixture.complete(number: 2, ended: ended).write(to: file)
+                try FileManager.default.createSymbolicLink(
+                    at: folder.appendingPathComponent(MeetingAttempt.fileName(number: 2)), withDestinationURL: file
+                )
+            }),
+            ("the last complete naming no transcript", record { $0.transcript = nil }),
+            ("the last complete naming another file", record { $0.transcript = "notes.md" }),
+            ("the last complete without an end", record { $0.endedAt = nil }),
+            ("the transcript edited, same size", { folder in
+                let edited = RetentionFixture.text.replacingOccurrences(of: "Me:", with: "Mx:")
+                try Data(edited.utf8).write(to: folder.appendingPathComponent("transcript.md"))
+            }),
+            ("a track a link", { folder in
+                let file = outside.appendingPathComponent(UUID().uuidString)
+                try Data(repeating: 1, count: 1_000).write(to: file)
+                try FileManager.default.removeItem(at: folder.appendingPathComponent("system.m4a"))
+                try FileManager.default.createSymbolicLink(at: folder.appendingPathComponent("system.m4a"), withDestinationURL: file)
+            }),
+            ("saved with a warning", { try RetentionFixture.metadata(state: "suspect").write(to: $0.appendingPathComponent("metadata.json")) }),
+            ("no metadata", { try FileManager.default.removeItem(at: $0.appendingPathComponent("metadata.json")) }),
+        ]
+        let base = try RetentionFixture.meeting("2026-09-30 09-00-00 Meeting", in: root, ended: ended)
+        guard case .eligible(let since, let files) = MeetingStorage.audioRetention(of: base) else {
+            return XCTFail("a meeting proven in full keeps its audio: \(MeetingStorage.audioRetention(of: base))")
+        }
+        XCTAssertEqual(since.timeIntervalSince1970, ended.timeIntervalSince1970, accuracy: 1)
+        XCTAssertEqual(Set(files.map(\.name)), ["system.m4a", "microphone.m4a"])
+        for (index, (name, change)) in cases.enumerated() {
+            let folder = try RetentionFixture.meeting(String(format: "2026-10-%02d 10-00-00 Meeting", index + 1), in: root, ended: ended)
+            try change(folder)
+            if case .eligible = MeetingStorage.audioRetention(of: folder) { XCTFail("\(name): the audio would go") }
+        }
+        let link = root.appendingPathComponent("2026-10-30 10-00-00 Meeting", isDirectory: true)
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: base)
+        if case .eligible = MeetingStorage.audioRetention(of: link) { XCTFail("a link to a meeting passed for one") }
+
+        // A track already gone, the proof intact: the rest goes by the same rule.
+        let partial = try RetentionFixture.meeting("2026-10-31 10-00-00 Meeting", in: root, ended: ended)
+        try FileManager.default.removeItem(at: partial.appendingPathComponent("microphone.m4a"))
+        guard case .eligible(_, let rest) = MeetingStorage.audioRetention(of: partial) else {
+            return XCTFail("the rest of the audio is kept")
+        }
+        XCTAssertEqual(rest.map(\.name), ["system.m4a"])
+    }
+
+    /// The count starts at the first full transcription, a later one does
+    /// not move it; and that first one must hold up too.
+    func testTheCountStartsAtTheFirstFullTranscriptionWhichMustHoldUp() throws {
+        let now = Date()
+        let longAgo = now.addingTimeInterval(-40 * 86_400)
+        let yesterday = now.addingTimeInterval(-86_400)
+        let twice = try RetentionFixture.meeting("2026-10-01 10-00-00 Meeting", in: root, ended: longAgo, records: [
+            RetentionFixture.complete(number: 1, ended: longAgo), RetentionFixture.complete(number: 2, ended: yesterday),
+        ])
+        XCTAssertNotNil(MeetingStorage.audioRetention(of: twice).due(days: 30, now: now), "a later transcription moved the count")
+        XCTAssertNil(MeetingStorage.audioRetention(of: twice).due(days: 90, now: now))
+
+        let flaws: [(String, (inout MeetingAttempt) -> Void)] = [
+            ("a missed piece", { $0.failedChunks = 2 }), ("cut short", { $0.cutShort = true }),
+            ("no fingerprint", { $0.fingerprint = nil }), ("another file", { $0.transcript = "notes.md" }),
+            ("no end", { $0.endedAt = nil }), ("an end before its start", { $0.endedAt = $0.startedAt.addingTimeInterval(-1) }),
+        ]
+        for (index, (name, flaw)) in flaws.enumerated() {
+            var flawed = RetentionFixture.complete(number: 1, ended: longAgo)
+            flaw(&flawed)
+            let doubtful = try RetentionFixture.meeting("2026-10-1\(index) 10-00-00 Meeting", in: root, ended: longAgo, records: [
+                flawed, RetentionFixture.complete(number: 2, ended: yesterday),
+            ])
+            if case .eligible = MeetingStorage.audioRetention(of: doubtful) {
+                XCTFail("a first full transcription with \(name) started the count")
+            }
+        }
+    }
+
+    /// A meeting's size counts everything in it, hidden files included, and
+    /// says when a part could not be read rather than passing that part for
+    /// the whole.
+    func testSizeCountsHiddenFilesAndSaysWhenItIsIncomplete() throws {
+        let folder = root.appendingPathComponent("2026-10-15 10-00-00 Meeting", isDirectory: true)
+        let nested = folder.appendingPathComponent("notes", isDirectory: true)
+        try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
+        try Data(repeating: 1, count: 20).write(to: folder.appendingPathComponent("system.m4a"))
+        try Data(repeating: 1, count: 10).write(to: folder.appendingPathComponent(".attempt 0001.murmurly.json"))
+        try Data(repeating: 1, count: 5).write(to: nested.appendingPathComponent("tasks.md"))
+
+        let whole = MeetingStorage.folderSize(of: folder)
+        XCTAssertEqual(whole.bytes, 35)
+        XCTAssertTrue(whole.complete)
+
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: nested.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: nested.path) }
+        let part = MeetingStorage.folderSize(of: folder)
+        XCTAssertFalse(part.complete, "a folder inside that cannot be read passed for counted")
+        XCTAssertEqual(part.bytes, 30)
+        XCTAssertFalse(MeetingStorage.folderSize(of: root.appendingPathComponent("absent")).complete)
+    }
+
+    /// Every kind of entry a meetings root may hold; returns the names that
+    /// are meetings, sorted.
+    private func seedMixedMeetingsRoot() throws -> [String] {
+        let fileManager = FileManager.default
+        let samples = [MeetingAudio.noise(count: 480, amplitude: 0.5, seed: 21)]
+        func folder(_ name: String, files: [String: String]) throws {
+            let url = root.appendingPathComponent(name, isDirectory: true)
+            try fileManager.createDirectory(at: url, withIntermediateDirectories: true)
+            for (file, text) in files { try Data(text.utf8).write(to: url.appendingPathComponent(file)) }
+        }
+        _ = try MeetingAudio.folder("2026-10-06 10-00-00 Meeting", in: root, microphone: samples, system: samples)
+        try folder("2026-07-14 09-00-00 Meeting", files: [
+            "metadata.json": #"{"startedAt":"2026-07-14T09:00:00Z","state":"done","sampleRate":48000}"#,
+        ])
+        try folder("2026-10-07 11-00-00 Meeting", files: ["system.caf": "audio"])
+        try folder("2026-10-07 11-00-00 Meeting-2", files: ["microphone.m4a": "audio"])
+        try folder("Notes", files: ["metadata.json": "{}"])
+        try folder("2026-10-08 10-00-00 Meeting", files: [:])
+        try folder("2026-10-08 11-00-00 Meeting", files: ["notes.md": "мои заметки"])
+        try folder(".2026-10-05 10-00-00 Meeting.removing", files: ["metadata.json": "{}"])
+        try Data("not a folder".utf8).write(to: root.appendingPathComponent("2026-10-09 10-00-00 Meeting"))
+        return [
+            "2026-07-14 09-00-00 Meeting", "2026-10-06 10-00-00 Meeting",
+            "2026-10-07 11-00-00 Meeting", "2026-10-07 11-00-00 Meeting-2",
+        ]
+    }
+
     private func names(in folder: URL) throws -> [String] {
         try FileManager.default.contentsOfDirectory(atPath: folder.path).sorted()
     }
@@ -407,5 +817,45 @@ enum MeetingAudio {
             result[name] = try Data(contentsOf: folder.appendingPathComponent(name))
         }
         return result
+    }
+}
+
+/// A meeting the audio rule takes: saved without a warning, two m4a tracks,
+/// a transcript and the complete record that proves it.
+enum RetentionFixture {
+    static let text = "# Meeting\n\nAutomatic transcript.\n\n---\n\n[0:05] **Me:** текст\n"
+
+    static func metadata(state: String = "done") throws -> Data {
+        try JSONSerialization.data(withJSONObject: [
+            "startedAt": "2026-09-01T10:00:00Z", "endedAt": "2026-09-01T10:30:00Z", "sampleRate": 48_000,
+            "state": state, "segments": [["index": 0, "system": "system.m4a", "mic": "microphone.m4a"]],
+        ])
+    }
+
+    static func complete(number: Int, ended: Date, transcript: String = "transcript.md") -> MeetingAttempt {
+        var attempt = MeetingAttempt(number: number, startedAt: ended.addingTimeInterval(-60))
+        attempt.result = .complete
+        attempt.endedAt = ended
+        attempt.transcript = transcript
+        let bytes = Data(text.utf8)
+        attempt.fingerprint = .init(bytes: bytes.count, sha256: SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined())
+        return attempt
+    }
+
+    static func write(_ attempt: MeetingAttempt, in folder: URL) throws {
+        try attempt.write(to: folder.appendingPathComponent(MeetingAttempt.fileName(number: attempt.number)))
+    }
+
+    @discardableResult
+    static func meeting(_ name: String, in root: URL, ended: Date, records: [MeetingAttempt]? = nil) throws -> URL {
+        let folder = root.appendingPathComponent(name, isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        try metadata().write(to: folder.appendingPathComponent("metadata.json"))
+        for track in ["system.m4a", "microphone.m4a"] {
+            try Data(repeating: 1, count: 1_000).write(to: folder.appendingPathComponent(track))
+        }
+        try Data(text.utf8).write(to: folder.appendingPathComponent("transcript.md"))
+        for record in records ?? [complete(number: 1, ended: ended)] { try write(record, in: folder) }
+        return folder
     }
 }

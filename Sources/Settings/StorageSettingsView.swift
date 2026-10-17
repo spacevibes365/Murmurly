@@ -3,6 +3,27 @@ import Foundation
 import SwiftUI
 
 struct ArchiveSnapshot: Equatable, Sendable {
+    /// The meetings' audio in one place, as the window reads it
+    /// (`MeetingStorage.audio`): how much, and how many meetings have none
+    /// left or cannot be told.
+    struct MeetingAudio: Equatable, Sendable {
+        var bytes: Int64 = 0
+        var without = 0
+        var unknown = 0
+
+        static func of(_ root: URL) -> MeetingAudio {
+            var audio = MeetingAudio()
+            for folder in (try? MeetingStorage.meetingFolders(in: root)) ?? [] {
+                switch MeetingStorage.audio(in: folder) {
+                case .known(let files, _) where files.isEmpty: audio.without += 1
+                case .known(let files, _): audio.bytes += files.reduce(0) { $0 + $1.bytes }
+                case .unknown: audio.unknown += 1
+                }
+            }
+            return audio
+        }
+    }
+
     /// The chosen meetings folder and what it holds.
     struct MeetingsFolder: Equatable, Sendable {
         let path: String
@@ -11,6 +32,7 @@ struct ArchiveSnapshot: Equatable, Sendable {
         let bytes: Int64
         /// Finished meetings still on this Mac: they move once it is available.
         let waiting: Int
+        var audio = MeetingAudio()
     }
 
     let dictationCount: Int
@@ -22,6 +44,7 @@ struct ArchiveSnapshot: Equatable, Sendable {
     let meetingCount: Int
     let meetingBytes: Int64
     let meetingOldest: Date?
+    var meetingAudio = MeetingAudio()
     /// Nil when no meetings folder is chosen. Until a refresh hears from the
     /// folder it keeps the last one, which may be another folder's: the view
     /// matches it to the chosen folder by path.
@@ -33,14 +56,6 @@ struct ArchiveSnapshot: Equatable, Sendable {
 
     /// What this Mac holds; the meetings folder is counted on its own.
     var totalCount: Int { dictationCount + meetingCount }
-    /// Index lines or audio files of the archive's own, counted off the main
-    /// actor; also while a folder of it can't be read. Other files in its
-    /// folder (a meeting moved there) do not count.
-    var dictationArchiveHasContent = false
-
-    /// Something for Clear All: lines, or the archive's own files that a clear
-    /// which failed halfway leaves without lines.
-    var hasDictationFiles: Bool { dictationCount > 0 || dictationArchiveHasContent }
     var totalBytes: Int64 { dictationBytes + meetingBytes }
     var oldest: Date? {
         [dictationOldest, meetingOldest].compactMap { $0 }.min()
@@ -109,9 +124,9 @@ struct ArchiveSnapshot: Equatable, Sendable {
             dictationBytes: dictations.bytes,
             dictationOldest: historyOldest,
             meetingCount: meetings.count,
-            meetingBytes: directorySize(at: meetingsRoot),
+            meetingBytes: meetingBytes(at: meetingsRoot),
             meetingOldest: meetings.oldest,
-            dictationArchiveHasContent: dictations.any
+            meetingAudio: .of(meetingsRoot)
         )
     }
 
@@ -124,26 +139,15 @@ struct ArchiveSnapshot: Equatable, Sendable {
             path: folder.path,
             available: available,
             count: elsewhere.count,
-            bytes: available ? directorySize(at: folder) : 0,
-            waiting: finishedCount(at: meetingsRoot)
+            bytes: available ? meetingBytes(at: folder) : 0,
+            waiting: finishedCount(at: meetingsRoot),
+            audio: available ? .of(folder) : MeetingAudio()
         )
     }
 
+    /// The window's definition of a meeting, so both say the same number.
     private static func meetingSummary(at root: URL) -> (count: Int, oldest: Date?) {
-        let fileManager = FileManager()
-        guard let children = try? fileManager.contentsOfDirectory(
-            at: root,
-            includingPropertiesForKeys: [.isDirectoryKey],
-            options: [.skipsHiddenFiles]
-        ) else { return (0, nil) }
-
-        let sessionNames = children.compactMap { child -> String? in
-            guard (try? child.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true,
-                  fileManager.fileExists(
-                    atPath: child.appendingPathComponent("metadata.json").path
-                  ) else { return nil }
-            return child.lastPathComponent
-        }
+        let sessionNames = ((try? MeetingStorage.meetingFolders(in: root)) ?? []).map(\.lastPathComponent)
         let oldest = sessionNames.min().flatMap(meetingDate(from:))
         return (sessionNames.count, oldest)
     }
@@ -163,22 +167,12 @@ struct ArchiveSnapshot: Equatable, Sendable {
         return formatter.date(from: String(directoryName.prefix(19)))
     }
 
-    private static func directorySize(at root: URL) -> Int64 {
-        let fileManager = FileManager()
-        guard let enumerator = fileManager.enumerator(
-            at: root,
-            includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey],
-            options: [.skipsHiddenFiles]
-        ) else { return 0 }
-
-        var total: Int64 = 0
-        for case let file as URL in enumerator {
-            guard let values = try? file.resourceValues(
-                forKeys: [.isRegularFileKey, .fileSizeKey]
-            ), values.isRegularFile == true else { continue }
-            total += Int64(values.fileSize ?? 0)
-        }
-        return total
+    /// Storage shows what it could count even when part of the folder cannot
+    /// be read, as it always has; the window says "unknown" for a meeting
+    /// instead. No folder yet is nothing on disk.
+    private static func meetingBytes(at root: URL) -> Int64 {
+        guard FileManager.default.fileExists(atPath: root.path) else { return 0 }
+        return MeetingStorage.folderSize(of: root).bytes
     }
 }
 
@@ -239,8 +233,19 @@ struct StorageSettingsView: View {
                     count: snapshot?.meetingCount
                 )
             }
+            if let snapshot {
+                Text(Self.audioLine(snapshot.meetingAudio, place: String(localized: "on this Mac")))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .accessibilityIdentifier("storageMeetingAudio")
+            }
             if let folderLine = meetingsFolderLine {
                 Text(folderLine)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            if let folder = checkedMeetingsFolder, folder.available {
+                Text(Self.audioLine(folder.audio, place: String(localized: "in the meetings folder")))
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -398,6 +403,13 @@ struct StorageSettingsView: View {
         guard let chosen = settings.meetingDestinations.meetings?.path,
               let folder = snapshot?.meetingsFolder, folder.path == chosen else { return nil }
         return folder
+    }
+
+    /// "Meeting audio on this Mac: 1.2 GB · without audio: 3".
+    static func audioLine(_ audio: ArchiveSnapshot.MeetingAudio, place: String) -> String {
+        var line = String(localized: "Meeting audio \(place): \(byteText(audio.bytes)) · without audio: \(audio.without)")
+        if audio.unknown > 0 { line += " · " + String(localized: "can’t be told: \(audio.unknown)") }
+        return line
     }
 
     /// No line while no folder is chosen; no "Checking…" after a failed count,

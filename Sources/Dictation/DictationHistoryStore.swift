@@ -16,6 +16,10 @@ struct DictationHistoryEntry: Codable, Equatable, Identifiable, Sendable {
     let targetApplicationName: String?
     let audioPath: String
     let text: String
+    /// The recognized text before the personal dictionary changed it; set
+    /// only when it did, so a wrong entry never costs the original words and
+    /// a line without replacements stays byte for byte what it was.
+    let rawText: String?
     /// Set only for a dictation cut short by a capture failure; absent keys
     /// keep every ordinary line byte-identical within schema version 1.
     let interrupted: Bool?
@@ -38,6 +42,7 @@ struct DictationHistoryEntry: Codable, Equatable, Identifiable, Sendable {
         targetApplicationName: String?,
         audioPath: String,
         text: String,
+        rawText: String? = nil,
         interrupted: Bool? = nil,
         recognitionFailed: Bool? = nil,
         recognitionSkipped: Bool? = nil
@@ -54,6 +59,7 @@ struct DictationHistoryEntry: Codable, Equatable, Identifiable, Sendable {
         self.targetApplicationName = targetApplicationName
         self.audioPath = audioPath
         self.text = text
+        self.rawText = rawText
         self.interrupted = interrupted
         self.recognitionFailed = recognitionFailed
         self.recognitionSkipped = recognitionSkipped
@@ -72,6 +78,7 @@ struct DictationHistoryEntry: Codable, Equatable, Identifiable, Sendable {
         case targetApplicationName = "target_app_name"
         case audioPath = "audio_path"
         case text
+        case rawText = "raw_text"
         case interrupted
         case recognitionFailed = "recognition_failed"
         case recognitionSkipped = "recognition_skipped"

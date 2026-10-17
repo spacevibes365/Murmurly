@@ -1,63 +1,71 @@
-# Murmurly 0.1.0
+# Murmurly 0.2
 
-The first public release.
+Your meetings now have a window of their own: Murmurly lists the recordings in
+your meeting folders, shows their transcripts and plays them back. This release
+also adds a personal dictionary, transcribes a meeting again with another
+engine or language, and is the first one signed with a Developer ID and
+notarized by Apple.
 
-Murmurly is a dictation and meeting recorder for your Mac. Speech is recognized
-on your Mac: Murmurly never uploads your recordings or text to be transcribed.
+## What's new
 
-## What it does
+- **The Murmurly window.** Choose **Open Murmurly** in the menu, or open the
+  app again while it runs. Its sidebar holds **Meetings**, **Starred**,
+  **Dictations**, **Dictionary** and **Files**. The dictation history (now
+  **Dictations**) and **Files** have moved here from Settings, which now holds
+  only settings.
+- **Your meetings.** Meetings are listed by date with their length, the app
+  that started the recording, how their transcription stands and their size.
+  Select one to read its transcript, search it with ⌘F and copy it. Give a
+  meeting a name of your own, and star it to find it under **Starred**.
+- **Listen.** Play a meeting from any line of its transcript: both tracks
+  together, at 0.75× to 2×, with your side or the others muted if you like.
+- **Search All Meetings.** Find words in the names and newest transcripts of
+  the meetings in your meeting folders.
+- **Speakers' names and Save As.** Put names in place of "Me" and "Others", and
+  save a transcript as Markdown, plain text or SRT subtitles.
+- **Delete.** Move a meeting's audio, or the whole meeting, to the Trash, one or
+  several at a time. If you like, Murmurly deletes the audio of fully
+  transcribed meetings 7, 30 or 90 days after their first full transcription
+  (**Settings → Meetings**); the transcripts stay.
+- **Personal dictionary.** Tell Murmurly how to write the names and terms the
+  engine gets wrong. It works in dictation, meeting transcripts and file
+  transcripts, and each can be switched off. Make an entry with **Add to
+  Dictionary…** from a dictation or a meeting's transcript, and move your
+  dictionary to another Mac with **Export…** and **Import…**.
+- **Transcribe a meeting again.** **Transcribe Meeting…** and **Transcribe
+  Again…** let you choose the engine and language for that transcription only.
+  Your settings stay as they are, and earlier transcripts are kept.
+- **Files: engine and language.** Transcribe a file with another engine or
+  language than dictation, and download that engine's model right there. By
+  default, files use the dictation's engine and language.
+- **Signed and notarized.** Murmurly is signed with a Developer ID and
+  notarized by Apple: macOS asks once whether to open it, as with any app you
+  download.
 
-- **Dictation into other apps.** Press ⌥Space, speak, press ⌥Space again: the
-  text is pasted where your cursor is. You can change the shortcut or use a
-  double press of ⌘ or ⌥ instead.
-- **Meeting recording.** Recording starts on its own when another app starts
-  using the microphone, or when you press ⌥⇧R. Your microphone and the call
-  audio are saved as two separate tracks.
-- **Transcripts.** After a meeting, Murmurly writes a transcript with
-  timestamps, with your microphone and the call audio labeled separately.
-- **Files.** Transcribe audio and video files: mp3, m4a, wav, mp4, mov.
-- **History.** Every recognized dictation is kept in a searchable history.
-- **Two speech engines.** Parakeet (about 0.5 GB, 25 European languages) or
-  Whisper (about 1.6 GB, about 100 languages). Models download from Hugging
-  Face only when you ask.
-- **Interface in 12 languages.** All translations except English and Russian
-  were made by machine; corrections are welcome.
-- **Automatic updates.** Murmurly checks GitHub for a new version once a day;
-  you can turn this off in Settings → Permissions. An update you choose while a
-  meeting is being recorded or transcribed, a file is being transcribed, or
-  during a dictation, is installed when you quit instead of restarting the app.
+## Good to know
+
+- **Updating from 0.1.** Murmurly 0.1 was not signed with a Developer ID, so
+  you may need to grant the microphone, Accessibility and system audio
+  permissions again. If dictation stops pasting or a meeting recording fails,
+  check **Settings → Permissions** and **System Settings → Privacy & Security**.
+  Later updates, signed with the same Developer ID, normally keep your
+  permissions.
+- **Older meetings.** Speakers' names, SRT subtitles and exact line times need
+  the record Murmurly now keeps with each new transcript. For a meeting
+  transcribed before 0.2, use **Transcribe Again…**.
+- **Meeting audio is kept unless you choose otherwise.** Deleting old audio is
+  off by default. When you turn it on, Murmurly first says how many meetings
+  lose their audio right away. That audio is deleted for good, not moved to the
+  Trash, and starred meetings keep theirs.
+- **Automatic meeting recording is on by default.** In many countries,
+  recording a conversation requires the consent of everyone in it, and Murmurly
+  does not notify other participants. You can turn automatic recording off on
+  the first screen or in Settings → Meetings.
 
 ## Requirements
 
 - A Mac with Apple silicon.
 - macOS 15 Sequoia or later.
 
-## Before you start
-
-- **Automatic meeting recording is on by default.** In many countries,
-  recording a conversation requires the consent of everyone in it, and Murmurly
-  does not notify other participants. You can turn automatic recording off on
-  the first screen or in Settings → Meetings.
-- **If macOS won't open the app,** this release is not signed with a Developer
-  ID. Try to open it once, then open System Settings → Privacy & Security and
-  click **Open Anyway**. With such a release you may need to grant the
-  permissions again after each update.
-
-## Known limitations
-
-- The other participants' voices are not told apart: everyone on the other side
-  is "Others".
-- Dictation and meeting recording never run at the same time. One dictation
-  lasts at most 5 minutes; an automatic meeting recording at most 4 hours.
-- A meeting transcription does not resume after quitting. Choosing Quit during
-  a transcription, or while its transcript is copied to your transcript folder,
-  warns first; logging out, restarting or shutting down the Mac interrupts it
-  without a warning. Use **Transcribe Meeting…** to transcribe it
-  later.
-- Removing duplicated speech from the transcript does not work for languages
-  written without spaces, such as Chinese and Japanese.
-- ⌥Space is also the default shortcut of ChatGPT for Mac. If you use both,
-  change one of them.
-
-The full list is in the
+Known limitations are listed in the
 [README](https://github.com/spacevibes365/Murmurly#known-limitations).

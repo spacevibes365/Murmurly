@@ -61,7 +61,9 @@ final class AppUpdater: NSObject, ObservableObject, SPUUpdaterDelegate {
 
     /// True while a relaunch would cut something short that does not resume
     /// by itself: a meeting being recorded or saved, a dictation, a meeting
-    /// transcription queued or under way, a file being transcribed in Files. A
+    /// transcription queued or under way, a file being transcribed in Files, a
+    /// meeting's changes not saved yet or a transcript being written to the
+    /// file chosen for it (both end by themselves). A
     /// job that transcribes counts until it ends, its copy into the transcripts
     /// folder included: the launch-time scan queues the folder again, but
     /// without either. Compression and moves of their own are not counted,
@@ -75,11 +77,12 @@ final class AppUpdater: NSObject, ObservableObject, SPUUpdaterDelegate {
         meeting: MeetingRecorder,
         dictation: DictationCoordinator,
         transcripts: MeetingTranscriptionQueue,
-        files: FilesModel
+        files: FilesModel,
+        library: MeetingLibrary
     ) -> AnyPublisher<Bool, Never> {
         // @Published sends the new value before the property changes, so the
         // values are read from the stream, never from the objects.
-        Publishers.CombineLatest(
+        Publishers.CombineLatest3(
             Publishers.CombineLatest4(
                 meeting.$state.map(\.isBusy),
                 dictation.$state.map { $0 != .idle },
@@ -87,9 +90,12 @@ final class AppUpdater: NSObject, ObservableObject, SPUUpdaterDelegate {
                 transcripts.$pending.map { $0.contains(where: \.transcribe) }
             )
             .map { $0 || $1 || $2 || $3 },
-            files.$isTranscribing
+            files.$isTranscribing,
+            // A meeting's changes not saved yet, being written to a folder
+            // that is not on this Mac; a transcript being written to a file.
+            Publishers.CombineLatest(library.$pendingMarks, library.$exporting).map { !$0.isEmpty || $1?.writing == true }
         )
-        .map { $0 || $1 }
+        .map { $0 || $1 || $2 }
         .removeDuplicates()
         .eraseToAnyPublisher()
     }

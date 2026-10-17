@@ -13,6 +13,7 @@ struct MenuBarLabel: View {
     let settings: SettingsStore
     let loginItem: LoginItemManager
     let files: FilesModel
+    let library: MeetingLibrary
     let appDelegate: AppDelegate
     @Environment(\.openWindow) private var openWindow
 
@@ -44,6 +45,8 @@ struct MenuBarLabel: View {
             loginItem.activate(desired: settings.launchAtLogin)
             appDelegate.attach(dictation: dictation, meeting: meeting, settings: settings)
             appDelegate.fileLosses = { files.quitLosses }
+            appDelegate.meetingLosses = { library.quitLosses }
+            appDelegate.showMainWindow = { AppWindowController.show("main", with: openWindow) }
         }
     }
 }
@@ -57,9 +60,14 @@ struct DictationMenuView: View {
     @ObservedObject var settings: SettingsStore
     @ObservedObject var models: ModelDownloader
     @ObservedObject var updater: AppUpdater
+    /// Not observed: the menu only asks it to show a meeting.
+    let library: MeetingLibrary
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
+        // First: the window is where meetings are, the menu a way in.
+        Button("Open Murmurly") { AppWindowController.show("main", with: openWindow) }
+        Divider()
         modelItems
         dictationStateLabel
         Picker("Dictation Engine", selection: $settings.dictationEngine) {
@@ -97,10 +105,7 @@ struct DictationMenuView: View {
                 }
             }
             Divider()
-            Button("Open Full History…") {
-                settings.settingsTab = .history
-                openSettingsWindow()
-            }
+            Button("Open Full History…") { showSection(.dictations) }
         }
         if !dictation.unsavedDictations.isEmpty {
             Menu("Unsaved Dictations (\(dictation.unsavedDictations.count))") {
@@ -140,8 +145,8 @@ struct DictationMenuView: View {
         Button { meeting.toggle() } label: { meetingButtonLabel }
             .disabled(meetingButtonDisabled)
             .accessibilityIdentifier("meetingRecorderButton")
-        if meeting.lastRecordingDirectory != nil {
-            Button("Show Last Recording…") { meeting.revealLastRecording() }
+        if let last = meeting.lastRecordingLocation {
+            Button("Show Last Recording…") { show(last) }
         }
         Button("Show Meetings Folder") { showMeetingsFolder() }
         if let warning = meeting.recordingWarning {
@@ -150,7 +155,9 @@ struct DictationMenuView: View {
                     Text(item.element)
                 }
                 Divider()
-                Button("Show Meeting Folder…") { meeting.revealWarnedRecording() }
+                Button("Show Meeting Folder…") {
+                    if let warned = meeting.warnedRecordingLocation { show(warned) }
+                }
                 Button("Hide Warning") { meeting.dismissRecordingWarning() }
             } label: {
                 // The folder name already ends with " Meeting" and is never
@@ -206,10 +213,7 @@ struct DictationMenuView: View {
         }
 
         Divider()
-        Button("Transcribe a File…") {
-            settings.settingsTab = .files
-            openSettingsWindow()
-        }
+        Button("Transcribe a File…") { showSection(.files) }
         if updater.installsAtQuit {
             Text("The update will be installed when you quit the app")
         }
@@ -250,17 +254,21 @@ struct DictationMenuView: View {
                 Button("Stop Transcription") { meetingTranscripts.cancelCurrent() }
             }
         }
-        Button("Transcribe Meeting…") { meetingTranscripts.chooseFolder() }
+        Button("Transcribe Meeting…") {
+            meetingTranscripts.chooseFolder(settings: settings.snapshot, models: models)
+        }
         switch meetingTranscripts.lastOutcome {
         case .saved?:
-            Button("Show Transcript") { meetingTranscripts.revealOutcome() }
+            showTranscriptItem
+            transcribeAgainItem
         case .noSpeech(let folder)?:
             Text("Meeting \(folder.lastPathComponent): no speech found")
         case .cutShort(let transcript, let reason)?:
             Menu {
                 Text(reason)
                 Divider()
-                Button("Show Transcript") { meetingTranscripts.revealOutcome() }
+                showTranscriptItem
+                transcribeAgainItem
                 Button("Hide Warning") { meetingTranscripts.dismissOutcome() }
             } label: {
                 Label(
@@ -272,13 +280,39 @@ struct DictationMenuView: View {
             Menu {
                 Text(reason)
                 Divider()
-                Button("Show Meeting Folder…") { meetingTranscripts.revealOutcome() }
+                Button("Show Meeting Folder…") {
+                    if let meeting = meetingTranscripts.lastMeeting { show(meeting) }
+                }
+                transcribeAgainItem
                 Button("Hide Warning") { meetingTranscripts.dismissOutcome() }
             } label: {
                 Label("Transcription of \(folder.lastPathComponent) Failed", systemImage: "exclamationmark.triangle.fill")
             }
         case .cancelled?, nil:
             EmptyView()
+        }
+    }
+
+    /// The meeting in the window, with the version the outcome wrote.
+    private var showTranscriptItem: some View {
+        Button("Show Transcript") {
+            guard let meeting = meetingTranscripts.lastMeeting else { return }
+            show(meeting, transcript: meetingTranscripts.lastOutcome?.transcript?.lastPathComponent)
+        }
+    }
+
+    /// A meeting in the main window, chosen in memory: wherever it is now,
+    /// read on its own when it is outside both meetings folders.
+    private func show(_ folder: URL, transcript: String? = nil) {
+        library.open(folder, transcript: transcript)
+        AppWindowController.show("main", with: openWindow)
+    }
+
+    /// The panel open in that meeting, for an engine or a language that
+    /// suits it better.
+    private var transcribeAgainItem: some View {
+        Button("Transcribe Again…") {
+            meetingTranscripts.transcribeAgain(settings: settings.snapshot, models: models)
         }
     }
 
@@ -306,18 +340,14 @@ struct DictationMenuView: View {
     }
 
     private func openSettingsWindow() {
-        DispatchQueue.main.async {
-            NSApp.setActivationPolicy(.regular)
-            NSApp.activate(ignoringOtherApps: true)
-            openWindow(id: "settings")
+        AppWindowController.show("settings", with: openWindow)
+    }
 
-            DispatchQueue.main.async {
-                NSApp.activate(ignoringOtherApps: true)
-                NSApp.windows.first {
-                    $0.identifier?.rawValue == "settings"
-                }?.makeKeyAndOrderFront(nil)
-            }
-        }
+    /// The main window on that section, opened or raised; the section is
+    /// there before the window first appears.
+    private func showSection(_ section: MainSection) {
+        library.section = section
+        AppWindowController.show("main", with: openWindow)
     }
 
     /// A symbol goes through `Label`, which the menu shows as the item's
@@ -436,4 +466,24 @@ struct DictationMenuView: View {
         }
     }
 
+}
+
+extension AppWindowController {
+    /// Opens the window with this scene id, or brings it forward, from a
+    /// menu, the other window or a reopen: after the menu has closed, the app
+    /// made regular and active first, and the window raised once it exists.
+    static func show(_ id: String, with openWindow: OpenWindowAction) {
+        DispatchQueue.main.async {
+            NSApp.setActivationPolicy(.regular)
+            NSApp.activate(ignoringOtherApps: true)
+            openWindow(id: id)
+
+            DispatchQueue.main.async {
+                NSApp.activate(ignoringOtherApps: true)
+                NSApp.windows.first {
+                    $0.identifier?.rawValue == id
+                }?.makeKeyAndOrderFront(nil)
+            }
+        }
+    }
 }

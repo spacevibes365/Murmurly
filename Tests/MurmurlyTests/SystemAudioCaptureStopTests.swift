@@ -46,7 +46,7 @@ actor AdoptedMeetingCapture: MeetingCaptureBackend {
         self.deleting = deleting
     }
 
-    func start() async throws -> Date {
+    func start(in _: URL) async throws -> Date {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let startedAt = Date()
         try await capture.adoptSessionForTesting(
@@ -76,6 +76,35 @@ actor AdoptedMeetingCapture: MeetingCaptureBackend {
 /// `stop()` hands back to the meeting coordinator.
 @MainActor
 final class SystemAudioCaptureStopTests: XCTestCase {
+    /// The folder is the recorder's, made for the session: a start refused
+    /// before any tap exists removes it, so no empty folder passes for a
+    /// recording that broke off.
+    func testRefusedStartRemovesTheFolderItWasGiven() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let running = root.appendingPathComponent("running", isDirectory: true)
+        let fresh = root.appendingPathComponent("fresh", isDirectory: true)
+        for folder in [running, fresh] {
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        }
+        let capture = SystemAudioCapture()
+        try await capture.adoptSessionForTesting(
+            directory: running, sampleRate: 48_000, systemFrames: 0, microphoneFrames: 0,
+            enqueuedFrames: 0, startedAt: Date()
+        )
+
+        do {
+            _ = try await capture.start(in: fresh)
+            XCTFail("a second start began")
+        } catch {
+            XCTAssertEqual(error as? SystemAudioCaptureError, .alreadyRunning)
+        }
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fresh.path), "the refused session's folder stayed")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: running.path), "the running session's folder went")
+        _ = try? await capture.stop()
+    }
+
     func testShortTracksAreSuspectWithMeasuredFrames() async throws {
         let session = try await stopAdoptedSession(systemFrames: 1_024, microphoneFrames: 1_024, enqueued: 48_000)
         defer { session.cleanup() }

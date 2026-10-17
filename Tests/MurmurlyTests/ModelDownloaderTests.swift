@@ -626,7 +626,11 @@ final class ModelDownloaderTests: XCTestCase {
                 reason: MeetingTranscriber.Failure.modelNotDownloaded.localizedDescription
             )
         )
-        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: folder.path), ["system.caf"])
+        XCTAssertEqual(
+            try FileManager.default.contentsOfDirectory(atPath: folder.path).filter { MeetingAttempt.number(inName: $0) == nil },
+            ["system.caf"]
+        )
+        XCTAssertEqual(try MeetingAttempt.entries(in: folder).map(\.attempt?.result), [.failed])
         XCTAssertEqual(try Data(contentsOf: track), Data("recorded".utf8))
     }
 

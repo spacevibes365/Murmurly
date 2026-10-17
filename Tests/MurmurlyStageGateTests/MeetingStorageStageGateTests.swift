@@ -128,10 +128,10 @@ final class MeetingStorageStageGateTests: XCTestCase {
         ))
         let transcriber = MeetingTranscriber(
             cache: WhisperKitCache(factory: LiveWhisperEngineFactory(), parakeetFactory: LiveParakeetEngineFactory()),
-            loadSpeechDetector: {
+            loadSpeechDetector: { _ in
                 try await MeetingTranscriber.sileroDetector(modelPath: MeetingTranscriber.vadModelPath)
             },
-            currentEngine: { choice },
+            currentEngine: { _ in choice },
             temporaryRoot: scratch
         )
         var runs: [String: Any] = [:]

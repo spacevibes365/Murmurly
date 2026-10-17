@@ -5,7 +5,9 @@ import Foundation
 /// for meetings, no writes into the user's archives, log or preferences, no
 /// launch-time permission prompt. The stage-gate scheme sets
 /// `MURMURLY_PRODUCTION_SERVICES=1`, so its production cold launch runs the
-/// app as shipped.
+/// app as shipped. A UI test's launch is isolated whatever its environment:
+/// it clicks through the app, and one click (the audio rule's Continue)
+/// would otherwise set the owner's settings and act on their meetings.
 enum TestIsolation {
     /// Any test launch: no launch-time prompt, model warm-up, recent history
     /// preload or login item.
@@ -24,8 +26,14 @@ enum TestIsolation {
     static let settingsSuiteName = root.appendingPathComponent("settings").path
 
     static func settingsDefaults() -> UserDefaults {
-        guard isEnabled else { return .standard }
-        guard let defaults = UserDefaults(suiteName: settingsSuiteName) else {
+        settingsDefaults(isolated: isEnabled, standard: .standard, suiteName: settingsSuiteName)
+    }
+
+    /// `standard` (the app's own domain: the owner's, on their Mac) only for
+    /// a launch that is not isolated.
+    static func settingsDefaults(isolated: Bool, standard: UserDefaults, suiteName: String) -> UserDefaults {
+        guard isolated else { return standard }
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
             preconditionFailure("Unable to create the isolated settings suite")
         }
         return defaults
@@ -34,11 +42,13 @@ enum TestIsolation {
     static func classify(
         arguments: [String], environment: [String: String]
     ) -> (testProcess: Bool, isolated: Bool) {
-        let testProcess = arguments.contains("-UITesting")
-            || arguments.contains("-UITestSettingsStore")
-            || environment["XCTestConfigurationFilePath"] != nil
+        let uiLaunch = arguments.contains("-UITesting") || arguments.contains("-UITestSettingsStore")
+        let testProcess = uiLaunch || environment["XCTestConfigurationFilePath"] != nil
         #if DEBUG
-        let isolated = testProcess && environment["MURMURLY_PRODUCTION_SERVICES"] != "1"
+        // The opt-out is the stage gate's, whose tests run inside the app it
+        // launched; an environment that reached a UI test's copy from
+        // anywhere else opts nothing out.
+        let isolated = uiLaunch || testProcess && environment["MURMURLY_PRODUCTION_SERVICES"] != "1"
         #else
         let isolated = false
         #endif

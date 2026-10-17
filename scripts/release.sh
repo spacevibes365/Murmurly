@@ -125,9 +125,25 @@ if [[ -n "$developer_id" ]]; then
     /usr/libexec/PlistBuddy -c "Delete :com.apple.security.cs.disable-library-validation" "$entitlements" 2>/dev/null || true
     "${sign[@]}" --entitlements "$entitlements" --preserve-metadata=requirements,flags "$app"
     rm -f "$entitlements"
-    if codesign -d --entitlements - --xml "$app" | grep -q disable-library-validation; then
-        fail "a Developer ID build must keep library validation on"
-    fi
+fi
+
+# What the signed code may carry, checked in every Mach-O file of the bundle:
+# no get-task-allow, which permits debugger attachment and code injection,
+# which Xcode can inject into an ordinary build (see project.yml, Release) and
+# which notarization refuses; and in a Developer ID build, library validation
+# on in the app itself. A signature that cannot be read stops the release.
+while IFS= read -r -d '' code; do
+    [[ "$(file -b "$code")" == Mach-O* ]] || continue
+    signed="$(codesign -d --entitlements - --xml "$code" 2>/dev/null)" \
+        || fail "could not read the signature of $code"
+    [[ "$signed" != *"<key>com.apple.security.get-task-allow</key>"* ]] \
+        || fail "$code must not let a debugger attach (get-task-allow)"
+done < <(find "$app" -type f -perm +111 -print0)
+if [[ -n "$developer_id" ]]; then
+    signed="$(codesign -d --entitlements - --xml "$app" 2>/dev/null)" \
+        || fail "could not read the signature of $app"
+    [[ "$signed" != *"<key>com.apple.security.cs.disable-library-validation</key>"* ]] \
+        || fail "a Developer ID build must keep library validation on"
 fi
 
 codesign --verify --deep --strict "$app" || fail "the app signature failed strict verification"

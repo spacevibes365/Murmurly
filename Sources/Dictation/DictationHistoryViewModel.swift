@@ -20,6 +20,16 @@ private final class HistoryAudioPlayerDelegate: NSObject, AVAudioPlayerDelegate,
 
 @MainActor
 final class DictationHistoryViewModel: ObservableObject {
+    /// The history's size for the section: its lines, and whether Clear All
+    /// has anything to clear, the archive's own files a clear that failed
+    /// halfway leaves without lines included.
+    struct Summary: Equatable, Sendable {
+        let count: Int
+        let hasFiles: Bool
+    }
+
+    typealias Summarize = @Sendable () async throws -> Summary
+
     @Published var searchText = ""
     @Published private(set) var entries: [DictationHistoryEntry] = []
     @Published private(set) var audioEntryIDs: Set<UUID> = []
@@ -32,11 +42,18 @@ final class DictationHistoryViewModel: ObservableObject {
     /// Why the history could not be read; shown in the tab, cleared by the
     /// next successful read.
     @Published private(set) var readFailure: String?
+    /// Counted by the section itself, whatever window shows it; nil until
+    /// the first count.
+    @Published private(set) var summary: Summary?
+    /// The last count failed: the last figures stay, none is promised.
+    @Published private(set) var summaryFailed = false
 
     private let store: DictationHistoryStore
     private let pageSize: Int
+    private let summarize: Summarize
     private var cursor: UInt64?
     private var generation = 0
+    private var summaryGeneration = 0
     private var player: AVAudioPlayer?
     private var playerDelegate: HistoryAudioPlayerDelegate?
     private var playbackGeneration = 0
@@ -49,9 +66,38 @@ final class DictationHistoryViewModel: ObservableObject {
     var willLookUpAudioForTesting: (@MainActor () -> Void)?
     #endif
 
-    init(store: DictationHistoryStore = .shared, pageSize: Int = 100) {
+    init(store: DictationHistoryStore = .shared, pageSize: Int = 100, summarize: Summarize? = nil) {
         self.store = store
         self.pageSize = pageSize
+        self.summarize = summarize ?? Self.summarize(store)
+    }
+
+    /// The store's lines and the archive's own files, off the main actor.
+    nonisolated static func summarize(_ store: DictationHistoryStore) -> Summarize {
+        {
+            let count = try await store.historySummary().count
+            let files = DictationHistoryStore.contentToClear(in: store.root).any
+            return Summary(count: count, hasFiles: count > 0 || files)
+        }
+    }
+
+    /// Counts the history again. A count started before a newer one, or
+    /// cancelled, publishes nothing, neither its figures nor its failure.
+    func refreshSummary() async {
+        summaryGeneration &+= 1
+        let asked = summaryGeneration
+        do {
+            let counted = try await summarize()
+            guard asked == summaryGeneration, !Task.isCancelled else { return }
+            summary = counted
+            summaryFailed = false
+        } catch is CancellationError {
+            // A newer count owns the figures.
+        } catch {
+            AppLog.error("history", "count failed: \(error.localizedDescription)")
+            guard asked == summaryGeneration, !Task.isCancelled else { return }
+            summaryFailed = true
+        }
     }
 
     func reload() async {

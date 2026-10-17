@@ -7,7 +7,7 @@ import XCTest
 private actor RefusingMeetingCapture: MeetingCaptureBackend {
     private let error: SystemAudioCaptureError
     init(_ error: SystemAudioCaptureError) { self.error = error }
-    func start() async throws -> Date { throw error }
+    func start(in _: URL) async throws -> Date { throw error }
     func stop() async throws -> [URL] { [] }
 }
 

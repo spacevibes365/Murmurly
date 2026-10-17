@@ -41,7 +41,9 @@ xcodebuild -project Murmurly.xcodeproj -scheme Murmurly \
 
 The stage gate is a separate scheme that runs the app as shipped: real models,
 real permissions, real audio, real global shortcuts and the real settings
-domain. It is deliberately not part of the `Murmurly` scheme. Anyone can build
+domain. It runs the Debug configuration with those real services, so it does
+not prove the shipped signature: that is `scripts/release.sh`'s and
+notarization's job. It is deliberately not part of the `Murmurly` scheme. Anyone can build
 it; the production cold-launch check below runs on any machine. The real-audio
 tests also need downloaded models and specific audio fixtures that are not in
 the repository (see the `MURMURLY_*` variables in
@@ -111,7 +113,12 @@ plain default window.
   crashes at launch because it cannot load the embedded `Sparkle.framework`
   (`different Team IDs`). A Developer ID build does not need it;
   `scripts/release.sh` removes it when re-signing and fails if it is still
-  there.
+  there. Release builds leave out `get-task-allow`
+  (`CODE_SIGN_INJECT_BASE_ENTITLEMENTS: NO`): Xcode can inject it during
+  ordinary builds when base-entitlement injection is enabled (archiving and
+  exporting handle it differently), and notarization refuses it.
+  `scripts/release.sh` refuses a release in which any signed part carries it;
+  the library-validation check applies to the Developer ID path only.
 - App Sandbox is off: the process tap, pasting into other apps and user-chosen
   meeting folders need their own design first.
 - `ARCHS = arm64`: the Core ML models need Apple silicon.
@@ -123,12 +130,36 @@ plain default window.
 A menu bar resident with no Dock icon. `MurmurlyApp` creates the
 `@MainActor ObservableObject`s and passes them down: `SettingsStore`,
 `RecordingIndicator`, `DictationCoordinator`, `MeetingRecorder`,
-`MeetingTranscriptionQueue`, `ModelDownloader`, `PermissionManager`,
-`LoginItemManager`. Shortcuts and background services start from the `.task` of
-`MenuBarLabel`, on the label's first render, not when a window opens: dictation
-and the meeting watchdog live with all windows closed. There is one window,
-Settings (`Window(id: "settings")`), whose tabs include Getting Started and
-Files; the menu's "Transcribe a File…" opens it on Files. There is no help book,
+`MeetingTranscriptionQueue`, `MeetingLibrary`, `FilesModel`, `ModelDownloader`,
+`PermissionManager`, `LoginItemManager`. Shortcuts and background services start
+from the `.task` of `MenuBarLabel`, on the label's first render, not when a
+window opens: dictation and the meeting watchdog live with all windows closed.
+There are two windows. The main window, "Murmurly" (`Window(id: "main")`,
+`MainWindow`, at least `MainWindow.minWidth` wide: the 200 pt sidebar, the
+divider, the list and the card at their least), shows the meetings; the menu's
+first item, "Open Murmurly", opens it, and so does opening the app again while
+it runs (`AppDelegate.applicationShouldHandleReopen` → `showMainWindow`, a
+bridge set in `MenuBarLabel.task`, whatever else is on screen). Its sidebar
+holds Meetings, Starred (the same list, filtered), Dictations, Dictionary and
+Files (`MainSection`), each a layer built with the window (`mainContent.*`;
+Meetings and Starred one), so each keeps its state and a sheet or a panel up
+over one stays through a change of section. The sidebar is a plain stack, not
+`NavigationSplitView`, folded by its own toolbar button (in memory), so AppKit
+keeps no layout of it in the app's preferences. The section lives in
+`MeetingLibrary.section`, in memory: a command from the menu given with the
+window closed is there for its first appearance, and Open Murmurly shows the
+last one. "Open Full History…" and "Transcribe a File…" open the main window on
+their section; "More Languages…", "Download Model…" and an unreachable meetings
+folder open Settings, which holds only settings (`SettingsTab`: Getting
+Started, Dictation, Meetings, Storage, Permissions; a stored tab of the three
+that left reads as the default). The scene hands the main window the app's
+own `FilesModel` and `DictationCoordinator`. The views follow the main
+window's section, never Settings' tab: the history's sound stops when
+Dictations is left, its error waits for Dictations and once up stays until OK,
+and any change of section drops a dictionary file being read. Both scenes are
+`.defaultLaunchBehavior(.suppressed)` and `.restorationBehavior(.disabled)`: no
+launch shows or restores a window, which the stage gate's cold launch checks.
+`AppWindowController.show(_:with:)` opens or raises either. There is no help book,
 so the Help menu has no help item (`CommandGroup(replacing: .help) {}`). Open at
 login is on by default: the first launch from `/Applications` or
 `~/Applications` registers the login item and macOS announces it with "Login
@@ -137,9 +168,16 @@ automatic recording. Getting Started numbers its five cards as README numbers
 the steps; only the model's step gets a check, from `ModelRow.isReady`, the
 same answer as the row's green dot. Each permission shows its own mark, and
 trying dictation, automatic recording and Open at login are not tasks to tick.
-Every tab is built with the window and only hidden, so a tab's `onAppear` runs
-once, when the window opens; what must happen on a switch of tabs watches
-`settings.settingsTab` (the scroll bar's flash, for one).
+Every tab and section is built with its window and only hidden, so its
+`onAppear` runs once, when the window opens; what must happen on a switch
+watches `settings.settingsTab` or `MeetingLibrary.section` (the scroll bar's
+flash, for one, `SettingsChrome.scrolling`). The Dictionary section's open and
+save panels, its import question and the entry sheet (the one opened from
+Dictations or a transcript included) stay over a changed section until the
+user answers them: SwiftUI runs the update that changes the section inside the
+window's layout, and closing a panel or the import question from it ran the
+sheet's close animation in a nested run loop there, which re-entered AppKit's
+update cycle and crashed (macOS 26.5).
 
 **Two mutually exclusive recording modes.** `DictationCoordinator` (⌥Space) and
 `MeetingRecorder` (⌥⇧R) hold weak references to each other
@@ -150,7 +188,7 @@ keeps failures and conflict notices and hides only the plain ones.
 
 **Dictation flow:** `MicCapture` (an actor around `AVAudioEngine`, so
 `engine.start()` never blocks the main actor) → temporary CAF → engine →
-history → `TextInjector`. The history is written before delivery: audio and the
+personal dictionary → history → `TextInjector`. The history is written before delivery: audio and the
 JSONL line are one store operation (`saveDictation`), so clearing the history
 sees a dictation whole or not at all. If the history write fails, the text is
 still delivered and stays in the menu's unsaved dictations until quit; the
@@ -217,7 +255,9 @@ or queued; the copy of a finished transcript into the chosen folder
 false, no compression or move step yet and a copy folder set), which the
 launch-time scan never makes again; a meeting being recorded with "transcribe
 after stop", which quit saves but does not queue; a Files run; unsaved Files
-text). The same quit
+text; a meeting's marks not on disk yet, `.unsavedMeetingMark`, and a
+transcript being written to the file chosen for it, `.transcriptFile`, both
+from `MeetingLibrary.quitLosses` through `AppDelegate.meetingLosses`). The same quit
 repeated within 10 s, with nothing new to lose, goes the usual way. Logout,
 restart, shutdown (`kAEQuitReason`) and SIGTERM do not wait for a person: they
 only log the loss. The route is `AppDelegate.route(quitReason:signalled:)`; the
@@ -225,7 +265,17 @@ two Files cases come from `FilesModel.quitLosses` (`.fileTranscription` while a
 run goes, `.unsavedFileText` while `hasUnsavedText`), which `MenuBarLabel` sets
 as `AppDelegate.fileLosses` right after `attach`.
 
-**Meeting recording:** `SystemAudioCapture` (an actor) creates a Core Audio
+**Meeting recording:** the recorder makes the session's folder
+(`RecordingsStore.createSession`, on the main actor, before the start is
+awaited) and hands it to the capture (`start(in:)`), which removes it on any
+failed or cancelled start. `MeetingRecorder.currentSession` holds the folder,
+the folder itself (`identity`, so marks and deletions refuse it by any
+address), the start time and the trigger from the first moment of starting until the
+stop's result is published, the queue's job included: a folder without
+`metadata.json` is the recording under way, not one that broke off. The stop
+writes `trigger` into `metadata.json`: the automatic recording's app, or
+`manual` (`recordingTrigger` stays nil for a manual one; the watchdog tells the
+two apart by it). `SystemAudioCapture` (an actor) creates a Core Audio
 process tap (`AudioHardwareCreateProcessTap` plus a private aggregate device),
 so no Screen Recording permission is needed. The microphone is the aggregate's
 input device and the clock source, and one IOProc writes both tracks, so they
@@ -278,6 +328,242 @@ limit in `recordingWarning.issues` and shows the "saved with a warning" banner.
 That stays in memory: `metadata.json` describes the tracks' integrity, and the
 limit is not about the tracks.
 
+**The Murmurly window** reads through `MeetingLibrary` (owned by the app,
+like `FilesModel`, so a closed window keeps its snapshot and stops nothing). A
+meeting is `MeetingStorage.meetingFolders`: a folder named as recordings are,
+with `metadata.json` or a track; Storage counts the same. Its identity is its
+path: a name in both roots is two rows. The library reads only while the
+window is open, each folder (the local root, the chosen meetings folder, a
+meeting outside both opened from the menu) on a serial `DispatchQueue` of its
+own, never the cooperative pool, at most one read per folder at a time;
+requests made meanwhile are joined. A read is `fresh` only if started for the
+latest request of this opening of the window, a text reaches the screen only
+for the meeting and version it was read for, and a read longer than 3 s says
+the folder is not responding while the local meetings show. A row's state is
+three things: the queue's work (`stepLabel`, the menu's words), the last
+attempt by number (unreadable → unknown, never the earlier result), and
+whether there is text; transcripts from before records have no completeness.
+Sizes come from `MeetingStorage.folderSize`, every file counted, unknown when
+part of the folder cannot be read (Storage shows what it counted). A
+transcript is parsed to lines only when every line is `[m:ss|h:mm:ss]
+**label:** text` below a `---`; anything else is shown as written. A row's
+check mark ("Fully transcribed") is only for a last record that says
+`complete`; a transcript without such proof is "Transcribed, completeness
+unknown", one with gaps a warning (`MeetingText.status`, tested as shown). A
+fresh read of a meeting's folder reads its shown text again (Refresh shows a
+change made outside and retries a failed read); every request marks the shown
+snapshots as not fresh; while the window is closed a read under way ends but
+nothing new starts. A folder of a meeting's name that cannot be read stays a
+meeting, its row saying so. The selection follows the queue's moves, those
+made while the window was closed too, and a local path is followed only while
+nothing is there (a copy put back is a meeting of its own). "Show Last
+Recording…", "Show Transcript" and "Show Meeting Folder…" (a warning, a failed
+transcription) open the meeting in the window (`MeetingLibrary.open`), on
+Meetings with the search cleared, whatever the window showed; the Transcribe
+Again sheet transcribes the meeting it was opened for at its address now, and
+the list and the card are a plain stack (`HSplitView` sized its panes by their
+widest and pushed the content past the window's edges). The card is shown only
+on Meetings and Starred (`isCardShown`): elsewhere the sound stops and its
+files close, Play is refused, an outcome that ends meanwhile is the window's
+notice, a wish of the search to focus the text is dropped and the hidden text,
+list, name and search field give up the keys (a name being typed is saved);
+Refresh and ⌘R are the meetings' own. Deletions' report, `markNotice` and
+`exportNotice` stand above every section (`MeetingNotices`). As a search ends,
+the list made anew scrolls to the card's meeting, or the first of several
+selected, once it shows a row.
+
+**Listening and searching** (`MeetingPlayer`, owned by `MeetingLibrary`, which
+alone loads and lets go of it). Two `AVAudioPlayer`s (`MeetingTrack`, the
+player's seam; `Deck.live` refuses in any test process whatever its
+environment, a DEBUG UI test's `-PlayerProbe` gets `SilentTrack`s) start at one
+moment of the output's clock; one rate, volume only 1 or 0, never a gain; the
+timeline is the longest file's own length. The files the card's meeting plays
+(`MeetingStorage.playback(in:)`: the checked m4a, else the CAF) are opened on
+the player's own serial queue for the parent folder (apart from the list's
+reads), one track after another, each load under a generation of its own:
+right before each open the folder at its address (`FolderIdentity`) and the
+track itself (`lstat`: a link or anything unknown is not opened) are checked
+again, and a load let go of opens nothing more; a late load only closes what it
+opened. Loads still opening are counted by the folder itself (`isOpening`,
+late ones included): `beginOperations` takes no folder meanwhile (a move waits
+for it, a deletion by hand is refused with the reason, old audio waits for the
+next pass), and when it takes one (a move's source and destination, a
+deletion, old audio's deletion) it calls `releaseAudio` in that turn and the
+player closes the files of those folders by identity; while an operation holds
+the folder, nothing opens (`audioRefusal`). A track that won't start or stops
+on an error (`AudioPlayerTrack` says why) stops both, with the reason. A
+recording starting stops the sound in the turn its state changes, a dictation
+pauses it, and both hold Play off at once (`held`), loaded or not; every start
+asks `startRefusal` again (recording, dictation, the meeting on the card, the
+window, operations). Line times (`MeetingTranscript.Timing`) are the attempt record's
+while the file matches its fingerprint and line count, else the file's own
+timecodes, said to be approximate. `MeetingTranscript.layout` is the shown text
+and its parts, one for the view, "Copy Text" and the search; `MeetingSearch` is
+the one rule for a match (case and ё/е alike, nothing else folded), over the
+lines' words only. The search reads the newest transcript of each meeting in
+batches of 20 on each listing's channel, after the card's and the list's reads,
+only while the window is open and only from listings read for the latest
+request: each request and answer raises the listing's revision, and a search
+read started under an earlier one is dropped, as is a count begun before a
+request; a listing being read again keeps its last known matches and says it
+is updating. Texts are cached by the folder
+itself and kept only for the meeting, folder and version they were read for;
+`SearchState` names what was not read, could not be read (a transcript, or a
+meeting's folder), lives in a folder not read or is being read again or
+counted, and "No matches" waits for all of it. A new query clears the last
+one's matches. The list is made anew as the search starts or ends (`.id`):
+rows brought back otherwise kept the table's own row height, their time,
+source and state cut off. The card shows which match of how many, with arrows, by the
+text's selection whatever moved it. ⌘G / ⇧⌘G reach `TranscriptNSTextView`
+through the Find menu while the find bar is closed.
+
+**A meeting's marks** (its own name, its star and its speakers' names) live in its folder,
+`murmurly.json` (`MeetingMarks`, never translated), written by the window
+alone. A change sets fields (`MeetingMarks.Change`), never the whole file: the
+file is read once, checked, and that very object is changed and written
+atomically, so every other key survives; only a file proven to be version 1 is
+written over (no version, another type, version 0, a later version, not JSON
+or a read that failed are left byte for byte, the controls off with the
+reason). Each meeting folder has one writer, by the folder itself
+(`FolderIdentity`: its volume and file number, by `lstat`, so a folder reached
+through a link in a parent path, or a meetings-folder meeting opened from
+outside both roots, is one folder, and a link at the address is none): it
+holds the fields the user set that are not on disk yet, writes one at a time,
+takes each successful write as what is on disk, so a later failure loses only
+its own fields and a read started before a write does not take it back, and
+writes only while the address still holds that folder. While the queue works
+on the folder (its `operations`: a move, a deletion, a deletion of old audio,
+each taken on the main actor before anything is touched) its marks are
+refused, the controls off with the step as the reason; nothing is held for
+later. The other way round, a move waits while a write of the
+folder's marks is under way (`marksBeingWritten`), then reads the folder again:
+one that is not the folder it waited for (replaced meanwhile, or unreadable)
+is not moved this time, and the next scan finds it as what it is. A folder the queue may move
+(its own rule, `isInMeetingsRoot`) is written at once on the main actor; any
+other on its parent folder's serial queue. Until a change is on disk its
+folder is in `pendingMarks`: the card says "saving", quit warns and Sparkle
+waits. A folder of the same name in both roots, one that cannot be read and
+the recording under way take no marks. The name changes the title only, never
+the folder; an empty name gives the date back; as in Finder, Return, a click
+elsewhere or another meeting save the name being typed, for the folder it was
+typed on, and a refusal, a failed write at once included, shows on the card
+whatever became of the row; a write off the main actor that fails while
+another meeting, or none, is on the card, or the card is out of sight, is said above every section until dismissed
+(`markNotice`, naming the meeting); Esc drops it. The sidebar's Starred
+filters the same list. The queue's move goes through `mover`, so a test holds
+it between the copy and the local folder's removal.
+
+**Speakers' names, Save As, a dictionary entry from the transcript.** The
+names are `speakers` in `murmurly.json` (`{"microphone": …, "system": …}`; a
+key of another kind inside it stays, a name that is not a string makes the
+file unreadable), set in the card's Names sheet through the same writer and
+rule as the star (`setNames(typedOn:at:…)`, the meeting found by its folder
+as a name typed is; one line each, no `*`, which would end a label early in
+Markdown; empty gives the label back). Save closes the sheet only once the
+names are on disk (`saveNames` waits for the write of a folder elsewhere),
+both fields off meanwhile, so nothing typed is lost unwritten; a
+refusal, late too, shows in the sheet with what was typed, the fields on again, and a write that
+fails keeps what it would have written (`MarkFailure.lost`), so the card's line
+and the window's notice name the names when the sheet was closed first.
+They take the place of the labels only
+in a transcript its attempt record still matches (`timing == .exact`): line i
+gets the name of `lines[i].source`, never by the label's text, so a file
+written under another language or with one label for both tracks is named
+alike (`MeetingTranscript.named`); any other version says why
+(`recordRefusal`: no records at all, the fingerprint differs, or no record
+matches), and the player's track buttons take the names whatever the version.
+Transcripts and their copies never change, and a new transcription takes the
+names as they are. `shownTranscript(of:)` is the one text for the card, Copy
+Text and Save As: with names, a line "Names: …" after the header. Save As
+(Markdown, plain text, SRT) takes that text at the click: Markdown is the file
+byte for byte unless names took the labels' place, then its own header bytes,
+the names line and only the labels changed; subtitles only from the record's
+exact spans, and only times finite, not negative and under 100 hours
+(`subtitlesRefusal`: a record edited by hand may say anything, and 1e20 made
+into milliseconds stopped the app). The name is the meeting's start to the minute
+(`2026-10-15 10-31 Meeting 2.md`, never translated). One save at a time
+(`exporting`, from the click): the panel (`Saving.destination`, a sheet through
+`FilesModel.present`), then the write on the library's own serial queue
+(`Saving.write`), refused inside any meeting's folder by name or by the
+folder itself, links followed (`destinationRefusal`); from the panel's answer
+to the end of the write it counts for quit and `AppUpdater.busy`. The outcome
+shows on the card while that meeting and version are on it; one that came
+while they were not, saved or not, is `exportNotice` above every section
+until its cross closes it. The panel goes through `FilesModel.present`, on the
+window Save As was clicked in; a test process never opens it: a DEBUG test
+with `-FileProbeRoot` gets `meeting-export-<n>.<ext>` in that root, with the
+name suggested in `meeting-export-<n>.name`. "Add to Dictionary…"
+(beside Copy Text, and first in the text's context menu) opens
+`DictionaryEntrySheet(transcript:selected:)` with plain text: the words of the
+line the selection began in (`Layout.dictionarySource`) and everything
+selected as the spelling. `TranscriptTextView` tells a selection only for the
+text it was made in (its identity, and a generation of the text view); the
+menu takes the view's own selection at the click. The sheets stay up over a
+change of section or meeting until their own buttons close them.
+
+**Deleting a meeting or its audio** (a row's menu, the card's Delete menu, the
+card of several selected meetings, ⌘⌫ in the list) goes only to the Trash. A
+folder on a volume without one (`CocoaError.featureUnsupported`) is not
+deleted: the window says so and shows it in Finder, after part of its audio
+went too. "Delete Audio…" takes `MeetingStorage.audio(in:requiringMetadata:
+true)`: the tracks `metadata.json` names (plain names in the folder itself,
+`isPlainTrackName`), each with its CAF/m4a pair and a killed compression's
+leftover; a recording without metadata goes only whole. "Delete Meeting…"
+takes `manifest(of:)`: every file at the top of the folder by `lstat`, refused
+with a folder or a link inside; Finder's own files (`isSystemFile`) are left
+out of the comparison, as Finder rewrites them. Every object is read by
+`lstat` and an error is "unknown", never "not there". A folder not named as a
+meeting's is never deleted, nor one that is the transcripts folder through any
+address; the copies in the transcripts folder are never touched. What the
+sheet showed is read again on the folder's queue: another folder or other
+files there are asked about again (`removalRecheck`). Then, in one turn of the
+main actor, `removalRefusal` and `MeetingTranscriptionQueue.reserve` check the
+recording (`Session.identity`, so no link reaches it), the queue's
+`operations`, the job under way and the transcriptions waiting for the folder,
+each by the folder itself (`Job.identity`, read again after the queue's own
+move); a waiting transcription whose folder is not known yet
+(`untoldTranscription`) refuses every deletion until it is. The reservation is
+an operation (`.removing`) until the end: no job is queued for the folder, its
+marks and moves are refused, and its waiting upkeep is dropped. Each call goes
+through `MeetingStorage.Removal.perform` on the folder's queue: the folder by
+its identity, the file or the manifest by `lstat` again, then `stillWanted`
+after that last read, then the backend. A meeting deleted whole has the
+transcripts folder its setting names resolved first (`Reader.copiesFolder`; a
+folder that cannot be told refuses), then that last check, then only whether
+the setting is still the one resolved, which waits for no disk; changed, the
+whole admission goes again. Only a meetings root proven absent is empty
+(`meetingFolders`): one behind a parent that can't be passed throws. `Removal.live` is the disk outside tests; any test
+process gets a refusal, except a DEBUG UI test with `-RemovalProbeTrash` and a
+seeded `-MeetingsProbeRoot` (never on, inside or around the owner's meetings
+folder, `RecordingsStore.ownersMeetingsRoot`), confined to that root.
+After a deletion the menu forgets the folder by any address it went by.
+
+**Old meeting audio** (Settings → Meetings, `meeting.audioRetentionDays`,
+`MeetingAudioRetention`: keep, the default, or 7, 30 or 90 days after the end
+of the first full transcription). A number of days is written only after a
+question that counts first what would go at once (`askAudioRetention`, each
+root read for at most 3 s, a root not counted said so); keep is written at
+once. `MeetingStorage.audioRetention(of:)` reads the facts strictly:
+`metadata.json` says `done`, the meeting is not starred, every attempt record
+is readable and numbered once, the last attempt is `complete`, the first and
+the last complete ones are consistent (`isConsistentComplete`), and the last
+transcript is unchanged by size and SHA-256; anything else keeps the audio,
+and the card says why. This deletion is for good, file by file, as a job step
+(`.removingAudio`, after the transcription and its copy, before compression),
+each file admitted again right before it: the facts read again, the rule and
+`SettingsStore.retentionGeneration` (raised by a change of the rule or of the
+meetings folder) unchanged, no marks being written. The pass runs at
+`activate`, after a yes (only on the meetings the question counted) and daily,
+over the local root and the chosen meetings folder. The count
+(`AudioCount`) names each meeting by its folder itself and is complete only
+when everything was read (a root that can't be listed, a meeting whose facts
+can't be read, `Retention.unknown`, or no answer in time say so in the
+question); the question carries the meetings and the generation it was counted
+under, and a count or a yes under another is counted and asked again. The step
+deletes only the meeting it counted (`Job.removesAudio`, with the identity),
+and goes after every transcription that is or may be of the meeting: the last
+of them takes it over.
+
 **Settings → Storage counts in two steps** (`ArchiveSnapshot.refresh`): this
 Mac's figures first, then the chosen folders, which may be on a network volume
 and are read off the main actor. Each publication checks that its task was not
@@ -291,49 +577,148 @@ The window checks the chosen folders again when the app becomes active and when
 a volume is mounted or unmounted. Neither the meetings nor the transcripts
 folder may be the dictation archive or inside it: `chooseMeetingsFolder` and
 `chooseTranscriptsFolder` compare paths after resolving links and refuse with
-`.insideDictationArchive`, which Storage shows as a warning line.
+`.insideDictationArchive`, which Storage shows as a warning line. Storage
+also shows the meeting audio's size and how many meetings have none left
+(`ArchiveSnapshot.MeetingAudio`).
 
 **Meeting transcription** (`MeetingTranscription.swift`). `MeetingTranscriber`
 finds speech with the Silero VAD, cuts each track into chunks, recognizes them
 with the selected engine, drops microphone chunks whose words mostly appear in
 the system track at the same time (echo; split on spaces, so it does nothing for
-languages written without them), and interleaves both tracks by time into
-`transcript.md` (never overwriting an existing one). `MeetingTranscriptionQueue`
+languages written without them), interleaves both tracks by time, applies the
+personal dictionary to each line, and writes `transcript.md` (never
+overwriting an existing one). `MeetingTranscriptionQueue`
 then compresses the tracks to 24-bit ALAC `.m4a`, verified sample by sample,
 can move finished meetings to a user-chosen folder, and can copy each transcript
 into another folder. The queue remembers where its own moves put each folder in
-this run (`movedTo`, in memory), and `location(of:)` looks there once the local
-folder is gone, so "Show Last Recording…" and the menu's warnings point at the
-moved meeting even after the folder setting changes. The Files tab uses
-`MeetingTranscriber.transcribeFile`: the same pipeline on one track, with work
-files only in a temporary folder, so nothing is created or deleted next to the
-user's file. A file run that breaks after at least one recognized line throws
-`Failure.fileCutShort` with those lines, the position and the reason, and the
-tab keeps them under a note; the user's cancel is still a `CancellationError`.
+this run (`movedTo`, in memory, published for the window), and `location(of:)` looks
+there once the local folder is gone, so "Show Last Recording…" and the menu's
+warnings point at the moved meeting even after the folder setting changes. No
+job transcribes the folder being recorded (`currentRecording`, set by the
+recorder): it has no metadata until its stop, so `Folder.inspect` alone would
+take it for one cut off by a crash.
+
+**Attempt records.** Each transcription attempt of a meeting leaves a hidden
+`.attempt <number> <UUID>.murmurly.json` in its folder (`MeetingAttempt`),
+written by the queue alone, inside the job's task, before `isTranscribing`
+goes back: in progress before the work starts, then its result. Only a folder
+`Folder.inspect` accepted gets one; one that cannot be recorded does not start.
+A cancel removes it; a result that cannot be written leaves it in progress.
+Attempts are ordered by their number, never by the clock, so a record that
+cannot be read keeps its place. `complete` means not cut short, no failed chunk
+and both tracks the metadata names (or the default ones) there; a transcript
+with a gap stays `.saved` in the menu but is `incomplete` on disk. The record
+holds the engines, languages, both tracks' labels as written, every line's
+span and source in the file's order (no text: the n-th line of the record is
+the n-th of its transcript while the fingerprint, size and SHA-256 of the
+`.md`, matches). Moves carry it; the copy into the transcripts folder takes
+only the `.md`. An attempt that left no record (refused before it began) is in
+`unrecordedOutcomes`, by the folder's path, carried by the queue's own move and
+cleared by the next attempt.
+
+A meeting is transcribed again from the menu: "Transcribe Meeting…", or
+"Transcribe Again…" beside the last outcome, which opens inside that meeting
+wherever it is now (`lastMeeting`, through `location(of:)`; Transcribe with
+nothing selected takes the folder shown). The folder panel
+(`AppWindowController.chooseFolder`: asynchronous `begin`, never `runModal`)
+carries an accessory view with Engine and Language for this transcription only
+(`MeetingTranscriptionQueue.ChoiceDraft`), taken from the settings as the panel
+opens and never written back; a language the engine does not know shows Auto,
+as in Settings, and comes back with its engine. Both engines stay choosable:
+one not downloaded is marked so, with a button that downloads that engine's
+model without touching the dictation's, and the panel's delegate
+(`panel(_:validate:)`) refuses Transcribe, the panel staying open, while a file
+is missing, tokenizer and VAD included; the OK button itself cannot be turned
+off. The panel takes the accessory's size once, as it opens, and never
+changes it (`choiceAccessory`), so the model's place always keeps the room of
+its tallest state, the button over two lines of a failure: a state that comes
+later would otherwise be cut off. A longer reason for the failure is the one
+exception, accepted as rare: the panel shows two lines of it and the whole in
+its tooltip, as the Files section and the Dictation tab show it whole. The job
+carries the choice (`Job.choice`); a job without one, after a stop or from a
+scan, follows the settings chunk by chunk as before. The choice reaches the
+engine and its request, the model check (again as each job starts,
+before any audio is read) and the dictionary's word forms, never the settings.
+It belongs to the job: after a move of its own the queue gives the meeting's
+waiting jobs its new address. `enqueue` queues a folder again only for a
+transcription it does not have yet: a scan joins any job of the folder, a
+transcription as the settings say joins any transcription of it, and a choice
+only the same choice (engine and the code the engine is asked for); a waiting
+scan or automatic job takes a choice over, and any other choice is a job of
+its own. Each run writes the next free `transcript N.md` and, with a
+transcripts folder, `… Meeting N.md`; nothing written before is touched, and a
+copy name already taken is refused and shown in Storage while the transcript
+stays. The header names the engine and the language actually used; the job's
+start is logged with its engine and language code.
+
+The Files section uses `MeetingTranscriber.transcribeFile`: the same pipeline on
+one track, with the tab's choice of engine and language where a meeting job
+takes its own, and work files only in a temporary folder, so nothing is
+created or deleted next to the user's file. A file run that breaks after at least one
+recognized line throws `Failure.fileCutShort` with those lines, the position
+and the reason, and the tab keeps them under a note; the user's cancel is still
+a `CancellationError`.
 
 Progress steps go `.reading` → `.detecting` → `.preparingModel` /
 `.waitingForEngine` → `.recognizing(track:done:total:)`, and the per-chunk ones
 come from inside the cache operation: the cache's progress callback feeds a
 local `AsyncStream` that the operation drains before it takes the result, so
 "recognizing" appears only once the engine is ready and no step arrives after
-the result. The meeting menu and the Files tab name the same steps.
+the result. The meeting menu and the Files section name the same steps.
 
-**The Files tab's state lives in the app.** `FilesModel` (in `ContentView.swift`)
-is created in `MurmurlyApp` with the other objects and handed to the window
-as an environment object, so closing the window neither stops a run nor loses
+**The Files section's state lives in the app.** `FilesModel` (in `ContentView.swift`)
+is created in `MurmurlyApp` with the other objects and handed to the main
+window as an environment object, so closing the window neither stops a run nor loses
 its text; it is in memory only. `hasUnsavedText` compares `resultRevision`
 with `savedRevision` (copying is not saving), and is the one definition for the
 note under the text, the replace sheet and the quit warning. A new file or run
 over unsaved text only sets `pendingReplacement` and asks ("Save .md…",
 "Replace", "Cancel"); a `Replacement` carries the revision the user agreed to
 drop, so a newer result is never replaced unasked, and "Save .md…" replaces only
-after the write succeeded. The open and save panels are sheets on the tab's
-window (`beginSheetModal`), or, with no key window, an asynchronous `begin()`;
-never `runModal`: nested modal loops already hung quit and this tab once. The
-DEBUG probe `-FileProbeRoot <dir>` (`Sources/FileProbe.swift`) drives the tab in
-UI tests; with `-FileProbeRealPanels` the real panels open in that folder,
-otherwise saving goes through a gate that waits with `Task.sleep` and never holds
-the main thread.
+after the write succeeded. A row under the actions holds the engine and
+language of the next run (`FilesModel.choice`, in memory only, never written
+to the settings): "As Dictation" (nil, the default after every launch) follows
+the settings chunk by chunk, a pick by hand holds for every chunk; the label
+tells the two apart, and a line of its own under the menu shows whether that
+engine's model is there, with a download of that model alone (beside the menu
+it did not fit the window's one width). The choice stays across runs, files and
+the window until "As Dictation" takes it back; the menu (`FilesChoiceMenu`) is
+off while a run goes. `start()` takes the choice at once, and a run asked for
+over unsaved text carries it through the question and the save panel
+(`Replacement.Action.rerun(Choice?)`; picking a file, `.file`, carries none and
+runs nothing). The model is asked for, that engine's with its tokenizer and the
+VAD (`FilesModel.ModelMissing`, `MeetingTranscriber`'s own check), before
+the question and again before the shown text is dropped, so a run that cannot
+start says why over the text and leaves it. Every open and save panel of the
+app's windows (Files', the dictionary's export and import, a meeting's Save
+As) goes through `FilesModel.present(_:on:as:)`: a sheet on the window of the
+view it was asked from (`WindowAnchor`, read at the click, before anything
+waits; a view in a sheet answers with the window the sheet is on), never the
+window key when the panel comes; an owner closed by then cancels the choice,
+with no panel anywhere. Never `runModal`: nested modal loops already hung quit
+and this tab once. A test process never opens a panel, whatever it was told
+(`panelBackend`; callers give only AppKit's last call, `sheet`, so the rule is
+chosen inside), and the folder panel of Transcribe Meeting… and Storage
+(`AppWindowController.chooseFolder`, `begin`) keeps the same rule. The DEBUG
+probe `-FileProbeRoot <dir>` (`Sources/FileProbe.swift`), only a temporary
+folder, every write of it through `FileProbe.writer`, answers every panel by
+what it is for and drives Files in UI tests: the n-th panel, while
+`present.hold` is there, says `present-<n>.holding` and waits for
+`present-<n>.release`, then `present-<n>.owner` (the window's identifier) or
+`present-<n>.cancelled`, the number going with its panel; Choose File… takes
+the path in `choose-file-<n>.txt`; saving goes through a gate that waits with
+`Task.sleep` and never holds the main thread, and the Dictionary's panels are answered at once by
+`dictionary-import-<n>.json` / `dictionary-export-<n>.json` there, unless a
+test holds an import's panel (`dictionary-import-<n>.hold` until `.chosen`); the
+import's read then waits for `dictionary-import-<n>.release` and the export's
+write for `dictionary-export-<n>.release` (or `.fail`). A probe run writes the
+choice it was started with (`run-<file>.choice`) before it says it started.
+The probe also holds a write of a meeting's marks off the main actor when the
+test puts `marks-<n>.hold` there (`marks-<n>.writing`, then `.release` or
+`.fail`), and every read of a transcript by the window while `text.hold` is
+there (`text.reading` names the meeting, `text.released` follows the hold's
+removal); in a test process the card's Add to Dictionary says the selection
+the card holds, `start+length`, so a test waits for the very selection it made.
 
 **Engines.** Parakeet TDT v3 through FluidAudio (the default) and Whisper
 through WhisperKit. `WhisperKitCache` (an actor, despite its name it serves both
@@ -346,6 +731,41 @@ Whisper tokenizer is a separate Hugging Face repository; `WhisperTokenizerLocato
 takes it from next to the model (`Models/openai/whisper-large-v3`) and checks it
 before WhisperKit would go to the network for it.
 
+The cache holds one engine, so a meeting job or a Files run in another engine
+than the dictation's leaves the dictation its own. Right before each chunk's request, a
+job whose engine differs from `DictationCoordinator.heldEngine` waits, shows
+`.waitingForEngine` and can be stopped: the dictation's engine while it starts,
+records or is recognized (from `recordingSnapshot`), and for 30 s after it ends
+(from the settings); nothing before the first dictation. The wait is part of
+the job, so quit and updates see it; a job in the dictation's engine never
+waits. The recorder hands `heldEngine` and the dictation's warm-up to the queue
+(`MeetingRecorder.transcripts`), and `FilesModel.live` takes them from the
+dictation itself. The cache and its order are unchanged, so what
+is left: a dictation started between the check and the request waits for one
+chunk or one load, and one started while a job prepares Whisper for the first
+time waits for that whole preparation. Once a series of jobs that had a choice
+leaves no transcription to run, whatever its last job was, the queue asks the
+dictation's own warm-up to take its engine back
+(`DictationCoordinator.prepareAfterOtherEngineJob`): nothing while a dictation is
+under way, which warms its selection as it ends; only with its model there;
+and under the selection's generation, so a change of the settings wins. Its
+failure shows as any warm-up's; the meetings' results and copies are in
+already. The Files section asks the same after every run that had a choice,
+whatever its end, once the result is shown. The Files section and the meeting
+queue do not give way to each other: a meeting in one engine and a file in
+another at the same time take the cache by turns and load the models again,
+and the warm-up after a file may come in the middle of a series of meetings.
+
+Measured on 2026-10-14 (Mac mini M4, 16 GB, by `murmurly.log`): the first
+load of Whisper large-v3 turbo after its download took 104 s, as Core ML
+builds the model for the device; every later load, after a relaunch too,
+2.3 s. Parakeet loads in 0.5 s. A 2-minute meeting (108 s of speech, 14
+chunks) took 2.2 s with Parakeet and 13 s with Whisper, its load included. So
+in that window a dictation waits for one chunk (under a second) or one load
+(2.3 s), and right after Whisper is downloaded for up to about 100 s. The
+dictation's own delay during a job was not measured live: a test process has
+no global shortcuts.
+
 **Language.** One setting, `dictationLanguage` (`"auto"` or an ISO code), and
 one function that builds the engine request, `SettingsSnapshot.decodeRequest`,
 for dictation, meetings and files. The pickers list the selected engine's
@@ -354,9 +774,10 @@ WhisperKit's list for Whisper). A code the current engine does not know acts as
 Auto without rewriting the setting. For Parakeet the language is not a hint but
 FluidAudio's script filter: `ru` forbids Latin letters, so English terms come
 out in Cyrillic; on Auto Parakeet runs without a filter, chosen by measuring a
-Russian meeting recording: English terms stay in Latin letters and only a few
-short replies come out in Latin, while the filter would turn the terms into
-Cyrillic. In meetings and files
+Russian meeting recording: some English terms then stay in Latin letters while
+others still come out in Cyrillic, and a few short replies come out in Latin;
+the filter would turn every term into Cyrillic. The personal dictionary fixes
+the terms that still come out wrong. In meetings and files
 on Auto, Whisper detects the language per chunk until the first recognized
 chunk longer than 5 s fixes it for the rest of the job; chunks are processed
 track by track, microphone first, so this is no detector of language changes
@@ -365,7 +786,89 @@ during a call. Without a filter Parakeet writes `<unk>` for a few characters
 has a search over the picker by name and code (`filteredLanguages`) that never
 hides Auto or the current choice; the menu shows Auto, the current language
 and "More Languages…". A language the selected engine does not know is
-explained under the picker (`fallbackNote`), and the setting stays.
+explained under the picker (`fallbackNote`), and the setting stays. A meeting
+job or a Files run may carry its own engine and language (`SettingsSnapshot.Choice`, a code
+the engine does not know kept as Auto); it is laid over the settings snapshot
+(`SettingsSnapshot.applying`) wherever the job reads them, so `decodeRequest`
+stays the one function and the settings are never written, not even for a
+moment.
+
+**Personal dictionary** (`Sources/PersonalDictionary.swift`, the Dictionary
+tab). An entry is a list of spellings an engine writes ("heard") → how to write
+it, with its own switch and a stable ID. It lives in `SettingsStore` as one
+versioned JSON document (`dictionary.entries`), saved whole and published only
+after the data is set; three switches (`dictionary.inDictation`, `.inMeetings`,
+`.inFiles`) are on until turned off, and nothing ever writes a dictionary on its
+own. A key that does not read as this version's document (damaged, or written
+by a newer app after going back to an older one) is kept as it is: jobs run
+without replacements and editing waits for an explicit "Clear Dictionary…".
+Export… writes that same document (`SettingsStore.encodedDictionary`, one
+encoder for the settings and the file: indented, keys sorted), atomically and
+off the main actor. The file is open to edit by hand, but every entry needs
+its `id` and `enabled`. Import… reads and checks the file off the main actor
+and refuses it whole, naming the entry, unless it is a dictionary this app
+could have saved itself (`importedDictionary(from:)`): this version, at least
+one entry, each id once, every entry as the sheet would take it, switched-off
+ones included, as a spelling repeated within one entry is a fault of the entry
+itself. Only a file that passed is asked about, and an empty dictionary is not
+asked at all: Add keeps every entry of yours (the same id with other content
+stays yours, so an old file never undoes a later edit or switch), skips the
+identical ones and brings one whose spelling an enabled entry of yours has in
+switched off; Replace takes the file as it is. The merge starts from the
+dictionary as it is at the answer and saves once
+(`importDictionary(_:replacing:)`); until then the section edits nothing. Any
+change of the main window's section while the file is read drops the import,
+the Dictionary hidden all along included, as nothing of it is on screen; a
+panel or a question already up stays over the new section, and its answer
+counts as it would there. Settings' tabs, another window's, change nothing. An export holds Export
+and Import from its panel to the end of its write, failed or not, so two
+writes never race to one file. Where the dictionary applies and the language
+stay the receiving Mac's.
+One sheet (`DictionaryEntrySheet`) adds and edits entries, from the tab, from
+a history row's "Add to Dictionary…" and from a meeting's transcript
+(`Source`: plain text, no history line). From the history it shows the dictation as
+recognized (`raw_text`, else `text`) in a copy to select in; "Use Selection"
+takes the selection as one spelling by the typed list's own rule
+(`DictionaryEntry.variant(fromSelection:)`) and refuses a comma, other
+punctuation or a line break instead of splitting or cutting it. The clipboard is
+not used, and the history line is never touched. While the key is unreadable the
+sheet itself takes no entry and leads to the Dictionary section
+(`openDictionary`, given by Dictations and the card). A change of section leaves the
+sheet up, with its draft, until Cancel or Save. Its preview runs the real
+replacer over the whole dictionary with the draft in place and starts again
+when any input changes, a language chosen from the menu bar included.
+Every job takes one `DictionarySnapshot`: a dictation with `recordingSnapshot`
+when recording starts, a meeting or a file as the job starts, before its speech
+model loads (`MeetingTranscriber.dictionary`), while the engine is still read
+before every chunk. An edit applies to the next job; a written `transcript.md`
+is never redone. Dictation replaces right after the segments are joined
+(`transcribe(url:snapshot:dictionary:)`), before the history and the paste, so
+both get one text; the history line keeps the recognized text in `raw_text`
+only when the dictionary changed it, and a retry or a quit-time save writes that
+pair as it is. Meetings and files replace after echo removal and merging
+(`MeetingTranscriber.finished`), on each final line's text: echo removal counts
+words and must see them as recognized, merging lets a phrase split between two
+chunks of one speaker be found, and `report.microphone` / `report.system` stay
+as recognized. A whole meeting, one cut short, a file, `incompleteFile` and
+`fileCutShort` all take that one step; a dictation that was not recognized
+and is tried again by dragging its audio into Files follows the Files switch,
+and the tab's choice of engine and language. `DictionaryReplacer` makes one pass
+left to right over the words `NLTokenizer` finds (split again at hyphens):
+longest variant first, an exact spelling before a word form, the text's own
+slices with the written form inserted literally. A variant's words may stand
+apart by spaces or one hyphen only; case and the Russian yo/ye never tell words
+apart; a rule leaves its own written form alone where it already stands. Word
+forms come from macOS's `NLTagger` lemma, one lower-case word at a time with
+Russian set, and count only for a variant written wholly in Cyrillic whose
+written form has no Cyrillic, and only when the job's language is Auto, Russian
+or a code the engine does not know (`DictionarySnapshot.matchesWordForms`, the
+same answer as the engine request; a meeting or a file with a choice of its own answers
+by that choice, its entries and switches staying the settings'); they are
+prepared off the main actor, once per job. They do not reach words macOS does
+not know (most loanwords: add the forms needed as more spellings), they also
+join singular and plural and homonyms, and they depend on the macOS version;
+languages written without spaces are not covered. Logs get the number of
+replacements, never the words.
 
 **Models are downloaded by the app.** `ModelDownloader`
 (`Sources/ModelDownloader.swift`) describes four models as data pinned to
@@ -398,8 +901,10 @@ quit, so while `AppUpdater.busy` is true the delegate refuses the current
 attempt (`updaterShouldRelaunchApplication` → `relaunchNow()`): a meeting being
 recorded or saved, a dictation, a meeting transcription queued or under way,
 where a job that transcribes (`activeJob`) counts until it ends, its copy into
-the transcripts folder included, and a Files run (`files.$isTranscribing`; the
-`files:` parameter of `busy` is required, so it cannot be forgotten).
+the transcripts folder included, a Files run (`files.$isTranscribing`; the
+`files:` parameter of `busy` is required, so it cannot be forgotten), a
+meeting's marks not on disk yet (`library.$pendingMarks`, required the
+same way) and a transcript being written to its file (`library.$exporting`).
 Compression and moves of their own are not counted (the launch-time scan queues
 them again). Refused, Sparkle closes its window and keeps the prepared update:
 it installs at the next quit, and "Check for Updates…" or the daily check offer
@@ -473,21 +978,29 @@ warm-up, Getting Started and the login item. In DEBUG it is also isolated: no
 global shortcuts or `NSEvent` monitors, no reading of the Core Audio process
 list (the watchdog starts nothing), and archives, log and settings in its own
 `$TMPDIR/Murmurly-test-<UUID>` (settings in `settings.plist` there, nothing in
-`~/Library/Preferences`); KeyboardShortcuts' initial shortcuts are not written to
-the standard domain. The exception is reading shortcuts: KeyboardShortcuts reads
+`~/Library/Preferences`; `-MeetingsProbeRoot <dir>` moves the meetings root to
+a folder a UI test seeded before launch, with `.m4a` tracks so the launch scan
+starts no compression); KeyboardShortcuts' initial shortcuts are not written to
+the standard domain. The main window has no split view, so no launch keeps
+a layout of it in the app's own domain, the owner's for a test copy.
+The exception is reading shortcuts: KeyboardShortcuts reads
 only `UserDefaults.standard`, which for the unit-test host is the app's own,
 live domain, so a test sets a shortcut only in the process's volatile argument
 domain (`IndicatorTests.withMeetingShortcut`), never by writing a domain. The
 `MurmurlyStageGate` scheme sets `MURMURLY_PRODUCTION_SERVICES=1` to opt
-out of the isolation, so its cold launch is the app as shipped. Release builds
-have no isolation at all.
+out of the isolation, so its cold launch is the app as shipped. The opt-out
+counts only for a hosted test process: a UI test's launch (`-UITesting`,
+`-UITestSettingsStore`) is isolated whatever reached its environment
+(`TestIsolation.classify`). Release builds have no isolation at all.
 
 ## Dictation archive
 
 The root is `~/Library/Application Support/Murmurly/Dictations/`, created
 with mode `0700`, files `0600`. `history.jsonl` is append-only JSONL, one
 `DictationHistoryEntry` per line: an open format for ordinary scripts. A last
-line without a trailing newline is parsed like any other.
+line without a trailing newline is parsed like any other. `raw_text` is there
+only when the personal dictionary changed `text`; search and copy use `text`,
+and old history is never reprocessed.
 
 After every actual change to the index (line appended, entry deleted, history
 cleared — even if removing the audio then failed) the store posts
@@ -495,7 +1008,9 @@ cleared — even if removing the audio then failed) the store posts
 list and search, Settings statistics, the recent menu) keeps a
 `DictationHistoryChanges` for that store, created before its first read, and
 re-reads on its revision; the menu is replaced with a fresh snapshot, never
-patched by hand. History reports a failed read or count in the tab, with "Try
+patched by hand. Dictations counts the history itself (`refreshSummary`, lines
+and whether Clear All has anything), whatever window shows it, and an older
+count says nothing over a newer one. Dictations reports a failed read or count in the section, with "Try
 Again" (`DictationHistoryViewModel.readFailure`); sheets are only for actions
 (delete, clear, play).
 
@@ -507,10 +1022,10 @@ and then removes month and year folders only if nothing is left in them.
 Ownership is determined by the path and filename, not by the file's origin. A
 meeting moved there under an earlier setting, a note or any other file stays;
 links to year or month folders are not followed. A folder that cannot be read
-fails the clear instead of passing for empty. The clear button stays enabled
-while the index has lines or the archive has a file of its own
-(`ArchiveSnapshot.hasDictationFiles`), so a clear that failed halfway can be
-finished.
+fails the clear instead of passing for empty. Dictations' Clear All stays
+enabled while the index has lines or the archive has a file of its own
+(`DictationHistoryViewModel.Summary.hasFiles`), so a clear that failed halfway
+can be finished.
 
 No absolute paths in the JSONL. `audio_path` is empty when audio is not saved;
 otherwise it is relative to `Dictations/`, with audio in dated subfolders.

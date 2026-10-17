@@ -1,4 +1,5 @@
 import AVFoundation
+import CryptoKit
 import Foundation
 
 /// Compresses a finished meeting folder in place: each CAF track becomes 24-bit
@@ -297,6 +298,102 @@ enum MeetingStorage {
         name.wholeMatch(of: #/[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}-[0-9]{2}-[0-9]{2} Meeting(-[0-9]+)?/#) != nil
     }
 
+    /// The track names a stop writes; a folder without `metadata.json` (a
+    /// recording cut off by a crash) is known by them.
+    static let defaultTrackNames: Set<String> = ["system.caf", "microphone.caf", "system.m4a", "microphone.m4a"]
+
+    /// The meetings directly in `root`, for Storage and the window alike, so
+    /// both count the same: a folder named as `RecordingsStore.createSession`
+    /// names it, with `metadata.json` or a track in it. A recording cut off
+    /// before its stop has no metadata and is still a meeting; nothing here
+    /// says whether it is finished. No root yet is no meetings; a root that
+    /// cannot be reached or listed throws, as that is not the same as empty. A folder of
+    /// a meeting's name that cannot be read is kept: it may be one, and
+    /// leaving it out would pass for its loss.
+    static func meetingFolders(in root: URL) throws -> [URL] {
+        let fileManager = FileManager.default
+        // Read strictly: only a root proven absent is none; one behind a
+        // parent that can't be passed is unknown, not empty.
+        var info = stat()
+        if stat(root.path, &info) != 0 {
+            let code = errno
+            guard code == ENOENT || code == ENOTDIR else {
+                throw NSError(domain: NSPOSIXErrorDomain, code: Int(code), userInfo: [NSFilePathErrorKey: root.path])
+            }
+            return []
+        }
+        return try fileManager.contentsOfDirectory(
+            at: root, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles]
+        ).filter { child in
+            guard isMeetingFolderName(child.lastPathComponent) else { return false }
+            guard let isDirectory = try? child.resourceValues(forKeys: [.isDirectoryKey]).isDirectory else { return true }
+            guard isDirectory else { return false }
+            guard let names = try? fileManager.contentsOfDirectory(atPath: child.path) else { return true }
+            return names.contains("metadata.json") || !Set(names).isDisjoint(with: defaultTrackNames)
+        }
+    }
+
+    /// `transcript.md` is 1, `transcript N.md` is N; nil for any other name.
+    static func transcriptNumber(_ name: String) -> Int? {
+        if name == "transcript.md" { return 1 }
+        guard name.hasPrefix("transcript "), name.hasSuffix(".md"),
+              let number = Int(name.dropFirst("transcript ".count).dropLast(".md".count)), number > 1 else { return nil }
+        return number
+    }
+
+    /// Whether a file in a meeting's folder is one of the app's own: the
+    /// metadata, the marks, the tracks it names or writes by default with
+    /// their CAF/m4a pairs, the transcripts and their attempt records, and
+    /// what a killed step leaves. Everything else is someone else's: notes
+    /// the user put there, which the window shows and nothing removes.
+    /// `tracks` are the names `metadata.json` lists.
+    static func isOwnFile(_ name: String, tracks: [String]) -> Bool {
+        if ["metadata.json", "murmurly.json"].contains(name) || defaultTrackNames.contains(name) { return true }
+        let stems = Set(tracks.map { ($0 as NSString).deletingPathExtension })
+        let stem = (name as NSString).deletingPathExtension
+        if stems.contains(stem), name.lowercased().hasSuffix(".caf") || name.lowercased().hasSuffix(".m4a") { return true }
+        if transcriptNumber(name) != nil || MeetingAttempt.number(inName: name) != nil { return true }
+        if name.hasPrefix(MeetingTranscriber.temporaryPrefix), name.hasSuffix(MeetingTranscriber.temporarySuffix) { return true }
+        return name.hasPrefix(".") && name.hasSuffix(partialSuffix)
+    }
+
+    /// Finder's and other volumes' own bookkeeping: neither ours nor the user's.
+    static func isSystemFile(_ name: String) -> Bool {
+        name == ".DS_Store" || name.hasPrefix("._") || name == "Icon\r"
+    }
+
+    /// The bytes under `folder`, for a meeting's row and Storage alike: every
+    /// regular file, hidden ones included (an attempt record, a copy a
+    /// killed move left), links not followed. `complete` is false when
+    /// anything could not be listed or measured, the folder itself included:
+    /// the bytes are then only what was counted, a part that must not pass
+    /// for the whole where a size is a fact about one meeting.
+    static func folderSize(of folder: URL) -> (bytes: Int64, complete: Bool) {
+        let keys: [URLResourceKey] = [.isRegularFileKey, .fileSizeKey]
+        var complete = true
+        guard let enumerator = FileManager.default.enumerator(
+            at: folder, includingPropertiesForKeys: keys, options: [],
+            errorHandler: { _, _ in
+                complete = false
+                return true
+            }
+        ) else { return (0, false) }
+        var total: Int64 = 0
+        for case let file as URL in enumerator {
+            guard let values = try? file.resourceValues(forKeys: Set(keys)) else {
+                complete = false
+                continue
+            }
+            guard values.isRegularFile == true else { continue }
+            guard let bytes = values.fileSize else {
+                complete = false
+                continue
+            }
+            total += Int64(bytes)
+        }
+        return (total, complete)
+    }
+
     /// `.<meeting>.removing`: a local folder a killed move was taking away.
     /// Only this exact form is ours; any other hidden name stays.
     static func isOwnRemovingName(_ name: String) -> Bool {
@@ -543,5 +640,832 @@ enum MeetingStorage {
         } catch {
             AppLog.error("meeting-storage", "could not remove \(what) \(url.path): \(error.localizedDescription)")
         }
+    }
+}
+
+// MARK: - A folder's identity
+
+/// A folder as the disk knows it: its volume and its file number, whatever
+/// path reaches it. Two spellings of one folder (a link in a parent path, a
+/// meetings folder that has since become a folder outside both roots) are one
+/// folder; a copy of it is another. Read with the folder, off the main actor
+/// for anything that may be on a network volume. Nil when it cannot be read,
+/// or when the path ends in a link rather than the folder itself: nothing is
+/// written or removed through one.
+struct FolderIdentity: Hashable, Sendable {
+    let device: Int32
+    let inode: UInt64
+
+    static func of(_ folder: URL) -> FolderIdentity? {
+        var info = stat()
+        guard lstat(folder.path, &info) == 0, info.st_mode & S_IFMT == S_IFDIR else { return nil }
+        return FolderIdentity(device: info.st_dev, inode: info.st_ino)
+    }
+
+    /// What a setting's path leads to, its own last link followed: for
+    /// telling whether a folder is that one, never for writing or deleting.
+    enum Reach: Equatable, Sendable {
+        case folder(FolderIdentity)
+        /// Nothing there, or something that is not a folder.
+        case none
+        /// It could not be told: never taken for "none".
+        case unknown(String)
+    }
+
+    static func reach(_ folder: URL) -> Reach {
+        var info = stat()
+        guard stat(folder.path, &info) == 0 else {
+            let code = errno
+            return code == ENOENT || code == ENOTDIR ? .none : .unknown(String(cString: strerror(code)))
+        }
+        guard info.st_mode & S_IFMT == S_IFDIR else { return .none }
+        return .folder(FolderIdentity(device: info.st_dev, inode: info.st_ino))
+    }
+}
+
+// MARK: - What may be removed, read strictly
+
+/// What deletes is read strictly: a name a file may have in the meeting's
+/// folder and nothing else, every object by `lstat` (a link is never
+/// followed), and an error is "unknown", never "not there". The window reads
+/// loosely; only what is read here is ever deleted.
+extension MeetingStorage {
+    /// A folder's address as the disk knows it: the folder itself, when it
+    /// is there, and its path with links resolved in its parent. Two
+    /// addresses are one folder when either matches: a destination not made
+    /// yet is known by its path. Off the main actor for anything that may be
+    /// on a network volume.
+    struct Address: Equatable, Sendable {
+        let identity: FolderIdentity?
+        let path: String
+
+        func isSameFolder(as other: Address) -> Bool {
+            (identity != nil && identity == other.identity) || path == other.path
+        }
+    }
+
+    /// `identity` nil means proven absent. Nil when anything is unknown:
+    /// the parent cannot be resolved, or the path holds a link, a file, or
+    /// cannot be read; an error is never taken for absence.
+    static func address(of folder: URL) -> Address? {
+        guard let parent = realpath(folder.deletingLastPathComponent().path, nil) else { return nil }
+        defer { free(parent) }
+        let path = String(cString: parent) + "/" + folder.lastPathComponent
+        var info = stat()
+        guard lstat(folder.path, &info) == 0 else {
+            return errno == ENOENT ? Address(identity: nil, path: path) : nil
+        }
+        guard info.st_mode & S_IFMT == S_IFDIR else { return nil }
+        return Address(identity: FolderIdentity(device: info.st_dev, inode: info.st_ino), path: path)
+    }
+
+    /// One file as `lstat` finds it: its name in the folder, the file itself
+    /// and its size.
+    struct FileFact: Equatable, Sendable {
+        let name: String
+        let device: Int32
+        let inode: UInt64
+        let bytes: Int64
+    }
+
+    enum Entry: Equatable, Sendable {
+        case file(FileFact)
+        case absent
+        /// A link, a folder, anything but a file, or an error: never taken
+        /// for a file nor for nothing.
+        case unknown(String)
+    }
+
+    static func entry(_ name: String, in folder: URL) -> Entry {
+        var info = stat()
+        guard lstat(folder.appendingPathComponent(name).path, &info) == 0 else {
+            let code = errno
+            return code == ENOENT
+                ? .absent : .unknown(String(localized: "“\(name)” can’t be read: \(String(cString: strerror(code)))"))
+        }
+        guard info.st_mode & S_IFMT == S_IFREG else {
+            return .unknown(String(localized: "“\(name)” is not a plain file"))
+        }
+        return .file(FileFact(name: name, device: info.st_dev, inode: info.st_ino, bytes: Int64(info.st_size)))
+    }
+
+    /// A name `metadata.json` may give a track: a file directly in the
+    /// meeting's folder. `../../notes.caf` is not the local `notes.caf`.
+    static func isPlainTrackName(_ name: String) -> Bool {
+        let lower = name.lowercased()
+        return !name.isEmpty && name != "." && name != ".." && !name.contains("/")
+            && (name as NSString).lastPathComponent == name && (lower.hasSuffix(".caf") || lower.hasSuffix(".m4a"))
+    }
+
+    /// A meeting's audio: the tracks `metadata.json` names (the default ones
+    /// without it), each with its CAF/m4a pair and what a killed compression
+    /// leaves.
+    enum Audio: Equatable, Sendable {
+        /// `missing`: the tracks with neither a CAF nor an m4a left.
+        case known(files: [FileFact], missing: [String])
+        case unknown(String)
+
+        var files: [FileFact]? {
+            if case .known(let files, _) = self { files } else { nil }
+        }
+
+        var bytes: Int64? { files.map { $0.reduce(0) { $0 + $1.bytes } } }
+    }
+
+    /// The tracks `metadata.json` names, system first: plain names in the
+    /// folder itself, or the default ones where it names none, or without
+    /// it unless `requiringMetadata`.
+    private static func trackNames(in folder: URL, requiringMetadata: Bool) -> Swift.Result<[String], ReadFailure> {
+        var tracks: [String] = []
+        switch entry("metadata.json", in: folder) {
+        case .absent:
+            guard !requiringMetadata else { return .failure(ReadFailure(String(localized: "metadata.json is gone"))) }
+            tracks = ["system.caf", "microphone.caf"]
+        case .unknown(let reason):
+            return .failure(ReadFailure(reason))
+        case .file:
+            guard let data = try? Data(contentsOf: folder.appendingPathComponent("metadata.json")),
+                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                return .failure(ReadFailure(String(localized: "metadata.json can’t be read")))
+            }
+            // The tracks as the app writes them, or none named: anything else
+            // is not taken for the default tracks.
+            let segments = object["segments"]
+            guard segments == nil || segments is [[String: Any]] else {
+                return .failure(ReadFailure(String(localized: "metadata.json can’t be read")))
+            }
+            let segment = (segments as? [[String: Any]])?.first
+            for (key, fallback) in [("system", "system.caf"), ("mic", "microphone.caf")] {
+                guard let value = segment?[key] else {
+                    tracks.append(fallback)
+                    continue
+                }
+                guard let name = value as? String, isPlainTrackName(name) else {
+                    return .failure(ReadFailure(String(localized: "metadata.json names a track outside the meeting’s folder")))
+                }
+                tracks.append(name)
+            }
+        }
+        return .success(tracks)
+    }
+
+    struct ReadFailure: Error {
+        let reason: String
+        init(_ reason: String) { self.reason = reason }
+    }
+
+    /// `requiringMetadata`: a recording without `metadata.json` (one that
+    /// broke off) is unknown, as a deletion of its audio needs it.
+    static func audio(in folder: URL, requiringMetadata: Bool = false) -> Audio {
+        let tracks: [String]
+        switch trackNames(in: folder, requiringMetadata: requiringMetadata) {
+        case .success(let names): tracks = names
+        case .failure(let failure): return .unknown(failure.reason)
+        }
+        var files: [FileFact] = []
+        var missing: [String] = []
+        for track in tracks {
+            let stem = (track as NSString).deletingPathExtension
+            var there = false
+            for name in [stem + ".caf", stem + ".m4a", "." + stem + partialSuffix] {
+                switch entry(name, in: folder) {
+                case .file(let fact):
+                    if !files.contains(fact) { files.append(fact) }
+                    if !name.hasPrefix(".") { there = true }
+                case .absent:
+                    continue
+                case .unknown(let reason):
+                    return .unknown(reason)
+                }
+            }
+            if !there { missing.append(track) }
+        }
+        return .known(files: files, missing: missing)
+    }
+
+    /// What the player plays: per track, its file as the folder holds it now,
+    /// the m4a once compression put it there (it takes its name only after
+    /// it was checked), else the CAF; a killed compression's leftover never.
+    enum Playback: Equatable, Sendable {
+        /// File names in the folder; empty when no track is left.
+        case tracks([MeetingAttempt.Source: String])
+        case unknown(String)
+    }
+
+    static func playback(in folder: URL) -> Playback {
+        let names: [String]
+        switch trackNames(in: folder, requiringMetadata: false) {
+        case .success(let tracks): names = tracks
+        case .failure(let failure): return .unknown(failure.reason)
+        }
+        var tracks: [MeetingAttempt.Source: String] = [:]
+        for (source, track) in zip([MeetingAttempt.Source.system, .microphone], names) {
+            let stem = (track as NSString).deletingPathExtension
+            for name in [stem + ".m4a", stem + ".caf"] {
+                switch entry(name, in: folder) {
+                case .file: tracks[source] = name
+                case .absent: continue
+                case .unknown(let reason): return .unknown(reason)
+                }
+                break
+            }
+        }
+        return .tracks(tracks)
+    }
+
+    /// Everything at the top of a meeting's folder, for deleting it whole:
+    /// files only. Finder's and volumes' own files may change, come or go
+    /// (Finder rewrites `.DS_Store` while the folder is open), being files.
+    struct Manifest: Equatable, Sendable {
+        let folder: FolderIdentity
+        let files: [FileFact]
+
+        func matches(_ now: Manifest) -> Bool {
+            folder == now.folder && Self.own(files) == Self.own(now.files)
+        }
+
+        private static func own(_ files: [FileFact]) -> [FileFact] {
+            files.filter { !MeetingStorage.isSystemFile($0.name) }.sorted { $0.name < $1.name }
+        }
+    }
+
+    enum ManifestRead: Equatable, Sendable {
+        case read(Manifest)
+        /// A folder or a link inside, or anything unreadable: not deleted by
+        /// the app, the reason says where to do it.
+        case refused(String)
+    }
+
+    static func manifest(of folder: URL) -> ManifestRead {
+        guard let identity = FolderIdentity.of(folder) else {
+            return .refused(String(localized: "The meeting folder can’t be read."))
+        }
+        let names: [String]
+        do {
+            names = try FileManager.default.contentsOfDirectory(atPath: folder.path)
+        } catch {
+            return .refused(String(localized: "The meeting folder can’t be read."))
+        }
+        var files: [FileFact] = []
+        for name in names.sorted() {
+            switch entry(name, in: folder) {
+            case .file(let fact): files.append(fact)
+            case .absent: continue
+            case .unknown(let reason):
+                return .refused(String(localized: "\(reason). Delete this meeting in Finder."))
+            }
+        }
+        return .read(Manifest(folder: identity, files: files))
+    }
+
+    // MARK: - The audio rule
+
+    /// Whether a meeting's audio may go by the rule, read strictly: the date
+    /// its first full transcription ended and the files; why it is kept; or
+    /// what could not be read to tell, which keeps it too, and leaves a
+    /// count of what the rule takes incomplete.
+    enum Retention: Equatable, Sendable {
+        case eligible(since: Date, files: [FileFact])
+        case kept(String)
+        case unknown(String)
+
+        /// Due once `days` have passed since `since`.
+        func due(days: Int, now: Date) -> [FileFact]? {
+            guard days > 0, case .eligible(let since, let files) = self,
+                  now >= since.addingTimeInterval(TimeInterval(days) * 86_400) else { return nil }
+            return files
+        }
+    }
+
+    /// A `complete` record that says what complete means: its transcript by
+    /// name and fingerprint, an end not before its start, no piece missed,
+    /// not cut short, no track missing.
+    static func isConsistentComplete(_ attempt: MeetingAttempt) -> Bool {
+        guard attempt.result == .complete, let transcript = attempt.transcript, transcriptNumber(transcript) != nil,
+              attempt.fingerprint != nil, let ended = attempt.endedAt, ended >= attempt.startedAt else { return false }
+        return attempt.failedChunks == 0 && !attempt.cutShort && attempt.missingTracks.isEmpty
+    }
+
+    /// The rule's facts. Anything not proven keeps the audio, with the
+    /// reason: a fact that disproves (not done, starred, not complete,
+    /// changed) or one that could not be read.
+    static func audioRetention(of folder: URL) -> Retention {
+        guard isMeetingFolderName(folder.lastPathComponent) else {
+            return .kept(String(localized: "This is not a meeting’s folder."))
+        }
+        guard FolderIdentity.of(folder) != nil else { return .unknown(String(localized: "The meeting folder can’t be read.")) }
+        switch entry("metadata.json", in: folder) {
+        case .absent: return .kept(String(localized: "The recording broke off before it was saved."))
+        case .unknown(let reason): return .unknown(reason)
+        case .file:
+            guard let data = try? Data(contentsOf: folder.appendingPathComponent("metadata.json")),
+                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                return .unknown(String(localized: "metadata.json can’t be read"))
+            }
+            guard object["state"] as? String == "done" else {
+                return .kept(String(localized: "The recording was saved with a warning."))
+            }
+        }
+        switch entry(MeetingMarks.fileName, in: folder) {
+        case .absent: break
+        case .unknown(let reason): return .unknown(reason)
+        case .file:
+            switch MeetingMarks.read(in: folder) {
+            case .read(let marks) where marks.starred: return .kept(String(localized: "The meeting is starred."))
+            case .read, .none: break
+            case .unreadable(let reason): return .unknown(MeetingMarks.Refusal.unreadable(reason).localizedDescription)
+            case .newer(let version): return .unknown(MeetingMarks.Refusal.newer(version: version).localizedDescription)
+            }
+        }
+        let names: [String]
+        do {
+            names = try FileManager.default.contentsOfDirectory(atPath: folder.path)
+        } catch {
+            return .unknown(String(localized: "The meeting folder can’t be read."))
+        }
+        let recordNames = names.filter { MeetingAttempt.number(inName: $0) != nil }
+        let numbers = recordNames.compactMap(MeetingAttempt.number(inName:))
+        guard !numbers.isEmpty else { return .kept(String(localized: "No record of a full transcription.")) }
+        guard Set(numbers).count == numbers.count else {
+            return .kept(String(localized: "Two records claim one transcription number."))
+        }
+        for name in recordNames {
+            guard case .file = entry(name, in: folder) else {
+                return .unknown(String(localized: "A transcription record can’t be read."))
+            }
+        }
+        guard let entries = try? MeetingAttempt.entries(in: folder), entries.allSatisfy({ $0.attempt != nil }) else {
+            return .unknown(String(localized: "A transcription record can’t be read."))
+        }
+        let attempts = entries.compactMap(\.attempt)
+        guard let last = attempts.last, last.result == .complete else {
+            return .kept(String(localized: "The last transcription is not complete."))
+        }
+        guard isConsistentComplete(last),
+              let first = attempts.first(where: { $0.result == .complete }), isConsistentComplete(first),
+              let since = first.endedAt, let transcript = last.transcript, let fingerprint = last.fingerprint else {
+            return .kept(String(localized: "A record of a full transcription contradicts itself."))
+        }
+        let changed = String(localized: "The transcript was changed or is missing.")
+        switch entry(transcript, in: folder) {
+        case .absent: return .kept(changed)
+        case .unknown(let reason): return .unknown(reason)
+        case .file(let file) where file.bytes != Int64(fingerprint.bytes): return .kept(changed)
+        case .file: break
+        }
+        let bytes: Data
+        do {
+            bytes = try Data(contentsOf: folder.appendingPathComponent(transcript))
+        } catch {
+            return .unknown(error.localizedDescription)
+        }
+        guard SHA256.hash(data: bytes).map({ String(format: "%02x", $0) }).joined() == fingerprint.sha256 else {
+            return .kept(changed)
+        }
+        switch audio(in: folder) {
+        case .unknown(let reason): return .unknown(reason)
+        case .known(let files, _) where files.isEmpty: return .kept(String(localized: "The meeting has no audio."))
+        case .known(let files, _): return .eligible(since: since, files: files)
+        }
+    }
+
+    // MARK: - Removal
+
+    /// The only way the app deletes a meeting's files: to the Trash by hand,
+    /// for good by the audio rule. Every call is made through `perform`,
+    /// which checks, right before it, the folder and the file (or the whole
+    /// folder's manifest) against what was confirmed, and then, after its
+    /// last read of the disk, whether the call is still wanted. In a test
+    /// process the disk's own calls are never made unless a test gives its
+    /// own; there is no way round.
+    struct Removal: Sendable {
+        enum Failure: LocalizedError, Equatable {
+            /// The volume has no Trash.
+            case noTrash
+            /// The folder or the file is not what was confirmed.
+            case changed(String)
+            /// The reason it was asked for is gone (the rule or the folder changed).
+            case stale(String)
+            case failed(String)
+
+            var errorDescription: String? {
+                switch self {
+                case .noTrash: String(localized: "This disk has no Trash — delete the folder in Finder.")
+                case .changed(let detail): String(localized: "Changed since it was confirmed: \(detail)")
+                case .stale(let reason), .failed(let reason): reason
+                }
+            }
+        }
+
+        enum Target: Sendable {
+            case file(FileFact)
+            case folder(Manifest)
+        }
+
+        var trash: @Sendable (URL) throws -> Void
+        var remove: @Sendable (URL) throws -> Void
+        /// Right before `perform` reads the disk: tests hold a call there.
+        var beforeCheck: @Sendable (URL) -> Void = { _ in }
+
+        /// `target` in `folder` (the folder itself for `.folder`), to the
+        /// Trash or for good. `stillWanted` runs after the last read of the
+        /// disk, right before the call: a reason returned refuses it.
+        func perform(
+            _ target: Target,
+            in folder: URL,
+            folderIdentity: FolderIdentity,
+            forGood: Bool,
+            stillWanted: @Sendable () -> String? = { nil }
+        ) -> Swift.Result<URL, Failure> {
+            let url: URL
+            beforeCheck(folder)
+            guard FolderIdentity.of(folder) == folderIdentity else {
+                return .failure(.changed(String(localized: "the meeting’s folder")))
+            }
+            switch target {
+            case .file(let fact):
+                url = folder.appendingPathComponent(fact.name)
+                guard MeetingStorage.entry(fact.name, in: folder) == .file(fact) else { return .failure(.changed(fact.name)) }
+            case .folder(let manifest):
+                url = folder
+                guard case .read(let now) = MeetingStorage.manifest(of: folder), manifest.matches(now) else {
+                    return .failure(.changed(String(localized: "what the meeting’s folder holds")))
+                }
+            }
+            if let reason = stillWanted() { return .failure(.stale(reason)) }
+            do {
+                try (forGood ? remove : trash)(url)
+                return .success(url)
+            } catch CocoaError.featureUnsupported {
+                return .failure(.noTrash)
+            } catch let failure as Failure {
+                return .failure(failure)
+            } catch {
+                return .failure(.failed(error.localizedDescription))
+            }
+        }
+
+        /// The disk's own calls, outside tests; in a DEBUG UI test, the probe
+        /// it asked for (`-RemovalProbeTrash`); in any other test process, a
+        /// refusal.
+        static let live = backend(
+            arguments: ProcessInfo.processInfo.arguments,
+            testProcess: TestIsolation.isTestProcess,
+            appMeetingsRoot: RecordingsStore.ownersMeetingsRoot()
+        )
+
+        /// The probe works only inside the root the UI test seeded, named by
+        /// its own argument; without one it refuses, whatever else the
+        /// process was told (the stage gate's opt-out included), and it never
+        /// reaches `appMeetingsRoot`, the owner's meetings (never the root a
+        /// test moved the app to), even when the seeded root is that very
+        /// folder, inside it or around it.
+        static func backend(arguments: [String], testProcess: Bool, appMeetingsRoot: URL) -> Removal {
+            #if DEBUG
+            if let index = arguments.firstIndex(of: "-RemovalProbeTrash"), index + 1 < arguments.count {
+                guard let seeded = arguments.firstIndex(of: "-MeetingsProbeRoot"), seeded + 1 < arguments.count else {
+                    return refusing
+                }
+                let root = URL(fileURLWithPath: arguments[seeded + 1], isDirectory: true)
+                let app = appMeetingsRoot.resolvingSymlinksInPath().standardizedFileURL.path + "/"
+                let own = root.resolvingSymlinksInPath().standardizedFileURL.path + "/"
+                guard !own.hasPrefix(app), !app.hasPrefix(own) else { return refusing }
+                return confined(to: [root], trash: URL(fileURLWithPath: arguments[index + 1], isDirectory: true))
+            }
+            #endif
+            guard !testProcess else { return refusing }
+            return Removal(
+                trash: { try FileManager.default.trashItem(at: $0, resultingItemURL: nil) },
+                remove: { try FileManager.default.removeItem(at: $0) }
+            )
+        }
+
+        static let refusing = Removal(
+            trash: { _ in throw Failure.failed(String(localized: "Nothing is deleted in a test process without a test Trash.")) },
+            remove: { _ in throw Failure.failed(String(localized: "Nothing is deleted in a test process without a test Trash.")) }
+        )
+
+        /// A test's own: its Trash is a folder of its own, and nothing outside
+        /// `roots` (links resolved) is ever touched.
+        static func confined(to roots: [URL], trash: URL) -> Removal {
+            let allowed = roots.map { $0.resolvingSymlinksInPath().standardizedFileURL.path + "/" }
+            let inside: @Sendable (URL) throws -> Void = { url in
+                let path = url.deletingLastPathComponent().resolvingSymlinksInPath().standardizedFileURL.path + "/"
+                guard allowed.contains(where: { path.hasPrefix($0) }) else {
+                    throw Failure.failed(String(localized: "Nothing is deleted in a test process without a test Trash."))
+                }
+            }
+            return Removal(
+                trash: { url in
+                    try inside(url)
+                    let place = trash.appendingPathComponent(UUID().uuidString, isDirectory: true)
+                    try FileManager.default.createDirectory(at: place, withIntermediateDirectories: true)
+                    try FileManager.default.moveItem(at: url, to: place.appendingPathComponent(url.lastPathComponent))
+                },
+                remove: { url in
+                    try inside(url)
+                    try FileManager.default.removeItem(at: url)
+                }
+            )
+        }
+    }
+}
+
+// MARK: - Attempt records
+
+/// What became of one transcription attempt of a meeting, kept in the
+/// meeting's folder so it outlives the run: whether the transcript it wrote
+/// covers the whole meeting, and with which engine, languages and lines.
+/// Written by the queue alone, in its job, only to a folder `Folder.inspect`
+/// accepted: in progress before the work starts, its result after. A record
+/// still in progress is an attempt that never ended (the app was killed, or
+/// the result could not be written); no record at all is an attempt from
+/// before records existed. Neither proves anything.
+///
+/// The order of attempts is their number, in the file's name, so even a
+/// record that cannot be read keeps its place; never the clock, which two
+/// attempts in one second share.
+struct MeetingAttempt: Codable, Sendable, Equatable {
+    static let formatVersion = 1
+    static let namePrefix = ".attempt "
+    static let nameSuffix = ".murmurly.json"
+
+    enum Result: String, Codable, Sendable {
+        case inProgress, complete, incomplete, noSpeech, failed
+    }
+
+    /// Which track a line came from: what the transcript's labels mean.
+    enum Source: String, Codable, Sendable {
+        case microphone, system
+    }
+
+    /// One transcript line's exact span; the n-th line of the record is the
+    /// n-th line of its transcript while the fingerprint matches.
+    struct Line: Codable, Sendable, Equatable {
+        var start: Double
+        var end: Double
+        var source: Source
+    }
+
+    struct Fingerprint: Codable, Sendable, Equatable {
+        var bytes: Int
+        var sha256: String
+    }
+
+    /// The labels written for each track, in the interface language of that run.
+    struct Speakers: Codable, Sendable, Equatable {
+        var microphone: String
+        var system: String
+    }
+
+    var version = MeetingAttempt.formatVersion
+    var number: Int
+    var result = Result.inProgress
+    var startedAt: Date
+    var endedAt: Date?
+    /// The transcript's file name in the folder.
+    var transcript: String?
+    /// `DictationEngine` raw values.
+    var engines: [String] = []
+    var languages: [String] = []
+    var failedChunks = 0
+    var cutShort = false
+    var missingTracks: [Source] = []
+    /// Why it failed, as shown; nothing decides by it.
+    var reason: String?
+    var speakers: Speakers?
+    var lines: [Line] = []
+    var fingerprint: Fingerprint?
+
+    /// One record file as found: its number from the name, and what it holds
+    /// unless it cannot be read or is of a version this app does not know.
+    struct Entry: Sendable, Equatable {
+        let name: String
+        let number: Int
+        let attempt: MeetingAttempt?
+    }
+
+    static func fileName(number: Int) -> String {
+        namePrefix + String(format: "%04d", number) + " " + UUID().uuidString + nameSuffix
+    }
+
+    /// `.attempt <number> <UUID>.murmurly.json`; nil for any other name.
+    static func number(inName name: String) -> Int? {
+        guard name.hasPrefix(namePrefix), name.hasSuffix(nameSuffix) else { return nil }
+        let middle = name.dropFirst(namePrefix.count).dropLast(nameSuffix.count).split(separator: " ")
+        guard middle.count == 2, let number = Int(middle[0]), number > 0,
+              UUID(uuidString: String(middle[1])) != nil else { return nil }
+        return number
+    }
+
+    /// Every record in the folder, oldest first by number.
+    static func entries(in folder: URL) throws -> [Entry] {
+        try FileManager.default.contentsOfDirectory(atPath: folder.path).compactMap { name in
+            guard let number = number(inName: name) else { return nil }
+            return Entry(name: name, number: number, attempt: read(folder.appendingPathComponent(name)))
+        }.sorted { $0.number < $1.number }
+    }
+
+    /// Creates the record of a new attempt, numbered after every record the
+    /// folder holds, readable or not. Throws when it cannot be written: the
+    /// attempt does not start then, or a later failure could leave no trace.
+    static func begin(in folder: URL, at date: Date = Date()) throws -> (url: URL, attempt: MeetingAttempt) {
+        let last = try FileManager.default.contentsOfDirectory(atPath: folder.path).compactMap(number(inName:)).max() ?? 0
+        let attempt = MeetingAttempt(number: last + 1, startedAt: date)
+        let url = folder.appendingPathComponent(fileName(number: attempt.number))
+        try attempt.write(to: url)
+        return (url, attempt)
+    }
+
+    /// Atomically: a killed write leaves the previous state of the record.
+    func write(to url: URL) throws {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        encoder.dateEncodingStrategy = .iso8601
+        try encoder.encode(self).write(to: url, options: .atomic)
+    }
+
+    private static func read(_ url: URL) -> MeetingAttempt? {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        guard let data = try? Data(contentsOf: url),
+              let attempt = try? decoder.decode(MeetingAttempt.self, from: data),
+              attempt.version == formatVersion else { return nil }
+        return attempt
+    }
+}
+
+// MARK: - The user's marks
+
+/// The user's own name for a meeting, its star and the names of its
+/// speakers, in the meeting's folder as `murmurly.json` (never translated),
+/// so they go wherever the meeting goes.
+/// Written by the window alone. Read loosely and written over the file as it
+/// is then, so every other key, a later version's or anyone's, survives; a
+/// file this app cannot read, or one of a later version, is never written
+/// over: its marks cannot be changed until it can be read.
+struct MeetingMarks: Sendable, Equatable {
+    static let fileName = "murmurly.json"
+    static let formatVersion = 1
+
+    var title: String?
+    var starred = false
+    /// Who speaks on each track, shown instead of the transcript's labels:
+    /// the file's lines say which track each one came from. In `speakers`,
+    /// `{"microphone": …, "system": …}`; the transcripts are never changed.
+    var speakers: [MeetingAttempt.Source: String] = [:]
+
+    /// What the user changed. A field set replaces the file's; a field left
+    /// nil stays as the file has it. `title` set to `.some(nil)` takes the
+    /// user's name out: the date shows again. A speaker's name set to nil
+    /// takes it out: the transcript's label shows again.
+    struct Change: Sendable, Equatable {
+        var title: String?? = nil
+        var starred: Bool? = nil
+        /// Only the tracks named here change. Set with `updateValue`: a
+        /// subscript assignment of a literal nil would drop the change itself.
+        var speakers: [MeetingAttempt.Source: String?] = [:]
+
+        var isEmpty: Bool { title == nil && starred == nil && speakers.isEmpty }
+
+        func applied(to marks: MeetingMarks) -> MeetingMarks {
+            var marks = marks
+            if let title { marks.title = title }
+            if let starred { marks.starred = starred }
+            for (source, name) in speakers { marks.speakers[source] = name }
+            return marks
+        }
+
+        /// A later change over this one: the fields it sets win.
+        mutating func add(_ later: Change) {
+            if let title = later.title { self.title = title }
+            if let starred = later.starred { self.starred = starred }
+            for (source, name) in later.speakers { speakers.updateValue(name, forKey: source) }
+        }
+    }
+
+    /// What a meeting's folder holds.
+    enum State: Sendable, Equatable {
+        case none
+        case read(MeetingMarks)
+        case unreadable(String)
+        /// Written by a later Murmurly: never written over.
+        case newer(version: Int)
+
+        var marks: MeetingMarks? {
+            switch self {
+            case .none: MeetingMarks()
+            case .read(let marks): marks
+            case .unreadable, .newer: nil
+            }
+        }
+    }
+
+    enum Refusal: LocalizedError, Equatable {
+        case unreadable(String)
+        case newer(version: Int)
+        /// The folder at the address is not the one the change was made for.
+        case replaced
+
+        var errorDescription: String? {
+            switch self {
+            case .unreadable(let reason):
+                String(localized: "murmurly.json in the meeting’s folder can’t be read (\(reason)); it is left as it is")
+            case .newer:
+                String(localized: "murmurly.json in the meeting’s folder was written by a newer Murmurly; it is left as it is")
+            case .replaced:
+                String(localized: "The meeting’s folder at this address is gone or is another one now; nothing was written.")
+            }
+        }
+    }
+
+    static func read(in folder: URL) -> State {
+        let url = folder.appendingPathComponent(fileName)
+        guard FileManager.default.fileExists(atPath: url.path) else { return .none }
+        let object: [String: Any]
+        do {
+            guard let dictionary = try JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any] else {
+                return .unreadable(String(localized: "not a JSON object"))
+            }
+            object = dictionary
+        } catch {
+            return .unreadable(error.localizedDescription)
+        }
+        switch parse(object) {
+        case .success(let marks): return .read(marks)
+        case .failure(.newer(let version)): return .newer(version: version)
+        case .failure(.unreadable(let reason)): return .unreadable(reason)
+        case .failure(let refusal): return .unreadable(refusal.localizedDescription)
+        }
+    }
+
+    /// This version's keys from the file's object; the rest is kept on write.
+    private static func parse(_ object: [String: Any]) -> Result<MeetingMarks, Refusal> {
+        guard let version = object["version"] as? Int else { return .failure(.unreadable(String(localized: "no version"))) }
+        guard version <= formatVersion else { return .failure(.newer(version: version)) }
+        guard version == formatVersion else { return .failure(.unreadable(String(localized: "version \(version)"))) }
+        let title = object["title"]
+        let starred = object["starred"]
+        guard title == nil || title is String, starred == nil || starred is Bool else {
+            return .failure(.unreadable(String(localized: "a mark of another kind")))
+        }
+        // Only this version's names are read; any other key in it is kept.
+        var speakers: [MeetingAttempt.Source: String] = [:]
+        if let names = object["speakers"] {
+            guard let names = names as? [String: Any] else { return .failure(.unreadable(String(localized: "a mark of another kind"))) }
+            for source in [MeetingAttempt.Source.microphone, .system] {
+                guard let name = names[source.rawValue] else { continue }
+                guard let name = name as? String else { return .failure(.unreadable(String(localized: "a mark of another kind"))) }
+                speakers[source] = name
+            }
+        }
+        return .success(MeetingMarks(title: title as? String, starred: starred as? Bool ?? false, speakers: speakers))
+    }
+
+    /// Reads the file once, checks it, lays the change over that very object
+    /// and writes it atomically, so every other key survives and nothing read
+    /// later stands in for what was checked. Returns the marks now on disk.
+    /// Nothing is written when the folder at the address is not `identity`
+    /// (another folder, or a link), when the file cannot be read, is not this
+    /// version's or is a later one's; only a file that is not there is new.
+    /// `read` stands in for the disk in tests.
+    @discardableResult
+    static func write(
+        _ change: Change,
+        in folder: URL,
+        expecting identity: FolderIdentity?,
+        read: (URL) throws -> Data = { try Data(contentsOf: $0) }
+    ) throws -> MeetingMarks {
+        guard let identity, FolderIdentity.of(folder) == identity else { throw Refusal.replaced }
+        let url = folder.appendingPathComponent(fileName)
+        var object: [String: Any] = [:]
+        let data: Data?
+        do {
+            data = try read(url)
+        } catch CocoaError.fileReadNoSuchFile {
+            data = nil
+        }
+        if let data {
+            guard let dictionary = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                throw Refusal.unreadable(String(localized: "not a JSON object"))
+            }
+            if case .failure(let refusal) = parse(dictionary) { throw refusal }
+            object = dictionary
+        }
+        object["version"] = formatVersion
+        if let title = change.title { object["title"] = title }
+        if let starred = change.starred { object["starred"] = starred }
+        if !change.speakers.isEmpty {
+            // The object read, changed in place: a key of a later version in it stays.
+            var names = object["speakers"] as? [String: Any] ?? [:]
+            for (source, name) in change.speakers {
+                if let name { names[source.rawValue] = name } else { names.removeValue(forKey: source.rawValue) }
+            }
+            if names.isEmpty { object.removeValue(forKey: "speakers") } else { object["speakers"] = names }
+        }
+        guard case .success(let marks) = parse(object) else { throw Refusal.unreadable(String(localized: "a mark of another kind")) }
+        let written = try JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys])
+        try written.write(to: url, options: .atomic)
+        return marks
     }
 }

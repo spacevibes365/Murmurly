@@ -17,9 +17,8 @@ private final class FileProbeSession {
     private var saves = 0
     private var openGates: Set<String> = []
 
-    /// `realPanels`: the real open and save panels, opening in the root,
-    /// instead of the probe's stand-in for the save panel.
-    init(realPanels: Bool = false) throws {
+    /// Every panel is the probe's: a test process never opens a real one.
+    init() throws {
         root = FileManager.default.temporaryDirectory
             .appendingPathComponent("file-probe-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -27,7 +26,6 @@ private final class FileProbeSession {
         // here so it is removed by an owned list, not a glob.
         print("FILE-PROBE-ROOT \(root.path)")
         app.launchArguments = ["-UITesting", "-UITestSettingsStore", "-FileProbeRoot", root.path]
-            + (realPanels ? ["-FileProbeRealPanels"] : [])
             + AppLanguage.launchArguments
         app.launch()
     }
@@ -39,33 +37,24 @@ private final class FileProbeSession {
         }
     }
 
-    /// Opens the settings window on the Files tab, whatever the tab shows.
+    /// Opens the main window on the Files section from the menu bar's
+    /// "Transcribe a File…", whatever the window shows.
     func openWindow() throws {
-        let statusItem = app.statusItems.firstMatch
-        guard statusItem.waitForExistence(timeout: 5) else {
-            throw ProbeTransportError(message: "the Murmurly item did not appear in the menu bar")
-        }
-        statusItem.click()
-        let menuItems = statusItem.menus.firstMatch.children(matching: .menuItem)
-        guard menuItems.count >= 3 else {
-            throw ProbeTransportError(message: "the Murmurly menu has too few items")
-        }
-        menuItems.element(boundBy: menuItems.count - 3).click()
-        guard app.settingsSidebarSearchIsEmpty() else {
-            throw ProbeTransportError(message: "the settings section search is not empty")
-        }
-        let files = app.buttons["settingsTab.files"]
-        guard files.waitForExistence(timeout: 5) else {
-            throw ProbeTransportError(message: "no Files tab")
-        }
-        files.click()
-        guard app.descendants(matching: .any)["settingsContent.files"].waitForExistence(timeout: 5) else {
-            throw ProbeTransportError(message: "the Files tab did not open")
+        guard app.transcribeAFileFromMenuBar() else {
+            throw ProbeTransportError(message: "the Files section did not open")
         }
     }
 
+    func closeSettings() throws {
+        try close(app.windows["settings"])
+    }
+
+    /// The window Files is in.
     func closeWindow() throws {
-        let window = app.windows.firstMatch
+        try close(app.windows["main"])
+    }
+
+    private func close(_ window: XCUIElement) throws {
         let close = window.buttons[XCUIIdentifierCloseWindow]
         guard close.waitForExistence(timeout: 5) else {
             throw ProbeTransportError(message: "the window has no close button")
@@ -129,10 +118,11 @@ private final class FileProbeSession {
         button.click()
     }
 
-    /// Runs the same file again behind a closed gate: the first run's gate and
-    /// start acknowledgement are removed, so this run waits and is seen to start.
+    /// Runs the same file again behind a closed gate: the first run's gate,
+    /// start and choice acknowledgements are removed, so this run waits and is
+    /// seen to start, and an old choice is never taken for its own.
     func restart(_ file: String) throws {
-        for name in ["run-\(file).release", "run-\(file).started"] {
+        for name in ["run-\(file).release", "run-\(file).started", "run-\(file).choice"] {
             try? FileManager.default.removeItem(at: root.appendingPathComponent(name))
         }
         try start(file)
@@ -140,6 +130,42 @@ private final class FileProbeSession {
 
     func waitRunStarted(_ file: String) throws {
         _ = try read("run-\(file).started")
+    }
+
+    /// What the run was started with, as the probe got it: `engine:code`,
+    /// or `as dictation`.
+    func runChoice(_ file: String) throws -> String {
+        try read("run-\(file).choice")
+    }
+
+    /// The tab's options menu: the choice it shows.
+    var choiceShown: String? {
+        app.descendants(matching: .any)["fileChoiceMenu"].value as? String
+    }
+
+    /// Picks from the tab's options menu as a person does: an item of an
+    /// engine's submenu, the engine found by the start of its name (one not
+    /// downloaded carries a note), or the top item when no engine is given.
+    func choose(_ item: String, engine: String? = nil) throws {
+        let menu = app.descendants(matching: .any)["fileChoiceMenu"]
+        guard menu.waitForExistence(timeout: 5), menu.isEnabled else {
+            throw ProbeTransportError(message: "the options menu is not available")
+        }
+        menu.click()
+        var scope: XCUIElement = app
+        if let engine {
+            let submenu = app.menuItems.matching(NSPredicate(format: "title BEGINSWITH %@", engine)).firstMatch
+            guard submenu.waitForExistence(timeout: 5) else {
+                throw ProbeTransportError(message: "the options menu has no “\(engine)”")
+            }
+            submenu.hover()
+            scope = submenu
+        }
+        let entry = scope.menuItems[item]
+        guard entry.waitForExistence(timeout: 5) else {
+            throw ProbeTransportError(message: "the options menu has no “\(item)”")
+        }
+        entry.click()
     }
 
     func releaseRun(_ file: String) throws {
@@ -211,18 +237,61 @@ private final class FileProbeSession {
         }
     }
 
-    /// The real save panel, which must come as a sheet on the window; answered
-    /// with Return or Escape, which work in any layout and language.
-    func answerSavePanel(save: Bool) throws {
-        let panel = app.sheets.containing(.textField, identifier: nil).firstMatch
-        guard panel.waitForExistence(timeout: 5) else {
-            throw ProbeTransportError(message: "no save panel sheet on the window")
+    /// The open panel's answer: the n-th Choose File… takes `file`.
+    func offerChoice(_ file: String, as number: Int) throws {
+        try Data(root.appendingPathComponent(file).path.utf8)
+            .write(to: root.appendingPathComponent("choose-file-\(number).txt"), options: .atomic)
+    }
+
+    /// Every panel from now on waits for its own `present-<n>.release`.
+    func holdPanels() throws {
+        try Data().write(to: root.appendingPathComponent("present.hold"), options: .atomic)
+    }
+
+    func waitPanelHeld(_ number: Int) throws {
+        _ = try read("present-\(number).holding")
+        openGates.insert("present-\(number).release")
+    }
+
+    func releasePanel(_ number: Int) throws {
+        try open("present-\(number).release")
+    }
+
+    /// The window the n-th panel went on, by its identifier, or "cancelled"
+    /// when that window was gone.
+    func panelWindow(_ number: Int) throws -> String {
+        let deadline = Date().addingTimeInterval(10)
+        while Date() < deadline {
+            if let owner = try? String(contentsOf: root.appendingPathComponent("present-\(number).owner"), encoding: .utf8) {
+                return owner
+            }
+            if FileManager.default.fileExists(atPath: root.appendingPathComponent("present-\(number).cancelled").path) {
+                return "cancelled"
+            }
+            Thread.sleep(forTimeInterval: 0.02)
         }
-        app.typeKey(save ? .return : .escape, modifierFlags: [])
-        guard panel.waitForNonExistence(timeout: 5) else {
-            throw ProbeTransportError(message: "the save panel stayed")
+        throw ProbeTransportError(message: "the probe did not say where panel \(number) went")
+    }
+
+    func exists(_ name: String) -> Bool {
+        FileManager.default.fileExists(atPath: root.appendingPathComponent(name).path)
+    }
+
+    /// Opens Settings from the menu bar (third item from its end): it
+    /// becomes the key window, over the main one.
+    func openSettings() throws {
+        let statusItem = app.statusItems.firstMatch
+        statusItem.click()
+        let items = statusItem.menus.firstMatch.children(matching: .menuItem)
+        guard items.count >= 3 else {
+            throw ProbeTransportError(message: "the Murmurly menu has too few items")
+        }
+        items.element(boundBy: items.count - 3).click()
+        guard app.windows["settings"].waitForExistence(timeout: 10) else {
+            throw ProbeTransportError(message: "no Settings")
         }
     }
+
 
     /// Quit from the app's own menu, as a person does; ⌘Q depends on the
     /// keyboard layout.
@@ -239,11 +308,6 @@ private final class FileProbeSession {
             throw ProbeTransportError(message: "no Quit in the app menu")
         }
         quit.click()
-    }
-
-    /// What the tab wrote to a file the real panel saved in the root.
-    func written(_ name: String) throws -> String {
-        try read(name)
     }
 
     /// Opens every gate this iteration left closed, so a failed iteration
@@ -496,6 +560,75 @@ final class FileSelectionProbeTests: XCTestCase {
         }
     }
 
+    /// The options row is there before any file; a choice other than the
+    /// settings' reaches the run as its argument, the same file run again over
+    /// its text in another choice, through "Replace", reaches that run and
+    /// shows its text, and the choice outlives the window, the text and its
+    /// file staying too, until "As Dictation" takes the choice back and leaves
+    /// the text. Each iteration saves its text, so the next one's file is
+    /// taken without a question.
+    func testFilesChoiceReachesTheRunAndOutlivesTheWindow() {
+        let auto = AppLanguage.text("Auto")
+        let asDictation = AppLanguage.text("As Dictation · %@ · %@", "Parakeet", auto)
+        let replace = AppLanguage.text("Replace")
+        iterate("choice") { probe, id, record in
+            let initial = probe.choiceShown
+            let a = try probe.makeFile("\(id)-A.wav")
+            let text = "transcript \(a)"
+            try probe.dropApplied("\(id)-a", a)
+            try probe.choose(auto, engine: "Parakeet")
+            try probe.start(a)
+            try probe.waitRunStarted(a)
+            let first = try probe.runChoice(a)
+            try probe.releaseRun(a)
+            guard probe.waitShows(text) else {
+                throw ProbeTransportError(message: "the first run showed no text")
+            }
+            try probe.choose(auto, engine: "Whisper")
+            try probe.restart(a)
+            guard probe.waitAsked() else { throw ProbeTransportError(message: "no question over the unsaved text") }
+            try probe.answer(replace)
+            // Started, so the first run's text is gone: what shows next is this run's.
+            try probe.waitRunStarted(a)
+            let second = try probe.runChoice(a)
+            try probe.releaseRun(a)
+            let secondShown = probe.waitShows(text)
+            try probe.closeWindow()
+            try probe.openWindow()
+            let reopened = probe.choiceShown
+            let textKept = probe.waitShows(text)
+            let fileKept = probe.shows(a)
+            try probe.choose(AppLanguage.text("As Dictation (%@ · %@)", "Parakeet", auto))
+            let back = probe.choiceShown
+            let textLeft = probe.shows(text) && probe.shows(a)
+            let save = try probe.clickSave(holding: false)
+            let saved = try probe.savedText(save)
+            let savedNoted = probe.app.descendants(matching: .any)["fileSavedNote"].waitForExistence(timeout: 5)
+            record["initial"] = initial ?? "none"
+            record["first"] = first
+            record["second"] = second
+            record["secondShown"] = secondShown
+            record["reopened"] = reopened ?? "none"
+            record["textKept"] = textKept
+            record["fileKept"] = fileKept
+            record["back"] = back ?? "none"
+            record["textLeft"] = textLeft
+            record["saved"] = saved
+            return problems([
+                (initial == asDictation, "the row did not start as the dictation: \(initial ?? "none")"),
+                (first == "parakeet:auto", "the first run was started with \(first)"),
+                (second == "whisper:auto", "the run again was started with \(second)"),
+                (secondShown, "the run again showed no text"),
+                (reopened == "Whisper · \(auto)", "the window came back with \(reopened ?? "none")"),
+                (textKept, "the text did not come back with the window"),
+                (fileKept, "the file name did not come back with the window"),
+                (back == asDictation, "“As Dictation” left \(back ?? "none")"),
+                (textLeft, "“As Dictation” took the text or its file name"),
+                (saved == text && savedNoted, "the text was not saved for the next iteration: \(saved)"),
+            ])
+        }
+    }
+
     /// A design decision: closing the window does not stop a run; open it again
     /// and the run is still going, then shows its result.
     func testClosingTheWindowDoesNotStopTheRun() {
@@ -551,6 +684,85 @@ final class FileSelectionProbeTests: XCTestCase {
                 (kept, "“Cancel” did not keep A, its text and its name"),
                 (replaced, "“Replace” did not take B without the text of A"),
             ])
+        }
+    }
+
+    /// A drop answered while the Dictionary tab's entry sheet stays over
+    /// unsaved text after a tab change: the sheet, its draft and the text
+    /// stay, the question about the text waits until the sheet is answered,
+    /// and its Cancel keeps the text. Nothing in the window starts the second
+    /// sheet: the drop's answer was on its way before the first one opened.
+    func testADropAnsweredUnderTheEntrySheetAsksOnceTheSheetIsAnswered() {
+        let cancel = AppLanguage.text("Cancel")
+        let replace = AppLanguage.text("Replace")
+        iterate("entry-sheet") { probe, id, record in
+            let app = probe.app
+            let a = try probe.makeFile("\(id)-A.wav")
+            let b = try probe.makeFile("\(id)-B.wav")
+            try probe.dropApplied("\(id)-a", a)
+            try probe.start(a)
+            try probe.waitRunStarted(a)
+            try probe.releaseRun(a)
+            guard probe.waitShows("transcript \(a)") else {
+                throw ProbeTransportError(message: "run A showed no text")
+            }
+            try probe.dropPending("\(id)-b", b)
+
+            guard app.showMainSection("dictionary") else {
+                throw ProbeTransportError(message: "the Dictionary section did not show")
+            }
+            let add = app.buttons["dictionaryAdd"]
+            guard add.waitForExistence(timeout: 5) else {
+                throw ProbeTransportError(message: "the Dictionary section did not show")
+            }
+            add.click()
+            let heard = app.textFields["dictionaryHeardField"]
+            guard heard.waitForExistence(timeout: 5) else {
+                throw ProbeTransportError(message: "Add… opened no sheet")
+            }
+            heard.click()
+            // Digits only: they do not depend on the active keyboard layout.
+            heard.typeText("42")
+            guard app.transcribeAFileFromMenuBar() else {
+                throw ProbeTransportError(message: "the Files tab did not show")
+            }
+            try probe.release("\(id)-b")
+            // Long enough for the answer to have gone through the tab.
+            let sheetStayed = !heard.waitForNonExistence(timeout: 2)
+            let running = app.state == .runningForeground
+            let draftKept = sheetStayed && heard.value as? String == "42"
+            let textKept = probe.shows(a) && probe.shows("transcript \(a)") && !probe.shows(b)
+            let waited = !app.sheets.buttons[replace].firstMatch.exists
+            record["sheetStayed"] = sheetStayed
+            record["draftKept"] = draftKept
+            record["textKept"] = textKept
+            record["questionWaited"] = waited
+            var found = problems([
+                (running, "the app did not survive the drop's answer"),
+                (sheetStayed, "the entry sheet went away"),
+                (draftKept, "the entry sheet lost its draft"),
+                (textKept, "the unsaved text changed under the sheet"),
+                (waited, "the question came while the entry sheet was up"),
+            ])
+            guard running, sheetStayed else { return found }
+
+            app.buttons["dictionaryCancel"].click()
+            guard heard.waitForNonExistence(timeout: 5) else {
+                return found + ["the entry sheet stayed after Cancel"]
+            }
+            let asked = app.sheets.buttons[replace].firstMatch.waitForExistence(timeout: 5)
+            record["askedAfterTheSheet"] = asked
+            guard asked else { return found + ["the question about the unsaved text never came"] }
+            try probe.answer(cancel)
+            let keptAfterCancel = probe.shows(a) && probe.shows("transcript \(a)") && !probe.shows(b)
+            record["keptAfterCancel"] = keptAfterCancel
+            found += problems([(keptAfterCancel, "“Cancel” did not keep A, its text and its name")])
+
+            // The next iteration starts without unsaved text.
+            try probe.dropPending("\(id)-b2", b)
+            try probe.release("\(id)-b2")
+            if probe.waitAsked() { try probe.answer(replace) }
+            return found
         }
     }
 
@@ -625,98 +837,152 @@ final class FileSelectionProbeTests: XCTestCase {
         }
     }
 
-    /// The real save panel is a sheet, not a modal loop, and writes the text
-    /// shown under the result's name.
-    func testRealSavePanelIsASheetAndWritesTheText() {
-        iterate("real-save", realPanels: true) { probe, id, record in
-            let a = try probe.makeFile("\(id)-A.wav")
-            try probe.dropApplied("\(id)-a", a)
+    /// Every panel of the tab goes on the window its button is in, and its
+    /// answer is the tab's: Choose File… takes the file; "Save .md…" in the
+    /// replace question goes on the window, not on the question on its way
+    /// out, saves, then takes the new file; Save .md writes the text.
+    func testEveryPanelOfTheTabGoesOnItsWindow() {
+        let probe: FileProbeSession
+        do {
+            probe = try FileProbeSession()
+            try probe.openFilesTab()
+        } catch {
+            return XCTFail("PROBE: launch not prepared: \(error)")
+        }
+        defer {
+            probe.releaseAll()
+            probe.app.terminate()
+        }
+        do {
+            let a = try probe.makeFile("owner-A.wav")
+            let b = try probe.makeFile("owner-B.wav")
+            try probe.offerChoice(a, as: 1)
+            probe.app.buttons["fileChooseButton"].click()
+            let window1 = try probe.panelWindow(1)
+            XCTAssertTrue(window1.hasPrefix("main"), "Choose File… went elsewhere: \(window1)")
+            XCTAssertTrue(probe.waitShows(a), "the chosen file was not taken")
             try probe.start(a)
             try probe.waitRunStarted(a)
             try probe.releaseRun(a)
-            guard probe.waitShows("transcript \(a)") else {
-                throw ProbeTransportError(message: "run A showed no text")
-            }
-            let save = probe.app.buttons["fileSaveButton"]
-            guard save.waitForExistence(timeout: 5) else {
-                throw ProbeTransportError(message: "the Save .md button is not available")
-            }
-            save.click()
-            try probe.answerSavePanel(save: true)
-            let text = try probe.written("\(id)-A.md")
-            let note = probe.app.staticTexts["fileSavedNote"]
-            let saved = note.waitForExistence(timeout: 5)
-                && note.value as? String == AppLanguage.text("Saved as %@", "\(id)-A.md")
-            record["savedText"] = text
-            record["savedNote"] = saved
-            return problems([
-                (text == "transcript \(a)", "the file has “\(text)” instead of “transcript \(a)”"),
-                (saved, "no “Saved as \(id)-A.md”"),
-            ])
+            XCTAssertTrue(probe.waitShows("transcript \(a)"), "run A showed no text")
+
+            try probe.offerChoice(b, as: 2)
+            probe.app.buttons["fileChooseButton"].click()
+            let window2 = try probe.panelWindow(2)
+            XCTAssertTrue(window2.hasPrefix("main"), "panel 2 went elsewhere: \(window2)")
+            XCTAssertTrue(probe.waitAsked(), "B replaced the unsaved text of A without asking")
+            let first = try probe.expectSave()
+            try probe.answer(AppLanguage.text("Save .md…"))
+            let window3 = try probe.panelWindow(3)
+            XCTAssertTrue(window3.hasPrefix("main"), "Save .md… went elsewhere: \(window3)")
+            XCTAssertEqual(try probe.savedText(first), "transcript \(a)")
+            XCTAssertTrue(probe.waitShows(b) && !probe.shows("transcript \(a)"), "B was not taken after the save")
+
+            try probe.start(b)
+            try probe.waitRunStarted(b)
+            try probe.releaseRun(b)
+            XCTAssertTrue(probe.waitShows("transcript \(b)"), "run B showed no text")
+            let second = try probe.clickSave(holding: false)
+            let window4 = try probe.panelWindow(4)
+            XCTAssertTrue(window4.hasPrefix("main"), "panel 4 went elsewhere: \(window4)")
+            XCTAssertEqual(try probe.savedText(second), "transcript \(b)")
+        } catch {
+            XCTFail("PROBE: \(error)")
         }
     }
 
-    /// "Save .md…" in the replace sheet with the real panel: cancelling the
-    /// panel keeps the unsaved text and does not take the new file; saving
-    /// writes the text, then takes it.
-    func testRealSavePanelDecidesTheReplacement() {
-        let saveFirst = AppLanguage.text("Save .md…")
-        iterate("real-save-first", realPanels: true) { probe, id, record in
-            let a = try probe.makeFile("\(id)-A.wav")
-            let b = try probe.makeFile("\(id)-B.wav")
-            try probe.dropApplied("\(id)-a", a)
+    /// A panel held between the click and its coming goes on the window it
+    /// was asked from even with another window made key meanwhile; with its
+    /// window closed meanwhile, it comes nowhere: nothing is written, and
+    /// the text stays, unsaved.
+    func testAHeldPanelGoesOnItsOwnWindowOrNowhere() {
+        let probe: FileProbeSession
+        do {
+            probe = try FileProbeSession()
+            try probe.openFilesTab()
+        } catch {
+            return XCTFail("PROBE: launch not prepared: \(error)")
+        }
+        defer {
+            probe.releaseAll()
+            probe.app.terminate()
+        }
+        do {
+            let a = try probe.makeFile("held-A.wav")
+            try probe.dropApplied("held-a", a)
             try probe.start(a)
             try probe.waitRunStarted(a)
             try probe.releaseRun(a)
-            guard probe.waitShows("transcript \(a)") else {
-                throw ProbeTransportError(message: "run A showed no text")
-            }
-            try probe.dropPending("\(id)-b", b)
-            try probe.release("\(id)-b")
-            guard probe.waitAsked() else { return ["B replaced the unsaved text of A without asking"] }
-            try probe.answer(saveFirst)
-            try probe.answerSavePanel(save: false)
-            let kept = probe.shows("transcript \(a)") && probe.shows(a) && !probe.shows(b)
-                && probe.app.staticTexts["fileUnsavedNote"].exists
-            record["keptAfterCancel"] = kept
+            XCTAssertTrue(probe.waitShows("transcript \(a)"), "run A showed no text")
+            try probe.holdPanels()
 
-            try probe.dropPending("\(id)-b2", b)
-            try probe.release("\(id)-b2")
-            guard probe.waitAsked() else { return ["the second drop of B did not ask"] }
-            try probe.answer(saveFirst)
-            try probe.answerSavePanel(save: true)
-            let text = try probe.written("\(id)-A.md")
-            let taken = probe.waitShows(b) && !probe.shows("transcript \(a)")
-            record["savedText"] = text
-            record["tookB"] = taken
-            return problems([
-                (kept, "a cancelled panel did not keep A, its text and its unsaved note"),
-                (text == "transcript \(a)", "the file has “\(text)” instead of “transcript \(a)”"),
-                (taken, "B was not taken after the save"),
-            ])
+            let first = try probe.clickSave(holding: false)
+            try probe.waitPanelHeld(1)
+            try probe.openSettings()
+            try probe.releasePanel(1)
+            let window1 = try probe.panelWindow(1)
+            XCTAssertTrue(window1.hasPrefix("main"), "the panel went on the key window: \(window1)")
+            XCTAssertEqual(try probe.savedText(first), "transcript \(a)")
+            // Settings may cover the section: it goes before the section is used again.
+            try probe.closeSettings()
+
+            // Run again: a new result, unsaved, over the saved one.
+            try probe.start(a)
+            XCTAssertTrue(probe.app.staticTexts["fileUnsavedNote"].waitForExistence(timeout: 10), "the new result passed for saved")
+            probe.app.buttons["fileSaveButton"].click()
+            try probe.waitPanelHeld(2)
+            try probe.closeWindow()
+            try probe.releasePanel(2)
+            XCTAssertEqual(try probe.panelWindow(2), "cancelled", "a panel came for a window that was gone")
+            XCTAssertFalse(probe.exists("save-2.txt"), "the closed window's save went on")
+            try probe.openWindow()
+            XCTAssertTrue(probe.waitShows("transcript \(a)"), "the text went with the window")
+            XCTAssertTrue(probe.app.staticTexts["fileUnsavedNote"].waitForExistence(timeout: 5), "a save that never came passed for saved")
+        } catch {
+            XCTFail("PROBE: \(error)")
         }
     }
 
-    /// The real open panel comes as a sheet on the window, not as a modal
-    /// window of its own; cancelling it changes nothing.
-    func testRealOpenPanelIsASheet() {
-        iterate("real-open", realPanels: true) { probe, _, record in
-            let prompt = probe.app.descendants(matching: .any)["fileDropZonePrompt"]
-            guard prompt.waitForExistence(timeout: 5) else {
-                throw ProbeTransportError(message: "no drop zone prompt")
-            }
-            prompt.click()
-            let sheet = probe.app.sheets.firstMatch
-            let asSheet = sheet.waitForExistence(timeout: 5)
-            record["openPanelIsSheet"] = asSheet
-            probe.app.typeKey(.escape, modifierFlags: [])
-            let closed = probe.app.sheets.firstMatch.waitForNonExistence(timeout: 5)
-                && probe.app.dialogs.firstMatch.waitForNonExistence(timeout: 5)
-            record["closed"] = closed
-            return problems([
-                (asSheet, "the open panel is not a sheet on the window"),
-                (closed && prompt.exists, "cancelling the open panel left it open or changed the tab"),
-            ])
+    /// "Save .md…" from the replace question, its panel held and its window
+    /// closed meanwhile: nothing is saved, the new file is not taken, and
+    /// the text, unsaved, is there when the window comes back.
+    func testAHeldSaveFromTheQuestionComesNowhereWithItsWindow() {
+        let probe: FileProbeSession
+        do {
+            probe = try FileProbeSession()
+            try probe.openFilesTab()
+        } catch {
+            return XCTFail("PROBE: launch not prepared: \(error)")
+        }
+        defer {
+            probe.releaseAll()
+            probe.app.terminate()
+        }
+        do {
+            let a = try probe.makeFile("question-A.wav")
+            let b = try probe.makeFile("question-B.wav")
+            try probe.dropApplied("question-a", a)
+            try probe.start(a)
+            try probe.waitRunStarted(a)
+            try probe.releaseRun(a)
+            XCTAssertTrue(probe.waitShows("transcript \(a)"), "run A showed no text")
+            try probe.dropPending("question-b", b)
+            try probe.release("question-b")
+            XCTAssertTrue(probe.waitAsked(), "B replaced the unsaved text of A without asking")
+            try probe.holdPanels()
+            try probe.answer(AppLanguage.text("Save .md…"))
+            try probe.waitPanelHeld(1)
+            try probe.closeWindow()
+            try probe.releasePanel(1)
+            XCTAssertEqual(try probe.panelWindow(1), "cancelled", "a panel came for a window that was gone")
+            XCTAssertFalse(probe.exists("save-1.txt"), "the save went on without its window")
+            try probe.openWindow()
+            XCTAssertTrue(probe.waitShows("transcript \(a)"), "the text went with the window")
+            XCTAssertTrue(probe.shows(a) && !probe.shows(b), "the new file was taken without the save")
+            XCTAssertTrue(probe.app.staticTexts["fileUnsavedNote"].waitForExistence(timeout: 5), "a save that never came passed for saved")
+            XCTAssertTrue(probe.app.buttons["fileSaveButton"].isEnabled, "Save .md stayed off")
+        } catch {
+            XCTFail("PROBE: \(error)")
         }
     }
 
@@ -738,6 +1004,41 @@ final class FileSelectionProbeTests: XCTestCase {
         }
         let frame = button.frame
         XCTAssertGreaterThan(frame.width, frame.height * 2, "REGRESSION: Transcribe is an icon without its name: \(frame)")
+    }
+
+    /// Text in Files not saved yet, the window now the main one's: Quit
+    /// from the app menu only warns, and the text stays; quitting again
+    /// quits.
+    func testQuitWithUnsavedFilesTextWarnsFirstThenQuits() {
+        let warning = AppLanguage.text("Files has unsaved text — save it as .md, or quit again to discard it")
+        let probe: FileProbeSession
+        do {
+            probe = try FileProbeSession()
+            try probe.openFilesTab()
+        } catch {
+            return XCTFail("PROBE: launch not prepared: \(error)")
+        }
+        defer {
+            probe.releaseAll()
+            probe.app.terminate()
+        }
+        do {
+            let a = try probe.makeFile("unsaved-A.wav")
+            try probe.dropApplied("unsaved-a", a)
+            try probe.start(a)
+            try probe.waitRunStarted(a)
+            try probe.releaseRun(a)
+            guard probe.waitShows("transcript \(a)") else { return XCTFail("PROBE: run A showed no text") }
+            try probe.quitFromMainMenu()
+            guard probe.waitShows(warning) else {
+                return XCTFail("REGRESSION: the first Quit did not warn about the unsaved text")
+            }
+            XCTAssertTrue(probe.shows("transcript \(a)"), "REGRESSION: the warning dropped the text")
+            try probe.quitFromMainMenu()
+            XCTAssertTrue(probe.app.wait(for: .notRunning, timeout: 10), "REGRESSION: the second Quit did not quit")
+        } catch {
+            XCTFail("PROBE: \(error)")
+        }
     }
 
     /// №4 as the app wires it: Quit from the app menu while a Files run goes
@@ -780,13 +1081,12 @@ final class FileSelectionProbeTests: XCTestCase {
 
     private func iterate(
         _ scenario: String,
-        realPanels: Bool = false,
         _ body: (FileProbeSession, String, inout [String: Any]) throws -> [String]
     ) {
         let iterations = max(1, Int(ProcessInfo.processInfo.environment["FILE_PROBE_ITERATIONS"] ?? "") ?? 1)
         let probe: FileProbeSession
         do {
-            probe = try FileProbeSession(realPanels: realPanels)
+            probe = try FileProbeSession()
             try probe.openFilesTab()
         } catch {
             XCTFail("PROBE: launch not prepared: \(error)")

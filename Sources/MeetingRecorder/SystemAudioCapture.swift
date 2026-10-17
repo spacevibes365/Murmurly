@@ -747,23 +747,27 @@ actor SystemAudioCapture: MeetingCaptureBackend {
         }
     }
 
-    func start() async throws -> Date {
-        guard tapRecorder == nil else { throw SystemAudioCaptureError.alreadyRunning }
-        guard AVCaptureDevice.authorizationStatus(for: .audio) == .authorized else {
-            throw SystemAudioCaptureError.microphoneUnavailable
-        }
-        try Task.checkCancellation()
-
-        let directory = try await MainActor.run {
-            try RecordingsStore().createSession()
-        }
-        let systemURL = directory.appendingPathComponent("system.caf")
-        let microphoneURL = directory.appendingPathComponent("microphone.caf")
-        let recorder = SystemAudioTapRecorder()
-
+    /// The folder is the recorder's, made for this session; whatever stops
+    /// the start, a refusal before the tap included, removes it, so no empty
+    /// or half-made folder passes for a recording.
+    func start(in directory: URL) async throws -> Date {
         do {
-            try await recorder.start(systemURL: systemURL, microphoneURL: microphoneURL)
+            guard tapRecorder == nil else { throw SystemAudioCaptureError.alreadyRunning }
+            guard AVCaptureDevice.authorizationStatus(for: .audio) == .authorized else {
+                throw SystemAudioCaptureError.microphoneUnavailable
+            }
             try Task.checkCancellation()
+
+            let systemURL = directory.appendingPathComponent("system.caf")
+            let microphoneURL = directory.appendingPathComponent("microphone.caf")
+            let recorder = SystemAudioTapRecorder()
+            do {
+                try await recorder.start(systemURL: systemURL, microphoneURL: microphoneURL)
+                try Task.checkCancellation()
+            } catch {
+                _ = try? recorder.stop()
+                throw error
+            }
 
             sessionDirectory = directory
             self.systemURL = systemURL
@@ -777,7 +781,6 @@ actor SystemAudioCapture: MeetingCaptureBackend {
             AppLog.info("meeting", "capture started: \(directory.path)")
             return captureStartedAt
         } catch {
-            _ = try? recorder.stop()
             try? FileManager.default.removeItem(at: directory)
             throw error
         }
