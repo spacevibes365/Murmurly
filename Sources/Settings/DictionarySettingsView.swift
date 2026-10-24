@@ -217,12 +217,29 @@ struct DictionarySettingsView: View {
             Toggle("", isOn: Binding(get: { entry.isEnabled }, set: { setEnabled(entry, $0) }))
                 .labelsHidden()
                 .disabled(locked)
-                .accessibilityLabel(Text(verbatim: entry.written))
+                .accessibilityLabel(
+                    Text(verbatim: entry.kind == .snippet ? entry.heard.joined(separator: ", ") : entry.written)
+                )
             // The user's own words: shown as typed, never looked up in the catalog.
             VStack(alignment: .leading, spacing: 2) {
-                Text(verbatim: entry.written)
-                Text(verbatim: entry.heard.joined(separator: ", "))
-                    .font(.caption).foregroundStyle(.secondary)
+                if entry.kind == .snippet {
+                    HStack(spacing: SettingsChrome.compactSpacing) {
+                        Image(systemName: "text.quote")
+                            .accessibilityLabel(Text("Snippet"))
+                            .accessibilityIdentifier("dictionarySnippetMark")
+                        Text(verbatim: entry.heard.joined(separator: ", "))
+                    }
+                    .accessibilityElement(children: .contain)
+                    .accessibilityIdentifier("dictionarySnippetMark")
+                    Text(verbatim: Self.firstNonEmptyLine(of: entry.written))
+                        .font(.caption).foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                } else {
+                    Text(verbatim: entry.written)
+                    Text(verbatim: entry.heard.joined(separator: ", "))
+                        .font(.caption).foregroundStyle(.secondary)
+                }
             }
             .opacity(entry.isEnabled ? 1 : SettingsChrome.disabledOpacity)
             Spacer()
@@ -352,6 +369,14 @@ struct DictionarySettingsView: View {
     private static func notImported(_ reason: String) -> String {
         String(localized: "Nothing was imported.") + " " + reason
     }
+
+    /// The first line with more than whitespace on it, trimmed; empty when
+    /// the text has none. Shown in the row, cut off at the end if it is long.
+    fileprivate static func firstNonEmptyLine(of text: String) -> String {
+        text.split(whereSeparator: \.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .first { !$0.isEmpty } ?? ""
+    }
 }
 
 /// Adds or edits one entry. Closing it drops the draft; a refused or failed
@@ -375,8 +400,16 @@ struct DictionaryEntrySheet: View {
     }
 
     private let source: Source?
+    /// Shown only when adding or editing from the Dictionary tab itself
+    /// (`source == nil`): a new entry from Dictations or a transcript is
+    /// always a replacement, as before. Fixed once the entry exists.
+    @State private var kind: DictionaryEntry.Kind
     @State private var heard: String
     @State private var written: String
+    /// A snippet's text, kept apart from `written`: switching the kind
+    /// picker back and forth must not pour a multi-line snippet into the
+    /// single-line replacement field or lose it there.
+    @State private var snippetText: String
     @State private var example: String
     /// A copy of the source's text to select in. Typing in it is harmless:
     /// the copy goes away with the sheet, and nothing is written back.
@@ -425,19 +458,25 @@ struct DictionaryEntrySheet: View {
     private init(entry: DictionaryEntry, example: String, source: Source?) {
         original = entry
         self.source = source
+        _kind = State(initialValue: entry.kind)
         _heard = State(initialValue: entry.heard.joined(separator: ", "))
-        _written = State(initialValue: entry.written)
+        _written = State(initialValue: entry.kind == .snippet ? "" : entry.written)
+        _snippetText = State(initialValue: entry.kind == .snippet ? entry.written : "")
         _example = State(initialValue: example)
         _sourceText = State(initialValue: source?.text ?? "")
     }
 
     private var isNew: Bool { !settings.dictionary.contains { $0.id == original.id } }
 
+    /// A snippet's text is kept exactly as typed, blank lines and the edges
+    /// included: it is pasted as written. A replacement's is trimmed, as
+    /// before.
     private var draft: DictionaryEntry {
         DictionaryEntry(
             id: original.id,
+            kind: kind,
             heard: DictionaryEntry.variants(fromList: heard),
-            written: written.trimmingCharacters(in: .whitespacesAndNewlines),
+            written: kind == .snippet ? snippetText : written.trimmingCharacters(in: .whitespacesAndNewlines),
             isEnabled: isNew || original.isEnabled
         )
     }
@@ -474,34 +513,69 @@ struct DictionaryEntrySheet: View {
         VStack(alignment: .leading, spacing: SettingsChrome.groupSpacing) {
             (isNew ? Text("Add Entry") : Text("Edit Entry")).font(.headline)
             if let source { sourceField(source) }
-            field("Heard as") {
-                TextField(
-                    "",
-                    text: $heard,
-                    prompt: Text(
-                        "cloud code, clod code",
-                        comment: "Placeholder: how an engine may write “Claude Code” in this language, comma-separated"
+            if source == nil { kindPicker }
+            field(kind == .snippet ? "Say" : "Heard as") {
+                if kind == .snippet {
+                    TextField(
+                        "",
+                        text: $heard,
+                        prompt: Text(
+                            "my signature",
+                            comment: "Placeholder: a phrase to say to paste a snippet, e.g. an email signature"
+                        )
                     )
-                )
-                .accessibilityLabel(Text("Heard as"))
-                .accessibilityIdentifier("dictionaryHeardField")
-                Text("Word forms are recognized with the macOS dictionary. Words it doesn’t know, often English terms, add in the forms you need, separated by commas. A form may also match a similar word.")
-                    .font(.caption).foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityLabel(Text("Say"))
+                    .accessibilityIdentifier("dictionaryHeardField")
+                    Text("Separate phrases with commas. Say one of them, and nothing else, to paste the text.")
+                        .font(.caption).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                } else {
+                    TextField(
+                        "",
+                        text: $heard,
+                        prompt: Text(
+                            "cloud code, clod code",
+                            comment: "Placeholder: how an engine may write “Claude Code” in this language, comma-separated"
+                        )
+                    )
+                    .accessibilityLabel(Text("Heard as"))
+                    .accessibilityIdentifier("dictionaryHeardField")
+                    Text("Word forms are recognized with the macOS dictionary. Words it doesn’t know, often English terms, add in the forms you need, separated by commas. A form may also match a similar word.")
+                        .font(.caption).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
-            field("Write as") {
-                TextField("", text: $written, prompt: Text(verbatim: "Claude Code"))
-                    .accessibilityLabel(Text("Write as"))
-                    .accessibilityIdentifier("dictionaryWrittenField")
-            }
-            field("Try it") {
-                TextField("", text: $example, prompt: Text("A sentence the way the engine writes it"))
-                    .accessibilityLabel(Text("Try it"))
-                    .accessibilityIdentifier("dictionaryExampleField")
-                if let preview {
-                    Text(verbatim: preview)
-                        .textSelection(.enabled)
-                        .accessibilityIdentifier("dictionaryPreview")
+            if kind == .snippet {
+                field("Text") {
+                    TextEditor(text: $snippetText)
+                        .font(.body)
+                        .scrollContentBackground(.hidden)
+                        .padding(SettingsChrome.dictionarySourcePadding)
+                        .frame(height: Self.snippetTextHeight)
+                        .background(Color(nsColor: .textBackgroundColor))
+                        .clipShape(RoundedRectangle(cornerRadius: SettingsChrome.chipCornerRadius))
+                        .overlay {
+                            RoundedRectangle(cornerRadius: SettingsChrome.chipCornerRadius)
+                                .stroke(Color(nsColor: .separatorColor), lineWidth: SettingsChrome.cardBorderWidth)
+                        }
+                        .accessibilityLabel(Text("Text"))
+                        .accessibilityIdentifier("dictionarySnippetTextField")
+                }
+            } else {
+                field("Write as") {
+                    TextField("", text: $written, prompt: Text(verbatim: "Claude Code"))
+                        .accessibilityLabel(Text("Write as"))
+                        .accessibilityIdentifier("dictionaryWrittenField")
+                }
+                field("Try it") {
+                    TextField("", text: $example, prompt: Text("A sentence the way the engine writes it"))
+                        .accessibilityLabel(Text("Try it"))
+                        .accessibilityIdentifier("dictionaryExampleField")
+                    if let preview {
+                        Text(verbatim: preview)
+                            .textSelection(.enabled)
+                            .accessibilityIdentifier("dictionaryPreview")
+                    }
                 }
             }
             if source != nil {
@@ -527,12 +601,31 @@ struct DictionaryEntrySheet: View {
             }
         }
         .onChange(of: selection) { selectionProblem = nil }
+        .onChange(of: kind) { errorMessage = nil }
         .onChange(of: heard) { errorMessage = nil }
         .onChange(of: written) { errorMessage = nil }
+        .onChange(of: snippetText) { errorMessage = nil }
         // A newer input cancels the older preview, so a late one never
         // overwrites it. The language counts too: it can change from the
         // menu bar while the sheet is open.
         .task(id: previewInput) { [input = previewInput] in await updatePreview(input) }
+    }
+
+    /// About six lines of a snippet's text.
+    private static let snippetTextHeight: CGFloat = 120
+
+    /// Replacement/Snippet. Shown only for an entry made on the Dictionary
+    /// tab (`source == nil`); fixed once the entry already exists, so Edit
+    /// never turns a replacement into a snippet or back.
+    private var kindPicker: some View {
+        Picker("Kind", selection: $kind) {
+            Text("Replacement").tag(DictionaryEntry.Kind.replacement)
+            Text("Snippet").tag(DictionaryEntry.Kind.snippet)
+        }
+        .pickerStyle(.segmented)
+        .labelsHidden()
+        .disabled(!isNew)
+        .accessibilityIdentifier("dictionaryKindPicker")
     }
 
     private func sourceField(_ source: Source) -> some View {

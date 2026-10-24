@@ -79,6 +79,12 @@ private final class SystemAudioRuntime: @unchecked Sendable {
     let microphoneBufferIndex: Int
     let systemBytesPerFrame: UInt32
     let microphoneBytesPerFrame: UInt32
+    #if DEBUG
+    /// Test-only: an adopted session writes synchronously (see
+    /// `adoptedForTesting`). Written once, before the first cycle; the IOProc
+    /// only reads it.
+    var writesSynchronouslyForTesting = false
+    #endif
 
     init(
         systemFile: ExtAudioFileRef,
@@ -173,12 +179,25 @@ private func murmurlySystemAudioIOProc(
 
     var systemData = AudioBufferList(mNumberBuffers: 1, mBuffers: system.buffer)
     var microphoneData = AudioBufferList(mNumberBuffers: 1, mBuffers: microphone.buffer)
-    let systemStatus = ExtAudioFileWriteAsync(systemFile, systemFrames, &systemData)
-    let microphoneStatus = ExtAudioFileWriteAsync(
-        microphoneFile,
-        systemFrames,
-        &microphoneData
-    )
+    let systemStatus: OSStatus
+    let microphoneStatus: OSStatus
+    #if DEBUG
+    // A test hands cycles over far faster than a device's clock, so the
+    // asynchronous writer's buffer can overflow (-66570) for a pace no real
+    // session is driven at. The adopted test session writes synchronously
+    // instead: there is no ring to overflow, and both writers' progress is
+    // guaranteed by the call itself.
+    if runtime.writesSynchronouslyForTesting {
+        systemStatus = ExtAudioFileWrite(systemFile, systemFrames, &systemData)
+        microphoneStatus = ExtAudioFileWrite(microphoneFile, systemFrames, &microphoneData)
+    } else {
+        systemStatus = ExtAudioFileWriteAsync(systemFile, systemFrames, &systemData)
+        microphoneStatus = ExtAudioFileWriteAsync(microphoneFile, systemFrames, &microphoneData)
+    }
+    #else
+    systemStatus = ExtAudioFileWriteAsync(systemFile, systemFrames, &systemData)
+    microphoneStatus = ExtAudioFileWriteAsync(microphoneFile, systemFrames, &microphoneData)
+    #endif
     let status = systemStatus == noErr ? microphoneStatus : systemStatus
     if status != noErr {
         // The error path may lock; the successful realtime path does not.
@@ -727,6 +746,11 @@ actor SystemAudioCapture: MeetingCaptureBackend {
     private var systemURL: URL?
     private var startedAt: Date?
     private var activity: NSObjectProtocol?
+    #if DEBUG
+    /// Test-only: where an adopted session's clock stops, whatever the pace
+    /// its cycles came at.
+    private var endedAtForTesting: Date?
+    #endif
 
     /// Creates and destroys one process tap. That proves only that a tap can be
     /// made: macOS asks for the recording permission when an aggregate device
@@ -802,7 +826,12 @@ actor SystemAudioCapture: MeetingCaptureBackend {
             activity = nil
         }
 
+        #if DEBUG
+        let captureEndedAt = endedAtForTesting ?? Date()
+        endedAtForTesting = nil
+        #else
         let captureEndedAt = Date()
+        #endif
         var issues: [String] = []
         var enqueuedFrames: Int64?
         var skippedCycles: Int64 = 0
@@ -1012,6 +1041,10 @@ extension SystemAudioTapRecorder {
             sampleRate: sampleRate
         )
         runtime.frames = enqueuedFrames
+        // There is no ring to overflow here: a test hands cycles over far
+        // faster than a device's clock, and `writesSynchronouslyForTesting`
+        // is set before the first `deliverCycleForTesting`.
+        runtime.writesSynchronouslyForTesting = true
         let recorder = SystemAudioTapRecorder()
         recorder.runtime = runtime
         recorder.sampleRate = sampleRate
@@ -1067,6 +1100,7 @@ extension SystemAudioCapture {
         microphoneFrames: UInt32,
         enqueuedFrames: Int64,
         startedAt: Date,
+        endedAt: Date? = nil,
         microphoneChannels: UInt32 = 1,
         microphoneSignalChannel: UInt32 = 0
     ) throws {
@@ -1084,6 +1118,7 @@ extension SystemAudioCapture {
         sessionDirectory = directory
         self.systemURL = systemURL
         self.startedAt = startedAt
+        endedAtForTesting = endedAt
     }
 
     /// Test-only: one IOProc cycle for the adopted session

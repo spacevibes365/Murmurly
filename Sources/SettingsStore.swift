@@ -45,6 +45,11 @@ final class SettingsStore: ObservableObject {
     @Published var saveDictationAudio: Bool {
         didSet { d.set(saveDictationAudio, forKey: K.saveDictationAudio) }
     }
+    /// Taken with the recording snapshot, so a toggle during a dictation
+    /// applies to the next one.
+    @Published var autoPaste: Bool {
+        didSet { d.set(autoPaste, forKey: K.autoPaste) }
+    }
     @Published var launchAtLogin: Bool { didSet { d.set(launchAtLogin, forKey: K.launchAtLogin) } }
     @Published var settingsTab: SettingsTab { didSet { d.set(settingsTab.rawValue, forKey: K.settingsTab) } }
     /// Applied by `AppDelegate.followAppearance(of:)`.
@@ -142,6 +147,7 @@ final class SettingsStore: ObservableObject {
         static let dictationLanguage = "dictation.language"
         static let dictationEngine = "dictation.engine"
         static let saveDictationAudio = "dictation.saveAudio"
+        static let autoPaste = "dictation.autoPaste"
         static let launchAtLogin = "app.launchAtLogin"
         static let settingsTab = "ui.settingsTab"
         static let appearance = "ui.appearance"
@@ -191,6 +197,7 @@ final class SettingsStore: ObservableObject {
         dictationEngine = d.string(forKey: K.dictationEngine)
             .flatMap(DictationEngine.init(rawValue:)) ?? .parakeet
         saveDictationAudio = d.object(forKey: K.saveDictationAudio) as? Bool ?? false
+        autoPaste = d.object(forKey: K.autoPaste) as? Bool ?? true
         launchAtLogin = d.object(forKey: K.launchAtLogin) as? Bool ?? true
         settingsTab = d.string(forKey: K.settingsTab).flatMap(SettingsTab.init(rawValue:))
             ?? .dictation
@@ -320,6 +327,10 @@ final class SettingsStore: ObservableObject {
         KeyboardShortcuts.getShortcut(for: .meeting)?.description
     }
 
+    var pasteLastDictationShortcutDescription: String? {
+        KeyboardShortcuts.getShortcut(for: .pasteLastDictation)?.description
+    }
+
     /// Called once during service activation, never by window rendering.
     /// Consume the missing preference before opening the first-run window.
     /// A test process writes nothing: the stage gate runs on the live domain,
@@ -334,7 +345,8 @@ final class SettingsStore: ObservableObject {
     var snapshot: SettingsSnapshot {
         SettingsSnapshot(dictationLanguage: dictationLanguage,
                          dictationEngine: dictationEngine,
-                         saveDictationAudio: saveDictationAudio)
+                         saveDictationAudio: saveDictationAudio,
+                         autoPaste: autoPaste)
     }
 
     /// The dictionary as the next job will use it. Entries and switches only:
@@ -540,20 +552,25 @@ final class SettingsStore: ObservableObject {
     }
 
     /// A version plus the entries, in the settings and in an exported file
-    /// alike; a later version may only add optional fields.
+    /// alike. Version 1 is the original document, byte for byte, and is
+    /// written while the dictionary holds no snippet; version 2 adds `kind`
+    /// and is written only once it holds one. Both are read; any other
+    /// version is kept as it is.
     private struct DictionaryDocument: Codable {
-        static let currentVersion = 1
-        var version = currentVersion
+        static let supportedVersions: ClosedRange<Int> = 1...2
+        var version: Int
         var entries: [DictionaryEntry]
     }
 
     /// One encoding for the settings and the file: indented and with its keys
     /// in a fixed order, so the file reads and edits by hand and compares
-    /// byte for byte.
+    /// byte for byte. A dictionary without a snippet keeps writing version 1
+    /// byte for byte, so Murmurly 0.2 still reads it as replacements.
     nonisolated static func encodedDictionary(_ entries: [DictionaryEntry]) throws -> Data {
+        let version = entries.contains { $0.kind == .snippet } ? 2 : 1
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
-        return try encoder.encode(DictionaryDocument(entries: entries))
+        return try encoder.encode(DictionaryDocument(version: version, entries: entries))
     }
 
     /// The entries of this version's document, or why the data is not one.
@@ -565,7 +582,7 @@ final class SettingsStore: ObservableObject {
         guard let version = try? decoder.decode(Version.self, from: data).version else {
             return .failure(.notADictionary)
         }
-        guard version == DictionaryDocument.currentVersion else { return .failure(.version(version)) }
+        guard DictionaryDocument.supportedVersions.contains(version) else { return .failure(.version(version)) }
         do {
             return .success(try decoder.decode(DictionaryDocument.self, from: data).entries)
         } catch {
@@ -628,6 +645,7 @@ struct SettingsSnapshot: Sendable, Equatable {
     var whisperModelPath: String = SettingsStore.defaultWhisperModel
     var parakeetModelPath: String = SettingsStore.defaultParakeetModel
     var saveDictationAudio: Bool = false
+    var autoPaste: Bool = true
 
     /// An engine and a language picked for one job, over the settings and
     /// never written into them: they stay the dictation's.

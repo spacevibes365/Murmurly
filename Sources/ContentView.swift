@@ -680,32 +680,38 @@ struct ContentView: View {
 
             Button("Choose File…") { pickFile() }
                 .disabled(files.isTranscribing)
+                .fixedSize()
                 .accessibilityIdentifier("fileChooseButton")
             if files.isTranscribing {
                 Button {
                     files.cancel()
                 } label: { Label("Cancel", systemImage: "stop.fill") }
                     .labelStyle(.titleAndIcon)
+                    .fixedSize()
                     .accessibilityIdentifier("fileCancelButton")
             } else {
                 // The tab's main action: named, not a bare waveform
-                // nobody takes for the button to press.
+                // nobody takes for the button to press. Fixed so a long file
+                // name shrinks instead of this button's own label.
                 Button {
                     files.start()
                 } label: { Label("Transcribe", systemImage: "waveform") }
                     .labelStyle(.titleAndIcon)
                     .buttonStyle(.borderedProminent)
                     .disabled(files.fileURL == nil)
+                    .fixedSize()
                     .accessibilityIdentifier("fileTranscribeButton")
             }
             Button("Copy") { files.copyTranscript() }
                 .disabled(files.segments.isEmpty)
+                .fixedSize()
                 .accessibilityIdentifier("fileCopyButton")
             Button("Save .md") {
                 let owner = anchor.window
                 Task { await files.saveTranscript(owner: owner) }
             }
                 .disabled(files.segments.isEmpty)
+                .fixedSize()
                 .accessibilityIdentifier("fileSaveButton")
         }
         .padding(.horizontal, SettingsChrome.contentHorizontalPadding)

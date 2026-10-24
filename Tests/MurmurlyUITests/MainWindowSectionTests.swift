@@ -1,4 +1,5 @@
 import AVFoundation
+import CoreGraphics
 import XCTest
 
 /// The main window's sections: the menu's commands open the window on theirs,
@@ -267,22 +268,85 @@ final class MainWindowSectionTests: XCTestCase {
         try menu(app, path)
     }
 
+    /// Found the same way as before (`menuItems[title]`, which never fails
+    /// the test outright, only answers exists or not), but acted on by a
+    /// point derived from the item's own frame rather than by asking the
+    /// item to click or hover itself: that re-walks the whole path from the
+    /// menu bar's own menu down and registers a hard XCTest failure, not a
+    /// catchable one, the moment a submenu closes or is rebuilt in between —
+    /// which the menu bar's menu is, by permission polling and the like. Up
+    /// to 3 opens of the menu bar's own menu per call.
     private func menu(_ app: XCUIApplication, _ path: [String]) throws {
         let statusItem = app.statusItems.firstMatch
         XCTAssertTrue(statusItem.waitForExistence(timeout: 5), "no Murmurly item in the menu bar")
-        statusItem.click()
+
+        for attempt in 1...3 {
+            statusItem.click()
+            if reachMenu(statusItem: statusItem, path: path) { return }
+            app.typeKey(.escape, modifierFlags: [])
+            app.typeKey(.escape, modifierFlags: [])
+            _ = waitUntil(seconds: 5) { !statusItem.menus.firstMatch.exists }
+            print("MENU: \(path.joined(separator: " › ")) not reached, attempt \(attempt)")
+        }
+        XCTFail("the menu did not open to \(path.joined(separator: " › "))")
+    }
+
+    /// Walks one path through the menu bar's own menu, already open. Returns
+    /// false, without failing the test, the moment a step can't be found or
+    /// acted on, so the caller can retry from a freshly opened menu.
+    private func reachMenu(statusItem: XCUIElement, path: [String]) -> Bool {
+        let base = statusItem.frame
+        func point(_ frame: CGRect, dx: CGFloat) -> XCUICoordinate {
+            statusItem.coordinate(withNormalizedOffset: .zero)
+                .withOffset(CGVector(dx: dx - base.minX, dy: frame.midY - base.minY))
+        }
+        // A frame mid-rebuild (permission polling and the like) can answer
+        // with NaN or a zero size; read it once and judge that one reading,
+        // never a second, possibly different, one taken right after.
+        func usable(_ frame: CGRect) -> Bool {
+            frame.minX.isFinite && frame.minY.isFinite
+                && frame.width.isFinite && frame.height.isFinite
+                && frame.width > 0 && frame.height > 0
+        }
+        func onScreen(_ coordinate: XCUICoordinate) -> Bool {
+            let point = coordinate.screenPoint
+            guard point.x.isFinite && point.y.isFinite else { return false }
+            // screenPoint is in Quartz's top-left-origin display space, the
+            // same one CGGetActiveDisplayList/CGDisplayBounds report; a
+            // reading off every display's union is a real, unusable
+            // coordinate, not one caught mid-rebuild.
+            var displays = [CGDirectDisplayID](repeating: 0, count: 16)
+            var count: UInt32 = 0
+            guard CGGetActiveDisplayList(UInt32(displays.count), &displays, &count) == .success, count > 0 else {
+                return false
+            }
+            return (0..<Int(count)).contains { CGDisplayBounds(displays[$0]).contains(point) }
+        }
+
         var menu = statusItem.menus.firstMatch
+        guard menu.waitForExistence(timeout: 5) else { return false }
         for (index, title) in path.enumerated() {
             let item = menu.menuItems[title]
-            XCTAssertTrue(item.waitForExistence(timeout: 5), "the menu has no \(title)")
+            guard item.waitForExistence(timeout: 5), item.isEnabled else { return false }
+            let frame = item.frame
+            guard usable(frame) else { return false }
             if index == path.count - 1 {
-                item.click()
+                let target = point(frame, dx: frame.midX)
+                guard onScreen(target) else { return false }
+                target.click()
             } else {
-                item.hover()
+                // Toward the right edge, so the pointer's path to the
+                // submenu goes sideways, not back over neighboring items.
+                let middle = point(frame, dx: frame.midX)
+                let edge = point(frame, dx: frame.maxX - 4)
+                guard onScreen(middle), onScreen(edge) else { return false }
+                middle.hover()
+                edge.hover()
                 menu = item.menus.firstMatch
-                XCTAssertTrue(menu.waitForExistence(timeout: 5), "\(title) opened no submenu")
+                guard menu.waitForExistence(timeout: 5) else { return false }
             }
         }
+        return true
     }
 
     /// Open Full History…, in the Dictation History submenu.

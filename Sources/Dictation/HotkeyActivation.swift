@@ -3,12 +3,15 @@ import Carbon.HIToolbox
 
 enum HotkeyActivation: String, CaseIterable, Sendable {
     case press
+    case hold
     case doubleModifier
 
     var explanation: String {
         switch self {
         case .press:
             String(localized: "Press to record, press again to paste.")
+        case .hold:
+            String(localized: "Hold the shortcut while you speak; release it to paste.")
         case .doubleModifier:
             String(localized: "Two quick presses start recording, one stops it. Ordinary shortcuts stay free.")
         }
@@ -67,6 +70,13 @@ func dictationGestureHint(
 ) -> DictationGestureHint {
     if activation == .doubleModifier, doubleModifierAvailable {
         return DictationGestureHint(start: "2× \(modifier.title)", stop: modifier.title)
+    }
+
+    if activation == .hold, let shortcutDescription {
+        return DictationGestureHint(
+            start: String(localized: "Hold \(shortcutDescription)"),
+            stop: String(localized: "Release \(shortcutDescription)")
+        )
     }
 
     let shortcut = shortcutDescription

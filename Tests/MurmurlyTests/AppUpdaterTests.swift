@@ -9,6 +9,54 @@ private actor SilentMic: MicCapturing {
     func stop() async throws -> URL? { nil }
 }
 
+/// Holds the store actor inside its first `beforeHistoryReplace` call until
+/// released (bounded): a "Recognize Again" save already begun stays under
+/// way until the test lets it finish.
+private final class RecognizeAgainHold: @unchecked Sendable {
+    private let lock = NSLock()
+    private let gate = DispatchSemaphore(value: 0)
+    private var calls = 0
+    private var isReleased = false
+
+    var entered: Bool { lock.withLock { calls > 0 } }
+
+    func hook() {
+        let first = lock.withLock { () -> Bool in
+            calls += 1
+            return calls == 1
+        }
+        if first { _ = gate.wait(timeout: .now() + 10) }
+    }
+
+    func release() {
+        let shouldSignal = lock.withLock { () -> Bool in
+            defer { isReleased = true }
+            return !isReleased
+        }
+        if shouldSignal { gate.signal() }
+    }
+}
+
+/// A gate a delivery waits on, so a test can catch ⌃⌘V mid-flight.
+@MainActor
+private final class TestGate {
+    private var waiter: CheckedContinuation<Void, Never>?
+    private var isOpen = false
+    private(set) var entered = false
+
+    func wait() async {
+        entered = true
+        guard !isOpen else { return }
+        await withCheckedContinuation { waiter = $0 }
+    }
+
+    func open() {
+        isOpen = true
+        waiter?.resume()
+        waiter = nil
+    }
+}
+
 @MainActor
 final class AppUpdaterTests: XCTestCase {
     // One fixed suite, cleared around every test: per-test UUID suites exhaust
@@ -244,6 +292,105 @@ final class AppUpdaterTests: XCTestCase {
         XCTAssertTrue(app.updater.installsAtQuit, "the menu and Settings say the update installs at quit")
     }
 
+    /// A dictation being recognized again is not visible through
+    /// `dictation.$state` (it stays `.idle`): `busy` must watch
+    /// `$recognizingAgainID` too, or "Install and Relaunch" would cut the
+    /// recognition short.
+    func testNoRelaunchWhileADictationIsRecognizedAgain() async throws {
+        let fixture = try DictationPipelineFixture(text: "original words")
+        defer { fixture.cleanup() }
+        try await fixture.dictate()
+        let recentEntries = try await fixture.store.recent(limit: 1)
+        let entry = try XCTUnwrap(recentEntries.first)
+        let app = makeApp(afterStop: .nothing, dictation: fixture.coordinator)
+        XCTAssertTrue(app.updater.relaunchNow(), "nothing runs yet: relaunch at once")
+
+        await fixture.engine.setText("second pass words")
+        await fixture.engine.holdDecodes()
+        fixture.coordinator.recognizeAgainModelReadyForTesting = true
+        let run = Task { @MainActor in try await fixture.coordinator.recognizeAgain(entry) }
+        try await waitForDictation { await fixture.engine.isHoldingDecode() }
+
+        XCTAssertFalse(app.updater.relaunchNow(), "a dictation is being recognized again")
+
+        await fixture.engine.releaseHeldDecode()
+        try await waitForDictation { app.updater.relaunchNow() }
+        try await run.value
+    }
+
+    /// `recognizingAgainID` only resets once the save itself finishes
+    /// (the coordinator's own `defer`), so the refusal must hold for the
+    /// save too, not only for the decode.
+    func testNoRelaunchWhileARecognizeAgainSaveIsUnderWay() async throws {
+        let hold = RecognizeAgainHold()
+        let fixture = try DictationPipelineFixture(text: "original words", beforeHistoryReplace: { _ in hold.hook() })
+        defer { fixture.cleanup() }
+        try await fixture.dictate()
+        let recentEntries = try await fixture.store.recent(limit: 1)
+        let entry = try XCTUnwrap(recentEntries.first)
+        let app = makeApp(afterStop: .nothing, dictation: fixture.coordinator)
+
+        await fixture.engine.setText("second pass words")
+        fixture.coordinator.recognizeAgainModelReadyForTesting = true
+        let run = Task { @MainActor in try await fixture.coordinator.recognizeAgain(entry) }
+        try await waitUntil { hold.entered }
+
+        XCTAssertFalse(app.updater.relaunchNow(), "the save Recognize Again already began is still under way")
+
+        hold.release()
+        try await waitUntil { app.updater.relaunchNow() }
+        try await run.value
+    }
+
+    /// ⌃⌘V whose delivery has begun (the clipboard overwritten, ⌘V sent)
+    /// must hold a relaunch until the clipboard is restored.
+    func testNoRelaunchDuringPasteLast() async throws {
+        let fixture = try DictationPipelineFixture(text: "unused")
+        defer { fixture.cleanup() }
+        try await fixture.dictate()
+        let app = makeApp(afterStop: .nothing, dictation: fixture.coordinator)
+        XCTAssertTrue(app.updater.relaunchNow(), "nothing runs yet: relaunch at once")
+
+        let gate = TestGate()
+        fixture.deliveryHook.gate = { await gate.wait() }
+        fixture.coordinator.modifierFlagsForTesting = { [] }
+        fixture.coordinator.pasteLastKeyDownForTesting()
+        let paste = fixture.coordinator.pasteLastKeyUpForTesting()
+        try await waitUntil { gate.entered }
+
+        XCTAssertFalse(app.updater.relaunchNow(), "⌃⌘V is still delivering")
+
+        gate.open()
+        if let paste { await paste.value }
+        try await waitUntil { app.updater.relaunchNow() }
+    }
+
+    /// A dictation being recognized again must not block a new meeting: the
+    /// watchdog's "busy" check only looks at `dictation.isBusy`
+    /// (`state != .idle`), which Recognize Again never touches.
+    func testAMeetingStartsWhileADictationIsRecognizedAgain() async throws {
+        let fixture = try DictationPipelineFixture(text: "original words")
+        defer { fixture.cleanup() }
+        try await fixture.dictate()
+        let recentEntries = try await fixture.store.recent(limit: 1)
+        let entry = try XCTUnwrap(recentEntries.first)
+        let app = makeApp(afterStop: .nothing, dictation: fixture.coordinator)
+
+        await fixture.engine.setText("second pass words")
+        await fixture.engine.holdDecodes()
+        fixture.coordinator.recognizeAgainModelReadyForTesting = true
+        let run = Task { @MainActor in try await fixture.coordinator.recognizeAgain(entry) }
+        try await waitForDictation { await fixture.engine.isHoldingDecode() }
+
+        app.recorder.toggle()
+        try await waitUntil { app.recorder.state == .recording }
+        app.recorder.toggle()
+        try await waitUntil { app.recorder.state == .idle }
+
+        await fixture.engine.releaseHeldDecode()
+        try await run.value
+    }
+
     // MARK: - Helpers
 
     private struct App {
@@ -266,7 +413,8 @@ final class AppUpdaterTests: XCTestCase {
     private func makeApp(
         afterStop: MeetingAfterStop,
         transcripts: URL? = nil,
-        files: FilesModel = FilesModel(transcription: { _ in { _, _ in [] } })
+        files: FilesModel = FilesModel(transcription: { _ in { _, _ in [] } }),
+        dictation: DictationCoordinator? = nil
     ) -> App {
         let entered = JobCounter()
         let released = JobCounter()
@@ -301,18 +449,19 @@ final class AppUpdaterTests: XCTestCase {
             watchdogSnapshotSource: { [] },
             beepPlayer: {}
         )
-        let dictation = DictationCoordinator(mic: SilentMic(), indicator: RecordingIndicator(renderingEnabled: false))
+        let dictationCoordinator = dictation
+            ?? DictationCoordinator(mic: SilentMic(), indicator: RecordingIndicator(renderingEnabled: false))
         recorder.transcripts = queue
-        recorder.activate(settings: settings, permissions: PermissionManager(), dictation: dictation)
+        recorder.activate(settings: settings, permissions: PermissionManager(), dictation: dictationCoordinator)
         let library = MeetingLibrary(recorder: recorder, queue: queue, settings: settings)
         let updater = AppUpdater(busy: AppUpdater.busy(
-            meeting: recorder, dictation: dictation, transcripts: queue, files: files, library: library
+            meeting: recorder, dictation: dictationCoordinator, transcripts: queue, files: files, library: library
         ))
         // The recorder holds settings and queue weakly, as the app's state
         // objects do; the returned value keeps them alive.
         return App(
             recorder: recorder, queue: queue, updater: updater, settings: settings,
-            dictation: dictation, files: files, library: library, entered: entered, released: released
+            dictation: dictationCoordinator, files: files, library: library, entered: entered, released: released
         )
     }
 

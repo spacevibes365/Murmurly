@@ -4,15 +4,53 @@ import NaturalLanguage
 /// One entry of the personal dictionary: the spellings an engine writes for a
 /// term and how the user wants it written ("клод код, клауд код" → "Claude Code").
 struct DictionaryEntry: Codable, Equatable, Identifiable, Sendable {
+    /// A replacement fires inside a phrase; a snippet (dictation only) fires
+    /// only when the whole dictation equals one of its phrases.
+    enum Kind: String, Codable, Equatable, Sendable {
+        case replacement
+        case snippet
+    }
+
     var id = UUID()
+    var kind: Kind = .replacement
     /// Kept as a list; the sheet shows it comma-separated.
     var heard: [String]
     var written: String
     var isEnabled = true
 
+    init(id: UUID = UUID(), kind: Kind = .replacement, heard: [String], written: String, isEnabled: Bool = true) {
+        self.id = id
+        self.kind = kind
+        self.heard = heard
+        self.written = written
+        self.isEnabled = isEnabled
+    }
+
     private enum CodingKeys: String, CodingKey {
-        case id, heard, written
+        case id, heard, written, kind
         case isEnabled = "enabled"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        heard = try container.decode([String].self, forKey: .heard)
+        written = try container.decode(String.self, forKey: .written)
+        isEnabled = try container.decode(Bool.self, forKey: .isEnabled)
+        kind = try container.decodeIfPresent(Kind.self, forKey: .kind) ?? .replacement
+    }
+
+    /// `kind` is written only for a snippet, so a document without one stays
+    /// byte for byte what it was before this field existed.
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(heard, forKey: .heard)
+        try container.encode(written, forKey: .written)
+        try container.encode(isEnabled, forKey: .isEnabled)
+        if kind != .replacement {
+            try container.encode(kind, forKey: .kind)
+        }
     }
 }
 
@@ -161,7 +199,11 @@ struct DictionarySnapshot: Sendable, Equatable {
     /// variants' word forms, so it is called off the main actor.
     func replacer(for use: Use) -> DictionaryReplacer? {
         guard applies(to: use) else { return nil }
-        let replacer = DictionaryReplacer(entries: entries, matchesWordForms: matchesWordForms)
+        let replacer = DictionaryReplacer(
+            entries: entries,
+            matchesWordForms: matchesWordForms,
+            includeSnippets: use == .dictation
+        )
         return replacer.isEmpty ? nil : replacer
     }
 }
@@ -206,49 +248,77 @@ struct DictionaryReplacer: Sendable {
         let letters: Int
     }
 
+    /// A snippet's trigger phrase, folded word by word, and its text as
+    /// written (untrimmed: the coordinator trims the delivered text).
+    private struct Snippet: Sendable {
+        let words: [String]
+        let written: String
+    }
+
     /// Longest first (by words, then letters), then in dictionary order.
     private let rules: [Rule]
     private let byWord: [String: [Int]]
     private let byForm: [String: [Int]]
+    private let snippets: [Snippet]
     private let makeForms: WordForms
 
-    var isEmpty: Bool { rules.isEmpty }
+    var isEmpty: Bool { rules.isEmpty && snippets.isEmpty }
 
     /// `matchesWordForms`: the job's language lets Russian word forms match
     /// (Auto, Russian, or a code the engine does not know). Even then only a
     /// variant written wholly in Cyrillic, with a written form without any,
     /// matches by form: a written form in the same alphabet (a surname) or a
     /// variant that mixes in Latin or digits has no ending to drop.
+    /// `includeSnippets` is true only for dictation: a snippet fires only
+    /// when the whole text equals one of its phrases, never by word form.
     init(
         entries: [DictionaryEntry],
         matchesWordForms: Bool,
+        includeSnippets: Bool = false,
         wordForms: @escaping WordForms = DictionaryReplacer.macOSWordForms
     ) {
         makeForms = wordForms
         let tokenizer = NLTokenizer(unit: .word)
         var lookup: ((String) -> String)?
         var prepared: [(rule: Rule, order: Int)] = []
+        var snippets: [Snippet] = []
         for entry in entries where entry.isEnabled {
-            let written = entry.written.trimmingCharacters(in: .whitespacesAndNewlines)
-            // The sheet refuses an empty written form; one from elsewhere
-            // would delete words.
-            guard !written.isEmpty else { continue }
-            let inflects = matchesWordForms && !written.contains(where: Self.isCyrillic)
-            for variant in entry.heard {
-                let ranges = Self.words(in: variant, tokenizer: tokenizer)
-                guard !ranges.isEmpty else { continue }
-                let words = ranges.map { Self.folded(variant[$0]) }
-                var forms: [String]?
-                if inflects, variant.contains(where: \.isLetter),
-                   variant.allSatisfy({ $0.isWhitespace || $0 == "-" || ($0.isLetter && Self.isCyrillic($0)) }) {
-                    let tagged = lookup ?? wordForms()
-                    lookup = tagged
-                    forms = ranges.map { Self.folded(tagged(variant[$0].lowercased())) }
+            switch entry.kind {
+            case .snippet:
+                guard includeSnippets else { continue }
+                // The sheet refuses an empty text; one from elsewhere (an
+                // edited export, a future version) would otherwise erase a
+                // dictation that matched the trigger.
+                guard !entry.written.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { continue }
+                for variant in entry.heard {
+                    let ranges = Self.words(in: variant, tokenizer: tokenizer)
+                    guard !ranges.isEmpty else { continue }
+                    let words = ranges.map { Self.folded(variant[$0]) }
+                    snippets.append(Snippet(words: words, written: entry.written))
                 }
-                let rule = Rule(written: written, words: words, forms: forms, letters: words.joined().count)
-                prepared.append((rule, prepared.count))
+            case .replacement:
+                let written = entry.written.trimmingCharacters(in: .whitespacesAndNewlines)
+                // The sheet refuses an empty written form; one from elsewhere
+                // would delete words.
+                guard !written.isEmpty else { continue }
+                let inflects = matchesWordForms && !written.contains(where: Self.isCyrillic)
+                for variant in entry.heard {
+                    let ranges = Self.words(in: variant, tokenizer: tokenizer)
+                    guard !ranges.isEmpty else { continue }
+                    let words = ranges.map { Self.folded(variant[$0]) }
+                    var forms: [String]?
+                    if inflects, variant.contains(where: \.isLetter),
+                       variant.allSatisfy({ $0.isWhitespace || $0 == "-" || ($0.isLetter && Self.isCyrillic($0)) }) {
+                        let tagged = lookup ?? wordForms()
+                        lookup = tagged
+                        forms = ranges.map { Self.folded(tagged(variant[$0].lowercased())) }
+                    }
+                    let rule = Rule(written: written, words: words, forms: forms, letters: words.joined().count)
+                    prepared.append((rule, prepared.count))
+                }
             }
         }
+        self.snippets = snippets
         rules = prepared.sorted {
             ($1.rule.words.count, $1.rule.letters, $0.order) < ($0.rule.words.count, $0.rule.letters, $1.order)
         }.map(\.rule)
@@ -262,7 +332,19 @@ struct DictionaryReplacer: Sendable {
         self.byForm = byForm
     }
 
+    /// A snippet's match against the whole text, ignoring the punctuation
+    /// between its words and at its edges; nil when none of the dictation's
+    /// own words, folded, equal a phrase whole.
+    private func matchedSnippet(in text: String) -> String? {
+        guard !snippets.isEmpty else { return nil }
+        let tokenizer = NLTokenizer(unit: .word)
+        let words = Self.words(in: text, tokenizer: tokenizer).map { Self.folded(text[$0]) }
+        guard !words.isEmpty else { return nil }
+        return snippets.first { $0.words == words }?.written
+    }
+
     func replacing(in text: String) -> (text: String, count: Int) {
+        if let snippet = matchedSnippet(in: text) { return (snippet, 1) }
         let result = replacing(in: [text])
         return (result.texts[0], result.count)
     }

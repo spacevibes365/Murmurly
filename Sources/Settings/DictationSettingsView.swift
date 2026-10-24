@@ -11,6 +11,7 @@ struct DictationSettingsView: View {
     var body: some View {
         VStack(spacing: SettingsChrome.groupSpacing) {
             hotkeyGroup
+            pastingGroup
             recognitionGroup
             feedbackGroup
             SettingsGroup("Archive") {
@@ -33,6 +34,7 @@ struct DictationSettingsView: View {
             ) {
                 Picker("", selection: $settings.hotkeyActivation) {
                     Text("Press").tag(HotkeyActivation.press)
+                    Text("Hold").tag(HotkeyActivation.hold)
                     Text("Double press").tag(HotkeyActivation.doubleModifier)
                 }
                 .labelsHidden()
@@ -92,6 +94,35 @@ struct DictationSettingsView: View {
         }
     }
 
+    private var pastingGroup: some View {
+        SettingsGroup("Pasting") {
+            SettingsRow(
+                "Paste automatically",
+                subtitle: "When off, dictations go to Dictations only; paste the last one with the shortcut below."
+            ) {
+                Toggle("", isOn: $settings.autoPaste)
+                    .labelsHidden()
+                    .accessibilityIdentifier("autoPasteToggle")
+            }
+            divider
+            SettingsRow("Paste last dictation") {
+                KeyboardShortcuts.Recorder(for: .pasteLastDictation) { _ in
+                    settings.objectWillChange.send()
+                }
+                .frame(minWidth: SettingsChrome.controlMinWidth)
+                .accessibilityIdentifier("pasteLastShortcutRecorder")
+            }
+            divider
+            SettingsRow("Copy last dictation") {
+                KeyboardShortcuts.Recorder(for: .copyLastDictation) { _ in
+                    settings.objectWillChange.send()
+                }
+                .frame(minWidth: SettingsChrome.controlMinWidth)
+                .accessibilityIdentifier("copyLastShortcutRecorder")
+            }
+        }
+    }
+
     private var recognitionGroup: some View {
         SettingsGroup("Recognition") {
             SettingsRow("Engine", subtitle: "Switches on the fly, no restart needed") {
@@ -128,11 +159,27 @@ struct DictationSettingsView: View {
             query: languageQuery,
             keeping: settings.pickedLanguage
         )
+        let matches = Self.filteredLanguages(
+            settings.dictationEngine.languageChoices,
+            query: languageQuery,
+            keeping: ""
+        )
         return VStack(alignment: .trailing, spacing: SettingsChrome.rowContentSpacing) {
             TextField("Search languages", text: $languageQuery)
                 .textFieldStyle(.roundedBorder)
                 .frame(width: SettingsChrome.popupMinWidth)
                 .accessibilityIdentifier("languageSearchField")
+            if !languageQuery.trimmingCharacters(in: .whitespaces).isEmpty, !matches.isEmpty, matches.count <= 6 {
+                VStack(alignment: .trailing, spacing: 4) {
+                    ForEach(matches, id: \.code) { choice in
+                        Button(choice.name) {
+                            settings.pickedLanguage = choice.code
+                            languageQuery = ""
+                        }
+                        .accessibilityIdentifier("languageMatch.\(choice.code)")
+                    }
+                }
+            }
             Picker("", selection: $settings.pickedLanguage) {
                 Text("Auto").tag("auto")
                 Divider()

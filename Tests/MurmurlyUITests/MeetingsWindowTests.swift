@@ -1077,10 +1077,35 @@ final class MeetingsWindowTests: XCTestCase {
         func inView(_ row: XCUIElement) -> Bool {
             row.exists && row.frame.height > 0 && list.frame.contains(CGPoint(x: row.frame.midX, y: row.frame.midY))
         }
-        // Down to the last row by the keyboard: the list follows its selection.
+        // The row selected right now, by its meeting's identifier; nil while
+        // none is. Read from the list itself, never by sending a fresh press
+        // before SwiftUI returned the selection from the last one.
+        func selectedRow() -> String? {
+            let row = list.outlineRows.matching(NSPredicate(format: "selected == true")).firstMatch
+            guard row.exists else { return nil }
+            let label = row.descendants(matching: .any)
+                .matching(NSPredicate(format: "identifier BEGINSWITH %@", "meetingRow.")).firstMatch
+            return label.exists ? label.identifier : nil
+        }
+        // Down to the last row by the keyboard: the list follows its
+        // selection. Each press waits for the selection to actually move
+        // before the next one, so none is sent while SwiftUI is still
+        // catching up and lost.
         first.click()
-        for _ in 0..<45 { app.typeKey(.downArrow, modifierFlags: []) }
-        XCTAssertTrue(waitUntil { inView(oldest) }, "the last row is not in view after going down to it: \(oldest.frame) in \(list.frame)")
+        XCTAssertTrue(
+            waitUntil { selectedRow() == "meetingRow.\(brokenOff)" },
+            "the click did not select the first row: \(selectedRow() ?? "none")"
+        )
+        let last = "meetingRow.\(names[39])"
+        var presses = 0
+        while let now = selectedRow(), now != last {
+            XCTAssertLessThan(presses, 41, "\(presses) presses down a list of 42 rows did not reach the last row: on \(now)")
+            app.typeKey(.downArrow, modifierFlags: [])
+            presses += 1
+            XCTAssertTrue(waitUntil { selectedRow().map { $0 != now } ?? false }, "down arrow \(presses) left the selection on \(now)")
+        }
+        XCTAssertEqual(selectedRow(), last, "after \(presses) presses no row or another row is selected")
+        XCTAssertTrue(waitUntil { inView(oldest) }, "the last row is selected but not in view: \(oldest.frame) in \(list.frame)")
         XCTAssertFalse(inView(first), "the list is too short to leave its top out of view")
         let field = app.textFields["meetingSearchField"]
         let nothing = noMatches(in: app)

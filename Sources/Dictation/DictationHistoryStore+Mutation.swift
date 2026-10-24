@@ -4,18 +4,55 @@ import Foundation
 private enum HistoryRewriteMode {
     case removing(Set<UUID>)
     case clearingAll
+    case replacing(id: UUID, replacement: RecognitionReplacement)
+}
+
+/// A line's new recognition: only these fields change (see
+/// `replaceRecognition`), the rest of the entry and every other line stay
+/// byte-for-byte.
+struct RecognitionReplacement: Sendable {
+    let text: String
+    let rawText: String?
+    let actualLanguage: String
+    let engine: String?
+
+    func applied(to entry: DictationHistoryEntry) -> DictationHistoryEntry {
+        DictationHistoryEntry(
+            schemaVersion: entry.schemaVersion,
+            id: entry.id,
+            source: entry.source,
+            at: entry.at,
+            duration: entry.duration,
+            selectedLanguage: entry.selectedLanguage,
+            actualLanguage: actualLanguage,
+            engine: engine,
+            targetBundleID: entry.targetBundleID,
+            targetApplicationName: entry.targetApplicationName,
+            audioPath: entry.audioPath,
+            text: text,
+            rawText: rawText,
+            interrupted: entry.interrupted,
+            recognitionFailed: nil,
+            recognitionSkipped: nil
+        )
+    }
+}
+
+private struct RewriteOutcome {
+    var removed: [DictationHistoryEntry] = []
+    var replaced = false
 }
 
 extension DictationHistoryStore {
     @discardableResult
     func delete(id: UUID) throws -> Bool {
-        let removed = try rewriteHistory(mode: .removing([id]))
+        let outcome = try rewriteHistory(mode: .removing([id]))
         // The index has changed; announce it even if removing audio throws.
         defer { notifyChange() }
-        for entry in removed {
+        for entry in outcome.removed {
             try removeAudio(for: entry)
         }
-        return !removed.isEmpty
+        return !outcome.removed.isEmpty
     }
 
     /// Empties the index and removes only what the archive itself made (see
@@ -32,6 +69,27 @@ extension DictationHistoryStore {
             try fileManager.removeItem(at: item)
         }
         Self.removeEmptyAudioFolders(in: root)
+    }
+
+    /// Replaces one line's recognized text in place, by its id: the audio,
+    /// `at`, `duration`, the target and `selected_language` stay, a failure
+    /// or skip mark is lifted since this attempt succeeded, and every other
+    /// line is untouched. An id no longer there (deleted, or cleared, while
+    /// this was being recognized) changes nothing and answers `false`.
+    @discardableResult
+    func replaceRecognition(
+        id: UUID,
+        text: String,
+        rawText: String?,
+        actualLanguage: String,
+        engine: String?
+    ) throws -> Bool {
+        let replacement = RecognitionReplacement(
+            text: text, rawText: rawText, actualLanguage: actualLanguage, engine: engine
+        )
+        let outcome = try rewriteHistory(mode: .replacing(id: id, replacement: replacement))
+        if outcome.replaced { notifyChange() }
+        return outcome.replaced
     }
 
     /// The archive's own files: dictation audio at `<yyyy>/<MM>/<uuid>.caf|m4a`
@@ -139,7 +197,13 @@ extension DictationHistoryStore {
         return UUID(uuidString: String(name.dropFirst(".history-".count).dropLast(".tmp".count))) != nil
     }
 
-    private func rewriteHistory(mode: HistoryRewriteMode) throws -> [DictationHistoryEntry] {
+    private func rewriteHistory(mode: HistoryRewriteMode) throws -> RewriteOutcome {
+        // Replacing a line that isn't there must leave the index byte for
+        // byte, inode and mtime included: with no index at all, there is
+        // nothing to create.
+        if case .replacing = mode, !fileManager.fileExists(atPath: historyURL.path) {
+            return RewriteOutcome()
+        }
         try ensureRootDirectory()
         let temporaryURL = root.appendingPathComponent(
             ".history-\(UUID().uuidString).tmp"
@@ -151,12 +215,25 @@ extension DictationHistoryStore {
             if !committed { try? fileManager.removeItem(at: temporaryURL) }
         }
 
-        var removed: [DictationHistoryEntry] = []
-        if case let .removing(ids) = mode,
-           fileManager.fileExists(atPath: historyURL.path) {
-            let input = try FileHandle(forReadingFrom: historyURL)
-            defer { try? input.close() }
-            removed = try copyHistory(input: input, output: output, removing: ids)
+        var outcome = RewriteOutcome()
+        if fileManager.fileExists(atPath: historyURL.path) {
+            switch mode {
+            case let .removing(ids):
+                let input = try FileHandle(forReadingFrom: historyURL)
+                defer { try? input.close() }
+                outcome.removed = try copyHistory(input: input, output: output, removing: ids)
+            case let .replacing(id, replacement):
+                let input = try FileHandle(forReadingFrom: historyURL)
+                defer { try? input.close() }
+                outcome.replaced = try copyHistoryReplacing(
+                    input: input, output: output, id: id, replacement: replacement
+                )
+                // No matching id: leave the real index untouched, before
+                // synchronize, the hook or the rename.
+                guard outcome.replaced else { return outcome }
+            case .clearingAll:
+                break
+            }
         }
 
         try output.synchronize()
@@ -165,7 +242,7 @@ extension DictationHistoryStore {
         try atomicallyRename(temporaryURL, to: historyURL)
         committed = true
         synchronizeRootDirectory()
-        return removed
+        return outcome
     }
 
     private func copyHistory(
@@ -213,6 +290,56 @@ extension DictationHistoryStore {
             }
         }
         return removed
+    }
+
+    /// Copies every line through, re-encoding only the one whose id matches;
+    /// a line that fails to decode is passed through byte-for-byte, as it
+    /// cannot be told apart from the one being replaced. The final line's
+    /// trailing newline (or its absence) is preserved exactly as in `copyHistory`.
+    private func copyHistoryReplacing(
+        input: FileHandle,
+        output: FileHandle,
+        id: UUID,
+        replacement: RecognitionReplacement
+    ) throws -> Bool {
+        let decoder = makeDecoder()
+        let encoder = makeEncoder()
+        let blockSize = 64 * 1024
+        var carry = Data()
+        var replaced = false
+
+        func process(_ rawLine: Data, isFinal: Bool) throws {
+            guard let entry = try? decoder.decode(DictationHistoryEntry.self, from: rawLine),
+                  entry.id == id else {
+                try output.write(contentsOf: rawLine)
+                if !isFinal { try output.write(contentsOf: Data([Self.newline])) }
+                return
+            }
+            let line = try encoder.encode(replacement.applied(to: entry))
+            try output.write(contentsOf: line)
+            if !isFinal { try output.write(contentsOf: Data([Self.newline])) }
+            replaced = true
+        }
+
+        while true {
+            try Task.checkCancellation()
+            let chunk = try input.read(upToCount: blockSize) ?? Data()
+            guard !chunk.isEmpty else { break }
+            var combined = carry
+            combined.append(chunk)
+            var lineStart = combined.startIndex
+
+            while let delimiter = combined[lineStart...].firstIndex(of: Self.newline) {
+                try process(Data(combined[lineStart..<delimiter]), isFinal: false)
+                lineStart = combined.index(after: delimiter)
+            }
+            carry = Data(combined[lineStart...])
+        }
+
+        if !carry.isEmpty {
+            try process(carry, isFinal: true)
+        }
+        return replaced
     }
 
     private func removeAudio(for entry: DictationHistoryEntry) throws {

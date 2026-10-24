@@ -60,14 +60,15 @@ final class AppUpdater: NSObject, ObservableObject, SPUUpdaterDelegate {
     }
 
     /// True while a relaunch would cut something short that does not resume
-    /// by itself: a meeting being recorded or saved, a dictation, a meeting
-    /// transcription queued or under way, a file being transcribed in Files, a
-    /// meeting's changes not saved yet or a transcript being written to the
-    /// file chosen for it (both end by themselves). A
-    /// job that transcribes counts until it ends, its copy into the transcripts
-    /// folder included: the launch-time scan queues the folder again, but
-    /// without either. Compression and moves of their own are not counted,
-    /// since the scan does queue them again.
+    /// by itself: a meeting being recorded or saved, a dictation, a dictation
+    /// being recognized again (its save included) or ⌃⌘V until its clipboard
+    /// is restored, a meeting transcription queued or under way, a file
+    /// being transcribed in Files, a meeting's changes not saved yet or a
+    /// transcript being written to the file chosen for it (both end by
+    /// themselves). A job that transcribes counts until it ends, its copy
+    /// into the transcripts folder included: the launch-time scan queues the
+    /// folder again, but without either. Compression and moves of their own
+    /// are not counted, since the scan does queue them again.
     ///
     /// Files' unsaved text is not counted either: it never ends by itself, so
     /// waiting for it would hold the update until the text is saved. The quit
@@ -82,10 +83,16 @@ final class AppUpdater: NSObject, ObservableObject, SPUUpdaterDelegate {
     ) -> AnyPublisher<Bool, Never> {
         // @Published sends the new value before the property changes, so the
         // values are read from the stream, never from the objects.
-        Publishers.CombineLatest3(
+        let dictationBusy = Publishers.CombineLatest3(
+            dictation.$state,
+            dictation.$recognizingAgainID,
+            dictation.$isPastingLast
+        )
+        .map { $0 != .idle || $1 != nil || $2 }
+        return Publishers.CombineLatest3(
             Publishers.CombineLatest4(
                 meeting.$state.map(\.isBusy),
-                dictation.$state.map { $0 != .idle },
+                dictationBusy,
                 transcripts.$activeJob.map { $0?.transcribe == true },
                 transcripts.$pending.map { $0.contains(where: \.transcribe) }
             )

@@ -634,6 +634,13 @@ final class ModelDownloaderTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: track), Data("recorded".utf8))
     }
 
+    func testZeroBytesReadAsANumber() {
+        for text in [ModelDownloader.sizeText(0), StorageSettingsView.byteText(0)] {
+            XCTAssertTrue(text.contains("0"), text)
+            XCTAssertFalse(text.contains("Zero"), text)
+        }
+    }
+
     /// Polls with a deadline, so a wedged download fails instead of hanging the run.
     private func eventually(
         within limit: Duration = .seconds(10),

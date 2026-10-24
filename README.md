@@ -20,8 +20,14 @@ on your Mac: Murmurly never uploads your recordings or text to be transcribed.
 
 ## Features
 
-- Dictation into any text field that accepts pasting, with a keyboard shortcut
-  or a double press of ⌘ or ⌥.
+- Dictation into any text field that accepts pasting, with a keyboard shortcut,
+  a double press of ⌘ or ⌥, or while you hold the shortcut down.
+- Paste the last dictation again with ⌃⌘V wherever your cursor is now, or copy
+  it to the clipboard with ⌃⌘C.
+- Esc keeps a dictation's text without pasting it, while it is recording or
+  being recognized.
+- A personal dictionary entry can be a snippet: say one of its phrases to
+  paste a prepared text instead.
 - Automatic meeting recording when another app takes the microphone, or manual
   recording with ⌥⇧R.
 - Your microphone and the call audio are saved as separate tracks, so the
@@ -30,7 +36,7 @@ on your Mac: Murmurly never uploads your recordings or text to be transcribed.
 - Transcribe a meeting again with another engine or language; earlier
   transcripts are kept.
 - Transcription of audio and video files: mp3, m4a, wav, mp4, mov.
-- Dictation history with search.
+- Dictation history with search; recognize a saved dictation again.
 - A personal dictionary for the names and terms the engine gets wrong, in
   dictation, meetings and files.
 - Listen to a meeting from any line of its transcript, and search the
@@ -178,19 +184,35 @@ Permissions**.
 
 - Press **⌥Space**, speak, and press **⌥Space** again. The text is pasted into
   the app that was in front. Murmurly then puts back what was on your clipboard,
-  unless you copied something else in the meantime.
-- If the text does not appear (the field does not accept pasting), it is in the
-  history and, without auto-paste, on the clipboard.
+  unless you copied something else in the meantime; this happens only on this
+  Mac, so something you copy on another device is not undone by it.
+- Nothing is pasted or put on the clipboard in a field macOS itself marks as a
+  password field; a notice says where the text is instead.
+- Turn off **Paste automatically** in **Settings → Dictation → Pasting** to
+  keep dictations out of your clipboard and out of other apps: they go to
+  **Dictations** only, and you paste the last one with **Paste last
+  dictation** (⌃⌘V by default) or copy it with **Copy last dictation** (⌃⌘C).
+  Both work whether or not **Paste automatically** is on.
+- Press Esc to cancel a dictation before the microphone has started. While it
+  is recording or being recognized, Esc stops it and saves it to
+  **Dictations** without pasting it; a notice names the shortcut to paste it
+  afterward.
+- If the text does not appear (the field does not accept pasting), it is in
+  the history and, with **Paste automatically** off, only in **Dictations**;
+  otherwise it is also on the clipboard.
 - One dictation can last up to 5 minutes; the last 30 seconds are counted down
   on the recording indicator. At the limit the recording stops, what you said
   is recognized and pasted, and Murmurly says it stopped at the 5-minute limit;
   start a new dictation to go on.
 - Dictation is not available while a meeting is being recorded, and a meeting
   recording does not start during a dictation: both need the microphone.
-- To change the shortcut, open **Settings → Dictation**. You can also start
-  dictation with a double press of the left or right ⌘ or ⌥ key, and stop it
-  with a single press. This mode needs Accessibility; until it is granted, only
-  the backup shortcut works, if you set one, and Settings says so.
+- To change the shortcut, open **Settings → Dictation**. **Trigger** chooses
+  how it starts: **Press** it to start and press it again to stop, **Hold**
+  it while you speak and release it to paste (releasing it in under half a
+  second drops the recording instead), or **Double press** the left or right
+  ⌘ or ⌥ key and stop with a single press. Double press needs Accessibility;
+  until it is granted, only the backup shortcut works, if you set one, and
+  Settings says so.
 - Choose the language in the menu (**Dictation Language**: Auto, the current
   language, **More Languages…**) or in **Settings → Dictation**, where you can
   search the list. **Auto** lets the engine decide.
@@ -210,6 +232,8 @@ that could not be recognized appears in the history as "— not recognized —"
 with its audio, so you can listen to it or transcribe it again: **Show in
 Finder** (the folder button in its row) shows the audio file, which you can drop
 into **Files** in the Murmurly window. Nothing is pasted in that case.
+**Recognize Again**, in a row's menu (Control-click), recognizes the saved
+audio again with the current engine, language and dictionary.
 
 If the history itself cannot be written, the dictation stays under **Unsaved
 Dictations** in the menu until you quit: a recognized one with its text, which
@@ -485,6 +509,13 @@ choose **Add to Dictionary…**, then select the words the engine got wrong in
 the text as it was recognized and click **Use Selection**. From a meeting's
 transcript, see [The Murmurly window](#the-murmurly-window).
 
+An entry can also be a **Snippet**: choose **Kind → Snippet** when you add it,
+list the phrases to say under **Say**, and the text to paste under **Text**,
+line breaks included. Say one of the phrases, and nothing else, for the whole
+dictation to paste that text instead of what was recognized; said inside a
+longer dictation, it does nothing. Snippets apply to dictation only, not to
+meetings or files.
+
 The dictionary applies to new dictations, meeting transcripts and file
 transcripts; what is already saved does not change. Upper and lower case and
 the Russian ё and е are not told apart. With the language set to Auto or
@@ -581,7 +612,16 @@ says so under the language list.
 - A meeting records the microphone that was the default when it started.
   Switching audio devices during a recording (for example, putting on AirPods)
   is not followed. A dictation cut off by such a switch is saved to the history
-  but not pasted.
+  but not pasted; paste it afterward with ⌃⌘V.
+- Esc is a global shortcut and does not reach the app where macOS turns on
+  Secure Keyboard Entry (for example, Terminal with that setting on, or some
+  password managers), so it does not cancel a dictation there.
+- The clipboard after a dictation is restored on this Mac only, so something
+  you copied on this Mac beforehand may not reach your other devices
+  afterward; this keeps a dictation from overwriting what you copied on
+  another device.
+- A personal dictionary with a snippet is saved in a format Murmurly 0.2 does
+  not apply; clear the dictionary before going back to 0.2.
 - If a meeting's microphone drops out for a moment, as Bluetooth headsets
   sometimes do, that moment is left out of both tracks so they stay in step.
   The recording is saved with a warning that says about how many seconds are

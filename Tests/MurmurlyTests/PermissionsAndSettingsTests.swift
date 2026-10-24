@@ -1,5 +1,6 @@
 import AppKit
 import AVFoundation
+import Combine
 import Darwin
 import Foundation
 import XCTest
@@ -32,6 +33,13 @@ private actor FailingStartMic: MicCapturing {
 private actor ImmediateMic: MicCapturing {
     func start() async throws {}
     func stop() async throws -> URL? { nil }
+}
+
+/// A value a test changes while a closure reads it.
+@MainActor
+private final class Box<Value> {
+    var value: Value
+    init(_ value: Value) { self.value = value }
 }
 
 @MainActor
@@ -274,13 +282,13 @@ final class PermissionsAndSettingsTests: XCTestCase {
         XCTAssertEqual(SettingsStore(defaults: defaults).hotkeyActivation, .press)
     }
 
-    func testRemovedHoldActivationFallsBackToPress() throws {
-        let suiteName = "io.github.spacevibes365.MurmurlyTests.RemovedHoldActivation.\(UUID().uuidString)"
+    func testStoredHoldActivationReadsAsHold() throws {
+        let suiteName = "io.github.spacevibes365.MurmurlyTests.StoredHoldActivation.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
         defaults.set("hold", forKey: "dictation.hotkey.activation")
 
-        XCTAssertEqual(SettingsStore(defaults: defaults).hotkeyActivation, .press)
+        XCTAssertEqual(SettingsStore(defaults: defaults).hotkeyActivation, .hold)
     }
 
     func testMeetingExclusionsHaveNoPersonalSeeds() throws {
@@ -381,6 +389,37 @@ final class PermissionsAndSettingsTests: XCTestCase {
 
         defaults.set(Data("not-json".utf8), forKey: "overlay.placement")
         XCTAssertNil(SettingsStore(defaults: defaults).overlayPlacement)
+    }
+
+    /// A poll that finds nothing new publishes nothing: the menu bar's menu
+    /// observes the permissions and was redrawn every 3 s, open or not.
+    func testAPollThatFindsNothingNewPublishesNothing() throws {
+        let folder = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PermissionPoll-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let suite = folder.appendingPathComponent("settings").path
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let trusted = Box(false)
+        let manager = PermissionManager(
+            accessibilityStatus: { trusted.value },
+            runningTests: true,
+            defaults: defaults,
+            version: "1"
+        )
+        var changes = 0
+        let watch = manager.objectWillChange.sink { changes += 1 }
+        defer { watch.cancel() }
+
+        manager.refresh()
+        XCTAssertEqual(changes, 0, "a poll that found nothing new published a change")
+
+        trusted.value = true
+        manager.refresh()
+        XCTAssertGreaterThan(changes, 0, "a change of the grant was not published")
+        XCTAssertTrue(manager.axTrusted)
     }
 
     /// The launch prompt for Accessibility: never on the first launch, once

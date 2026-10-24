@@ -36,6 +36,7 @@ enum IndicatorState: Equatable, Sendable {
     case busyWithMeeting
     case dictationFailure(message: String)
     case meetingFailure(message: String)
+    case notice(message: String)
 
     var visualKind: VisualKind {
         switch self {
@@ -52,7 +53,7 @@ enum IndicatorState: Equatable, Sendable {
              .microphoneAccessDenied, .meetingMicrophoneAccessDenied,
              .dictationFailure, .meetingFailure:
             return .failure
-        case .noSpeech, .clipboardFallback, .busyWithDictation, .busyWithMeeting:
+        case .noSpeech, .clipboardFallback, .busyWithDictation, .busyWithMeeting, .notice:
             return .notice
         }
     }
@@ -67,7 +68,7 @@ enum IndicatorState: Equatable, Sendable {
         case .busyWithDictation, .busyWithMeeting:
             return 2.5
         case .meetingMicrophoneAccessDenied, .clipboardFallback, .clipboardFailed,
-             .injectionFailed, .microphoneTimedOut, .dictationFailure:
+             .injectionFailed, .microphoneTimedOut, .dictationFailure, .notice:
             return 3
         case .microphoneAccessUndetermined, .microphoneAccessDenied:
             return 3.5
@@ -268,7 +269,7 @@ struct IndicatorView: View {
         case .meetingMicrophoneAccessDenied: String(localized: "First allow the microphone in the “M” menu")
         case .busyWithDictation: String(localized: "Dictation in progress — finish it first")
         case .busyWithMeeting: String(localized: "Meeting recording in progress — finish it first")
-        case let .dictationFailure(message), let .meetingFailure(message): message
+        case let .dictationFailure(message), let .meetingFailure(message), let .notice(message): message
         case .recordingDictation, .recordingMeeting: ""
         }
     }

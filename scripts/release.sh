@@ -12,6 +12,16 @@
 #       release; it never silently falls back to an unsigned DMG.
 #       Create the profile once with `xcrun notarytool store-credentials`.
 #
+#   scripts/release.sh --check-dmg <image.dmg>
+#       Only looks for personal paths in an existing image (see below).
+#
+# The release is built from a fresh clone of the committed HEAD in
+# /private/tmp, with its build folder there too: a binary keeps the paths it
+# was compiled at, and a path in a home folder names its owner. Every image is
+# then mounted and searched, file by file, for the folder that holds the home
+# folders, and a hit stops the release. Uncommitted changes stop it before
+# anything is built.
+#
 # Automatic updates (Sparkle). When the app carries a public EdDSA key, the
 # DMG is also signed with its private half from the login keychain, and
 # .build/release/appcast.xml offers it to installed copies. Upload both files
@@ -25,7 +35,7 @@
 #
 # The key, once per project, by whoever publishes the releases:
 #   1. Run this script once: SwiftPM puts Sparkle's tools into
-#      .build/release-derived-data/SourcePackages/artifacts/sparkle/Sparkle/bin/
+#      /private/tmp/murmurly-release-<commit>/SourcePackages/artifacts/sparkle/Sparkle/bin/
 #   2. `generate_keys` creates the private key in the login keychain and prints
 #      the public one. Put it into Signing.xcconfig:
 #          MURMURLY_SU_PUBLIC_KEY = <the printed key>
@@ -41,14 +51,69 @@
 set -euo pipefail
 
 project_root="$(cd "$(dirname "$0")/.." && pwd -P)"
-project_file="$project_root/Murmurly.xcodeproj"
-derived_data="$project_root/.build/release-derived-data"
-output_dir="$project_root/.build/release"
+output_dir="${MURMURLY_RELEASE_OUTPUT:-$project_root/.build/release}"
 
 fail() {
     echo "release: $*" >&2
     exit 1
 }
+
+# A home folder names its owner, so the image may carry no path into the folder
+# that holds the home folders. In 0.2 only the app binary did: 721 times, its
+# source and build folders.
+path_needle="$(dirname "$HOME")/"
+
+# Mounts the image read-only and searches every file in it, the binaries,
+# .DS_Store and the picture included: a .DS_Store written from a home folder
+# can point at it too.
+check_image_paths() {
+    local image="$1" mount file count total=0 found=""
+    mount="$(mktemp -d "${TMPDIR:-/tmp}/release-check.XXXXXX")"
+    hdiutil attach -readonly -nobrowse -noautoopen -noverify -mountpoint "$mount" "$image" > /dev/null \
+        || fail "could not mount $image to look for personal paths"
+    while IFS= read -r -d '' file; do
+        count="$({ LC_ALL=C grep -a -o -F -- "$path_needle" "$file" || true; } | wc -l | tr -d ' ')"
+        if [[ "$count" != 0 ]]; then
+            found+="  ${file#"$mount"/}: $count × $path_needle"$'\n'
+            total=$((total + count))
+        fi
+    done < <(find "$mount" -type f -print0)
+    hdiutil detach "$mount" -quiet || hdiutil detach "$mount" -force -quiet
+    rmdir "$mount"
+    [[ $total -eq 0 ]] || fail "$image carries $total personal path(s):"$'\n'"$found"
+}
+
+if [[ "${1:-}" == "--check-dmg" ]]; then
+    [[ -f "${2:-}" ]] || fail "usage: scripts/release.sh --check-dmg <image.dmg>"
+    check_image_paths "$2"
+    echo "No personal paths in $2"
+    exit 0
+fi
+
+# The build runs in a fresh clone of the committed HEAD, its build folder
+# beside it, both in /private/tmp: the binary keeps the paths it was compiled
+# at (Swift's #file in the packages, the debug map of every object file), and
+# a /private/tmp path names no one. The clone runs this script again and writes
+# the DMG and the appcast into this checkout's .build/release.
+if [[ -z "${MURMURLY_RELEASE_COMMIT:-}" ]]; then
+    [[ -z "$(git -C "$project_root" status --porcelain --untracked-files=no)" ]] \
+        || fail "commit or stash your changes first: the release is built from the committed HEAD"
+    commit="$(git -C "$project_root" rev-parse HEAD)"
+    clone="/private/tmp/murmurly-src-${commit:0:12}"
+    rm -rf "$clone"
+    git clone --quiet --no-local --no-checkout "$project_root" "$clone"
+    git -C "$clone" cat-file -e "$commit^{commit}" 2> /dev/null \
+        || git -C "$clone" fetch --quiet "$project_root" "$commit"
+    git -C "$clone" checkout --quiet --detach "$commit"
+    status=0
+    MURMURLY_RELEASE_COMMIT="$commit" MURMURLY_RELEASE_OUTPUT="$output_dir" \
+        "$clone/scripts/release.sh" || status=$?
+    rm -rf "$clone"
+    exit "$status"
+fi
+
+project_file="$project_root/Murmurly.xcodeproj"
+derived_data="/private/tmp/murmurly-release-${MURMURLY_RELEASE_COMMIT:0:12}"
 
 developer_id="${DEVELOPER_ID:-}"
 notary_profile="${NOTARY_PROFILE:-}"
@@ -161,18 +226,46 @@ rm -f "$dmg"
 
 staging="$(mktemp -d "${TMPDIR:-/tmp}/release.XXXXXX")"
 trap 'status=$?; rm -rf "$staging"; exit "$status"' EXIT
-ditto "$app" "$staging/$(basename "$app")"
-ln -s /Applications "$staging/Applications"
-# The window Finder opens: 128 pt icons, the app on the left, a grey arrow and
-# Applications on the right. DS_Store was written once by dmgbuild 1.6.5, so the
-# release needs nothing beyond hdiutil; background.tiff is 1x + 2x
-# (tiffutil -cathidpicheck) and light, because Finder draws a window with a
-# picture in the light appearance even in Dark Mode. DS_Store finds the picture
-# by the volume name "Murmurly" and /.background.tiff, and the icons by the
-# names Murmurly.app and Applications: change one and Finder silently shows its
-# plain default window instead.
-cp "$project_root/scripts/dmg/DS_Store" "$staging/.DS_Store"
-cp "$project_root/scripts/dmg/background.tiff" "$staging/.background.tiff"
+
+# The window Finder opens is written by dmgbuild, pinned, in a throwaway
+# environment, for the very volume it creates: the picture's alias in
+# .DS_Store names that volume. A .DS_Store copied from another image left the
+# window without its picture on another Mac (0.2). dmgbuild also writes a
+# bookmark beside the alias; Finder (macOS 26.5, a fresh account) did not
+# resolve it and drew no picture at all (0.3 candidate), so the settings turn
+# the bookmark off and Finder takes the alias, as in other apps' images. The window: 128 pt icons,
+# the app on the left, a grey arrow and Applications on the right;
+# background.tiff is 1x + 2x (tiffutil -cathidpicheck) and light, because
+# Finder draws a window with a picture in the light appearance even in Dark Mode.
+python3 -c 'import sys; sys.exit(sys.version_info < (3, 10))' 2> /dev/null \
+    || fail "dmgbuild needs python3 3.10 or newer"
+python3 -m venv "$staging/dmgbuild"
+"$staging/dmgbuild/bin/pip" install --quiet --disable-pip-version-check \
+    dmgbuild==1.6.5 ds-store==1.3.1 mac-alias==2.2.2 \
+    || fail "could not install dmgbuild"
+dmg_settings="$staging/dmg-settings.py"
+cat > "$dmg_settings" <<'SETTINGS'
+import dmgbuild.core
+dmgbuild.core.Bookmark.for_file = staticmethod(lambda path: None)
+format = "UDZO"
+filesystem = "HFS+"
+files = [defines["app"]]
+symlinks = {"Applications": "/Applications"}
+background = defines["background"]
+window_rect = ((200, 200), (560, 340))
+default_view = "icon-view"
+show_status_bar = show_tab_view = show_toolbar = show_pathbar = show_sidebar = False
+sidebar_width = 180
+arrange_by = None
+grid_offset = (0, 0)
+grid_spacing = 100
+scroll_position = (0, 0)
+label_pos = "bottom"
+text_size = 13
+icon_size = 128
+show_icon_preview = False
+icon_locations = {"Murmurly.app": (140, 155), "Applications": (420, 155)}
+SETTINGS
 
 # hdiutil occasionally records an empty chunk at an offset past the end of the
 # data fork; its own validator then rejects the whole image ("chunk data starts
@@ -182,18 +275,18 @@ cp "$project_root/scripts/dmg/background.tiff" "$staging/.background.tiff"
 echo "Creating ${dmg_name}…"
 for attempt in 1 2 3; do
     rm -f "$dmg"
-    hdiutil create \
-        -volname "$product_name" \
-        -srcfolder "$staging" \
-        -fs HFS+ \
-        -format UDZO \
-        "$dmg"
+    "$staging/dmgbuild/bin/dmgbuild" \
+        -s "$dmg_settings" \
+        -D app="$app" \
+        -D background="$project_root/scripts/dmg/background.tiff" \
+        "$product_name" "$dmg"
     if hdiutil verify "$dmg"; then
         break
     fi
     echo "release: attempt $attempt produced an image that failed verification" >&2
     [[ $attempt -lt 3 ]] || fail "the disk image failed verification three times"
 done
+check_image_paths "$dmg"
 
 if [[ -n "$developer_id" ]]; then
     codesign --sign "$developer_id" --timestamp "$dmg"
@@ -214,6 +307,7 @@ if [[ -n "$developer_id" ]]; then
     xcrun stapler staple "$dmg"
     xcrun stapler validate "$dmg"
     spctl --assess --type open --context context:primary-signature --verbose "$dmg"
+    check_image_paths "$dmg"
 fi
 
 # Signed only now: stapling changes the DMG, and Sparkle checks the exact bytes.

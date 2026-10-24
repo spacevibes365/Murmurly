@@ -117,6 +117,48 @@ final class MurmurlyUITests: XCTestCase {
         }
     }
 
+    /// Typing a few letters into the language search shows matches right
+    /// away, under the field, instead of only narrowing a closed menu.
+    func testLanguageSearchShowsMatchesToPick() throws {
+        let app = XCUIApplication()
+        app.launchArguments = ["-UITesting", "-UITestSettingsStore"] + AppLanguage.launchArguments
+        app.launch()
+        defer { app.terminate() }
+
+        try XCTSkipUnless(
+            physicalCharacter(virtualKey: 2) == "d" && physicalCharacter(virtualKey: 14) == "e",
+            "typeText(\"de\") depends on the keyboard layout: this one does not type a plain \"de\""
+        )
+
+        XCTAssertEqual(app.windows.count, 0, "UI testing must also start without a window")
+        openSettingsFromMenuBar(in: app)
+
+        let windowContent = app.descendants(matching: .any)["settingsWindowContent"]
+        XCTAssertTrue(windowContent.waitForExistence(timeout: 5))
+        guard app.settingsSidebarSearchIsEmpty() else { return }
+
+        let dictationTab = app.buttons["settingsTab.dictation"]
+        XCTAssertTrue(dictationTab.waitForExistence(timeout: 5))
+        dictationTab.click()
+
+        let searchField = app.descendants(matching: .any)["languageSearchField"]
+        XCTAssertTrue(searchField.waitForExistence(timeout: 5))
+        searchField.click()
+        searchField.typeText("de")
+
+        let match = app.descendants(matching: .any)["languageMatch.de"]
+        XCTAssertTrue(match.waitForExistence(timeout: 5))
+        match.click()
+
+        let picker = app.descendants(matching: .any)["dictationLanguagePicker"]
+        XCTAssertTrue(picker.waitForExistence(timeout: 5))
+        let selected = (picker.value as? String) ?? ""
+        // The picker names languages in the interface's own language.
+        let german = AppLanguage.locale.localizedString(forLanguageCode: "de") ?? "German"
+        XCTAssertTrue(selected.lowercased().contains(german.lowercased()), "picker shows \(selected)")
+        XCTAssertEqual(searchField.value as? String, "")
+    }
+
     /// The main window's sections are built with it and only hidden: only
     /// the shown one is in the accessibility tree, and the history's search
     /// typed there is still there after another section.
@@ -205,7 +247,10 @@ final class MurmurlyUITests: XCTestCase {
     /// and builds its recorder, which is where KeyboardShortcuts would seed an
     /// initial combination into a domain that has none.
     func testTestLaunchKeepsShortcutPreferences() {
-        let keys = ["KeyboardShortcuts_dictate", "KeyboardShortcuts_meeting"]
+        let keys = [
+            "KeyboardShortcuts_dictate", "KeyboardShortcuts_meeting",
+            "KeyboardShortcuts_pasteLastDictation", "KeyboardShortcuts_copyLastDictation",
+        ]
         let before = shortcutPreferences(keys)
         print("shortcut preferences before: \(before)")
         let app = XCUIApplication()
@@ -338,9 +383,13 @@ final class MurmurlyUITests: XCTestCase {
     }
 
     private func physicalCommaCharacter() -> String? {
+        physicalCharacter(virtualKey: 43) // kVK_ANSI_Comma
+    }
+
+    private func physicalCharacter(virtualKey: CGKeyCode) -> String? {
         guard let event = CGEvent(
             keyboardEventSource: nil,
-            virtualKey: 43, // kVK_ANSI_Comma
+            virtualKey: virtualKey,
             keyDown: true
         ) else { return nil }
         var characterCount = 0

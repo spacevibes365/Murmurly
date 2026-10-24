@@ -18,6 +18,14 @@ extension KeyboardShortcuts.Name {
         "meeting",
         initial: TestIsolation.isEnabled ? nil : .init(.r, modifiers: [.option, .shift])
     )
+    static let pasteLastDictation = Self(
+        "pasteLastDictation",
+        initial: TestIsolation.isEnabled ? nil : .init(.v, modifiers: [.control, .command])
+    )
+    static let copyLastDictation = Self(
+        "copyLastDictation",
+        initial: TestIsolation.isEnabled ? nil : .init(.c, modifiers: [.control, .command])
+    )
 }
 
 @MainActor
@@ -59,6 +67,16 @@ final class HotkeyManager {
     private var recorderObserver: NSObjectProtocol?
     private var onToggle: () -> Void = {}
     private var isRecording: () -> Bool = { false }
+    private var onHoldBegan: () -> Void = {}
+    private var onHoldEnded: () -> Void = {}
+    private var onEscape: () -> Void = {}
+    /// The tasks iterating each registered shortcut's stream, by shortcut; a
+    /// shortcut's own handle is what "listening" for it means — no separate
+    /// flag that could fall out of sync with it.
+    private var escapeListeners: [KeyboardShortcuts.Shortcut: (id: UUID, task: Task<Void, Never>)] = [:]
+    /// A test copy's stand-in streams: same open/closed life as the real
+    /// ones, but no system hotkey.
+    private var escapeContinuations: [KeyboardShortcuts.Shortcut: AsyncStream<KeyboardShortcuts.EventType>.Continuation] = [:]
 
     /// A test copy installs no system handlers unless a test asks for them.
     init(installsSystemHandlers: Bool = !TestIsolation.isEnabled) {
@@ -68,15 +86,84 @@ final class HotkeyManager {
     isolated deinit {
         settingsCancellable?.cancel()
         tearDownDictationRegistration()
+        closeEscapeListener()
+    }
+
+    /// Esc is taken from every app while registered: open exactly
+    /// `shortcuts`, close the rest. Idempotent; a shortcut already open only
+    /// gets the new callback.
+    func listenForEscape(_ shortcuts: Set<KeyboardShortcuts.Shortcut>, onEscape: @escaping () -> Void) {
+        self.onEscape = onEscape
+        for shortcut in escapeListeners.keys where !shortcuts.contains(shortcut) {
+            closeEscapeListener(for: shortcut)
+        }
+        for shortcut in shortcuts where escapeListeners[shortcut] == nil {
+            openEscapeListener(for: shortcut)
+        }
+    }
+
+    /// Ending a stream (by cancelling the task that iterates it) is what
+    /// unregisters its Carbon hotkey; KeyboardShortcuts does that on the next
+    /// main-actor turn.
+    func closeEscapeListener() {
+        listenForEscape([]) {}
+    }
+
+    private func openEscapeListener(for shortcut: KeyboardShortcuts.Shortcut) {
+        let events: AsyncStream<KeyboardShortcuts.EventType>
+        if installsSystemHandlers {
+            #if DEBUG
+            Self.systemRegistrationsForTesting += 1
+            #endif
+            events = KeyboardShortcuts.events(for: shortcut)
+        } else {
+            let (stream, continuation) = AsyncStream<KeyboardShortcuts.EventType>.makeStream()
+            escapeContinuations[shortcut] = continuation
+            events = stream
+        }
+        let id = UUID()
+        let task = Task { @MainActor [weak self] in
+            for await event in events where event == .keyDown {
+                self?.onEscape()
+            }
+            self?.escapeListenerEnded(shortcut, id)
+        }
+        escapeListeners[shortcut] = (id, task)
+    }
+
+    private func closeEscapeListener(for shortcut: KeyboardShortcuts.Shortcut) {
+        escapeListeners[shortcut]?.task.cancel()
+        escapeListeners[shortcut] = nil
+        escapeContinuations[shortcut]?.finish()
+        escapeContinuations[shortcut] = nil
+    }
+
+    private func escapeListenerEnded(_ shortcut: KeyboardShortcuts.Shortcut, _ id: UUID) {
+        if escapeListeners[shortcut]?.id == id { escapeListeners[shortcut] = nil }
+    }
+
+    /// Esc as pressed while holding `shortcut`: its modifiers stay down, so
+    /// the system sees ⌥Esc, not Esc. nil when that is just Esc or the held
+    /// shortcut has no modifiers (`.function` is dropped: Carbon has no
+    /// fn modifier).
+    static func escapeChord(holding shortcut: KeyboardShortcuts.Shortcut?) -> KeyboardShortcuts.Shortcut? {
+        guard let shortcut, shortcut.key != .escape else { return nil }
+        let modifiers = shortcut.modifiers.intersection([.command, .option, .control, .shift])
+        guard !modifiers.isEmpty else { return nil }
+        return .init(.escape, modifiers: modifiers)
     }
 
     func activate(
         settings: SettingsStore,
         onToggle: @escaping () -> Void,
-        isRecording: @escaping () -> Bool
+        isRecording: @escaping () -> Bool,
+        onHoldBegan: @escaping () -> Void = {},
+        onHoldEnded: @escaping () -> Void = {}
     ) {
         self.onToggle = onToggle
         self.isRecording = isRecording
+        self.onHoldBegan = onHoldBegan
+        self.onHoldEnded = onHoldEnded
 
         settingsCancellable?.cancel()
         settingsCancellable = Publishers.CombineLatest3(
@@ -115,6 +202,15 @@ final class HotkeyManager {
             self?.shortcutKeyDown()
         }
 
+        if configuration.activation == .hold {
+            #if DEBUG
+            Self.systemRegistrationsForTesting += 1
+            #endif
+            KeyboardShortcuts.onKeyUp(for: .dictate) { [weak self] in
+                self?.shortcutKeyUp()
+            }
+        }
+
         if configuration.activation == .doubleModifier {
             installDoubleModifierMonitors()
         }
@@ -125,8 +221,17 @@ final class HotkeyManager {
     }
 
     private func shortcutKeyDown() {
-        guard configuration != nil else { return }
-        onToggle()
+        guard let configuration else { return }
+        if configuration.activation == .hold {
+            onHoldBegan()
+        } else {
+            onToggle()
+        }
+    }
+
+    private func shortcutKeyUp() {
+        guard configuration?.activation == .hold else { return }
+        onHoldEnded()
     }
 
     func dictationDidBecomeIdle() {
@@ -285,6 +390,10 @@ final class HotkeyManager {
         shortcutKeyDown()
     }
 
+    func shortcutKeyUpForTesting() {
+        shortcutKeyUp()
+    }
+
     func resetDoubleModifierSequenceForTesting() {
         doubleModifierReducer.reset()
     }
@@ -303,6 +412,31 @@ final class HotkeyManager {
 
     /// Test-only stand-in for `NSEvent.pressedMouseButtons`.
     var pressedMouseButtonsForTesting: Int?
+
+    /// What is registered (or, in a test copy, would be): the live handles,
+    /// never a separate list that could drift from them.
+    var escapeShortcutsForTesting: Set<KeyboardShortcuts.Shortcut> {
+        Set(escapeListeners.filter { !$0.value.task.isCancelled }.keys)
+    }
+
+    /// Reads the listeners' real handles: open only while at least one task
+    /// is alive and not cancelled, never a separate flag that could drift
+    /// from it.
+    var isEscapeListenerOpenForTesting: Bool { !escapeShortcutsForTesting.isEmpty }
+
+    /// Puts a key-down on that shortcut's stand-in stream, the same path a
+    /// real Esc takes. Returns whether there was a listener to receive it; a
+    /// shortcut that is not registered never calls `onEscape`, and the
+    /// caller still has to confirm the event was handled (not just queued).
+    @discardableResult
+    func pressEscapeForTesting(_ shortcut: KeyboardShortcuts.Shortcut) -> Bool {
+        guard let continuation = escapeContinuations[shortcut] else { return false }
+        continuation.yield(.keyDown)
+        return true
+    }
+
+    @discardableResult
+    func pressEscapeForTesting() -> Bool { pressEscapeForTesting(.init(.escape)) }
     #endif
 
     static func registerMeeting(onToggle: @escaping () -> Void) {
@@ -312,5 +446,22 @@ final class HotkeyManager {
         Self.systemRegistrationsForTesting += 1
         #endif
         KeyboardShortcuts.onKeyDown(for: .meeting, action: onToggle)
+    }
+
+    /// The target is the app in front at key-down; the paste itself waits for
+    /// key-up, as the chord's own keys are still down at key-down.
+    static func registerLastDictation(
+        onPasteDown: @escaping () -> Void,
+        onPasteUp: @escaping () -> Void,
+        onCopy: @escaping () -> Void
+    ) {
+        // A test copy must not take the user's shortcuts.
+        guard !TestIsolation.isEnabled else { return }
+        #if DEBUG
+        Self.systemRegistrationsForTesting += 3
+        #endif
+        KeyboardShortcuts.onKeyDown(for: .pasteLastDictation, action: onPasteDown)
+        KeyboardShortcuts.onKeyUp(for: .pasteLastDictation, action: onPasteUp)
+        KeyboardShortcuts.onKeyDown(for: .copyLastDictation, action: onCopy)
     }
 }

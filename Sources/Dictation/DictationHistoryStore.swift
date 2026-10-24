@@ -87,7 +87,8 @@ struct DictationHistoryEntry: Codable, Equatable, Identifiable, Sendable {
 
 extension Notification.Name {
     /// Posted by a `DictationHistoryStore`, as the object, after its index
-    /// changed: a line appended, an entry deleted or the history cleared.
+    /// changed: a line appended, an entry deleted, its recognition replaced
+    /// or the history cleared.
     static let dictationHistoryDidChange = Notification.Name("DictationHistoryDidChange")
 }
 
@@ -231,7 +232,7 @@ actor DictationHistoryStore {
         return FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
     }
 
-    private func makeEncoder() -> JSONEncoder {
+    func makeEncoder() -> JSONEncoder {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
         encoder.dateEncodingStrategy = .custom { date, encoder in

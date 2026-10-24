@@ -547,7 +547,10 @@ struct StorageSettingsView: View {
 
     /// Decimal units in the interface language, as Finder shows sizes.
     static func byteText(_ bytes: Int64) -> String {
-        ByteCountFormatter.string(fromByteCount: max(bytes, 0), countStyle: .file)
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .file
+        formatter.allowsNonnumericFormatting = false
+        return formatter.string(fromByteCount: max(bytes, 0))
     }
 }
 

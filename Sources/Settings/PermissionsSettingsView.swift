@@ -103,8 +103,9 @@ struct PermissionsSettingsView: View {
         }
     }
 
-    /// The gesture that really starts dictation: the double press when it is
-    /// chosen and usable, otherwise the shortcut.
+    /// The gesture that really starts dictation: holding the shortcut in hold
+    /// mode, the double press when it is chosen and usable, otherwise a press
+    /// of the shortcut.
     @ViewBuilder private var tryDictationRow: some View {
         let doublePress = settings.hotkeyActivation == .doubleModifier && permissions.axTrusted
         let hint = dictationGestureHint(
@@ -113,7 +114,12 @@ struct PermissionsSettingsView: View {
             shortcutDescription: settings.dictationShortcutDescription,
             doubleModifierAvailable: permissions.axTrusted
         )
-        if doublePress || settings.dictationShortcutDescription != nil {
+        if settings.hotkeyActivation == .hold, let shortcut = settings.dictationShortcutDescription {
+            SettingsRow(
+                "Hold \(shortcut)",
+                subtitle: "Open a text field, hold the keys and say a phrase, then release them. Without Accessibility, paste the text with ⌘V."
+            ) { EmptyView() }
+        } else if doublePress || settings.dictationShortcutDescription != nil {
             SettingsRow(
                 "Press \(hint.start)",
                 subtitle: "Open a text field, say a phrase, then press \(hint.stop) to finish. Without Accessibility, paste the text with ⌘V."

@@ -200,13 +200,15 @@ final class RealAudioStageGateTests: XCTestCase {
         XCTAssertEqual(RecordingsStore.meetingsRoot(), support.appendingPathComponent("Meetings", isDirectory: true))
         XCTAssertNotNil(MeetingWatchdog.readSystemSnapshot(), "Production watchdog must read real processes")
 
-        // The menu-bar label's launch task registers the dictation and meeting
-        // hotkeys with the system; it may still be running when the test starts.
-        for _ in 0..<500 where HotkeyManager.systemRegistrationsForTesting < 2 {
+        // The menu-bar label's launch task registers the dictation hotkey (1),
+        // the meeting hotkey (1) and the last-dictation paste down/up and copy
+        // (3); a double-modifier activation adds its two monitors. It may
+        // still be running when the test starts.
+        for _ in 0..<500 where HotkeyManager.systemRegistrationsForTesting < 5 {
             try await Task.sleep(for: .milliseconds(10))
         }
         XCTAssertGreaterThanOrEqual(
-            HotkeyManager.systemRegistrationsForTesting, 2,
+            HotkeyManager.systemRegistrationsForTesting, 5,
             "Production launch did not register its global hotkeys"
         )
     }

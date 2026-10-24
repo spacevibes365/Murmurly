@@ -6,7 +6,8 @@ import XCTest
 /// Test isolation at the real system boundaries, inside the unit-test host. The host is a
 /// test copy of the app, so it must leave the user's hotkeys, processes,
 /// archives, log and preferences alone. Only API that exists before the fix,
-/// plus the DEBUG registration counter, so the same file runs on both trees.
+/// plus the DEBUG registration counter, so the same file runs on both trees,
+/// plus the last-dictation registration.
 @MainActor
 final class TestIsolationTests: XCTestCase {
     func testTestHostRegistersNoGlobalHotkeys() throws {
@@ -22,6 +23,7 @@ final class TestIsolationTests: XCTestCase {
         let manager = HotkeyManager()
         manager.activate(settings: settings, onToggle: {}, isRecording: { false })
         HotkeyManager.registerMeeting {}
+        HotkeyManager.registerLastDictation(onPasteDown: {}, onPasteUp: {}, onCopy: {})
 
         XCTAssertEqual(
             HotkeyManager.systemRegistrationsForTesting - before, 0,
@@ -60,6 +62,8 @@ final class TestIsolationTests: XCTestCase {
         // domain the first time a name that has one is touched.
         XCTAssertNil(KeyboardShortcuts.Name.dictate.initialShortcut)
         XCTAssertNil(KeyboardShortcuts.Name.meeting.initialShortcut)
+        XCTAssertNil(KeyboardShortcuts.Name.pasteLastDictation.initialShortcut)
+        XCTAssertNil(KeyboardShortcuts.Name.copyLastDictation.initialShortcut)
     }
 
     func testInjectedSnapshotStillDrivesTheWatchdog() {

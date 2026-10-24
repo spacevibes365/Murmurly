@@ -23,7 +23,8 @@ extension IOProcCycle {
 /// The real `SystemAudioCapture` behind a recorder, without Core Audio: start
 /// adopts an empty 24 kHz session begun `elapsed` seconds ago, stop hands
 /// `cycles` to the real IOProc, optionally loses a track, then runs the real
-/// stop.
+/// stop; its clock stops `elapsed` seconds after its start, whatever the pace
+/// of the cycles.
 actor AdoptedMeetingCapture: MeetingCaptureBackend {
     /// An AirPods headset dropping out and coming back mid-call: between
     /// steady cycles, one without the microphone stream (live, the aggregate
@@ -55,7 +56,8 @@ actor AdoptedMeetingCapture: MeetingCaptureBackend {
             systemFrames: 0,
             microphoneFrames: 0,
             enqueuedFrames: 0,
-            startedAt: startedAt.addingTimeInterval(-elapsed)
+            startedAt: startedAt.addingTimeInterval(-elapsed),
+            endedAt: startedAt
         )
         return startedAt
     }
@@ -442,13 +444,15 @@ final class SystemAudioCaptureStopTests: XCTestCase {
             .appendingPathComponent("meeting-stop-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let capture = SystemAudioCapture()
+        let startedAt = Date().addingTimeInterval(-elapsed)
         try await capture.adoptSessionForTesting(
             directory: directory,
             sampleRate: sampleRate,
             systemFrames: systemFrames,
             microphoneFrames: microphoneFrames,
             enqueuedFrames: enqueued,
-            startedAt: Date().addingTimeInterval(-elapsed),
+            startedAt: startedAt,
+            endedAt: startedAt.addingTimeInterval(elapsed),
             microphoneChannels: microphoneChannels,
             microphoneSignalChannel: microphoneSignalChannel
         )

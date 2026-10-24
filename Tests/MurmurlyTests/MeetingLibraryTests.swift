@@ -13,6 +13,7 @@ private final class DiskGate: @unchecked Sendable {
     private let lock = NSLock()
     private var held: Set<String> = []
     private var reads: [String: Int] = [:]
+    private var waiting: [String: Int] = [:]
     private var heldAnswers: Set<String> = []
     private var answers: [String: Int] = [:]
     private var heldWrites: Set<String> = []
@@ -42,9 +43,17 @@ private final class DiskGate: @unchecked Sendable {
 
     func pass(_ folder: URL) {
         let path = key(folder)
-        lock.withLock { reads[path, default: 0] += 1 }
+        lock.withLock {
+            reads[path, default: 0] += 1
+            waiting[path, default: 0] += 1
+        }
+        defer { lock.withLock { waiting[path, default: 0] -= 1 } }
         while lock.withLock({ held.contains(path) }) { Thread.sleep(forTimeInterval: 0.005) }
     }
+
+    /// Reads held at the gate right now: one counted here has begun,
+    /// whatever was counted before it.
+    func waiting(at folder: URL) -> Int { lock.withLock { waiting[key(folder), default: 0] } }
 
     private func answer(_ folder: URL) {
         let path = key(folder)
@@ -479,14 +488,21 @@ final class MeetingLibraryTests: XCTestCase {
         library.select(meeting)
         try await until { self.shownLines(library) == ["первая"] }
         gate.hold(local)
+        defer { gate.release(local) }
         library.refresh()
-        try await until { gate.reads(of: self.local) == 2 }
+        // The delayed read is really under way (the channel is busy); the
+        // second refresh only joins it.
+        try await until { gate.waiting(at: self.local) == 1 }
         library.refresh()
 
         library.windowClosed()
         let (lists, texts) = (gate.reads(of: local), gate.reads(of: meeting))
         gate.release(local)
-        try await Task.sleep(for: .milliseconds(300))
+        // finishList sets reading = false and calls runNext in the same turn:
+        // a wrongly restarted joined request would set reading back to true
+        // in that same turn, and this wait would time out instead of seeing
+        // false.
+        try await until { !library.local.reading }
 
         XCTAssertEqual(gate.reads(of: local), lists, "a read started after the window closed")
         XCTAssertEqual(gate.reads(of: meeting), texts, "a text was read after the window closed")
@@ -3533,6 +3549,7 @@ final class MeetingLibraryTests: XCTestCase {
         let second = try seed("2026-10-06 11-00-00 Meeting", in: local, metadata: done)
         let third = try seed("2026-10-06 12-00-00 Meeting", in: local, metadata: done)
         let door = Door()
+        defer { door.unlock() }
         let queue = makeQueue(door: door)
         let library = try await openLibrary(queue: queue)
 
@@ -3540,7 +3557,21 @@ final class MeetingLibraryTests: XCTestCase {
         XCTAssertEqual(plan.items.count, 1)
         queue.enqueue(first)
         try await until { queue.activeJob != nil }
+        // The job's attempt record is on disk before it waits at the door:
+        // the folder no longer holds what the sheet showed, and the
+        // deletion must ask about it again rather than time out.
+        try await until {
+            ((try? FileManager.default.contentsOfDirectory(atPath: first.path)) ?? [])
+                .contains { MeetingAttempt.number(inName: $0) != nil }
+        }
         library.remove(plan)
+        try await until { library.removalRecheck != nil }
+        XCTAssertEqual(library.removalReport.count, 0, "a changed folder must be asked about again, not refused on the old plan")
+        XCTAssertEqual(
+            library.removalRecheck?.items.map(\.meeting.directory.lastPathComponent),
+            [first.lastPathComponent]
+        )
+        library.remove(try XCTUnwrap(library.removalRecheck))
         try await until { !library.removalReport.isEmpty }
         XCTAssertEqual(library.removalReport.map(\.outcome.isRefused), [true])
         XCTAssertTrue(exists(first))

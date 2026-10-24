@@ -373,7 +373,7 @@ final class DictionaryStorageTests: XCTestCase {
     }
 
     func testUnreadableDictionaryIsKeptBlocksEditingAndJobsRunWithout() throws {
-        let newer = try JSONSerialization.data(withJSONObject: ["version": 2, "entries": []])
+        let newer = try JSONSerialization.data(withJSONObject: ["version": 3, "entries": []])
         for stored in [Data("not json".utf8) as Any, "a string", newer] {
             defaults.set(stored, forKey: Self.key)
             let before = defaults.object(forKey: Self.key) as? NSObject
@@ -610,8 +610,8 @@ final class DictionaryTransferTests: XCTestCase {
             (document(["entries": [good]]), .notADictionary, notADictionary),
             (document(["version": 1, "entries": "клод код"]), .notADictionary, notADictionary),
             // Read as a newer version, not as a damaged file, whatever it holds.
-            (document(["version": 2, "words": ["клод код"]]), .version(2),
-             "This dictionary is in a format this version of Murmurly can’t read (version 2)."),
+            (document(["version": 3, "words": ["клод код"]]), .version(3),
+             "This dictionary is in a format this version of Murmurly can’t read (version 3)."),
             (document(["version": 1, "entries": [[String: Any]]()]), .noEntries, "The file has no entries."),
             (document(["version": 1, "entries": [good, noSwitch]]), .unreadableEntry(2), "Entry 2 can’t be read."),
             (document(["version": 1, "entries": [good, badID]]), .unreadableEntry(2), "Entry 2 can’t be read."),

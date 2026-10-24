@@ -118,9 +118,12 @@ final class PermissionManager: ObservableObject {
         accessibility: Bool
     ) {
         let changed = microphone != micStatus || accessibility != axTrusted
-        micStatus = microphone
-        micGranted = microphone == .authorized
-        axTrusted = accessibility
+        // @Published sends on every assignment, equal or not: each 3 s poll
+        // would redraw the menu bar's menu, open or not, for nothing.
+        if micStatus != microphone { micStatus = microphone }
+        let granted = microphone == .authorized
+        if micGranted != granted { micGranted = granted }
+        if axTrusted != accessibility { axTrusted = accessibility }
         if changed || !hasLoggedStatus {
             hasLoggedStatus = true
             AppLog.info(

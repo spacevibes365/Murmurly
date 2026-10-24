@@ -216,7 +216,7 @@ struct DictationHistoryView: View {
 
     private func historyRow(_ entry: DictationHistoryEntry) -> some View {
         let buttonsShown = hoveredEntryID == entry.id || selectedEntryID == entry.id
-            || model.playingEntryID == entry.id
+            || model.playingEntryID == entry.id || dictation.recognizingAgainID == entry.id
         return HStack(alignment: .top, spacing: SettingsChrome.historyRowSpacing) {
             Text(entry.at.formatted(date: .omitted, time: .shortened))
                 .font(.caption.monospacedDigit())
@@ -237,6 +237,11 @@ struct DictationHistoryView: View {
                      + (entry.interrupted == true ? " · " + String(localized: "recording interrupted") : ""))
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                if dictation.recognizingAgainID == entry.id {
+                    Text("Recognizing…")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
             actionButtons(entry)
                 .opacity(buttonsShown ? 1 : 0)
@@ -279,11 +284,20 @@ struct DictationHistoryView: View {
             let playTitle: LocalizedStringKey = model.playingEntryID == entry.id ? "Stop Playback" : "Play Recording"
             Button(playTitle) { togglePlayback(entry) }
             Button("Show in Finder") { reveal(entry) }
+            Button("Recognize Again") { recognizeAgain(entry) }
+                .disabled(!canRecognizeAgain)
         }
         if !entry.text.isEmpty {
             Button("Copy Text") { dictation.copyHistoryEntry(entry) }
             Button("Add to Dictionary…") { addingToDictionary = entry }
         }
+    }
+
+    /// Whether a row may start "Recognize Again": no other replacement is
+    /// already running, and no dictation is under way (it would just hit
+    /// the busy refusal).
+    private var canRecognizeAgain: Bool {
+        dictation.recognizingAgainID == nil && !dictation.isBusy
     }
 
     /// Asks first, wherever it is chosen.
@@ -304,6 +318,19 @@ struct DictationHistoryView: View {
         showingDeleteConfirmation = true
     }
 
+    /// Recognizes the entry's audio again with the dictation's current
+    /// engine, language and dictionary; the new text replaces the old one in
+    /// the same line, and a failure shows as the section's usual error.
+    private func recognizeAgain(_ entry: DictationHistoryEntry) {
+        Task {
+            do {
+                try await dictation.recognizeAgain(entry)
+            } catch {
+                model.errorMessage = error.localizedDescription
+            }
+        }
+    }
+
     private func actionButtons(_ entry: DictationHistoryEntry) -> some View {
         HStack(spacing: SettingsChrome.rowContentSpacing) {
             let isPlaying = model.playingEntryID == entry.id
@@ -320,6 +347,26 @@ struct DictationHistoryView: View {
                 reveal(entry)
             }
             .disabled(!model.audioEntryIDs.contains(entry.id))
+            // Only a row with audio gets the button; others keep the same
+            // width empty, so the column of buttons never shifts.
+            if model.audioEntryIDs.contains(entry.id) {
+                if dictation.recognizingAgainID == entry.id {
+                    ProgressView()
+                        .controlSize(.small)
+                        .frame(width: SettingsChrome.historyActionSize, height: SettingsChrome.historyActionSize)
+                        .help("Recognizing…")
+                        .accessibilityLabel("Recognizing…")
+                } else {
+                    historyAction("arrow.clockwise", help: "Recognize again") {
+                        recognizeAgain(entry)
+                    }
+                    .disabled(!canRecognizeAgain)
+                }
+            } else {
+                Color.clear
+                    .frame(width: SettingsChrome.historyActionSize, height: SettingsChrome.historyActionSize)
+                    .accessibilityHidden(true)
+            }
             historyAction("doc.on.doc", help: "Copy text") {
                 dictation.copyHistoryEntry(entry)
             }

@@ -166,6 +166,92 @@ private struct NoQuitWhisperFactory: WhisperEngineFactory {
     }
 }
 
+/// Holds the store actor inside its first `beforeHistoryReplace` call until
+/// released (bounded): a "Recognize Again" save already begun stays under
+/// way until the test lets it finish. `releaseFailing()` makes the call that
+/// was waiting throw once it resumes, instead of succeeding.
+private final class RecognizeAgainHold: @unchecked Sendable {
+    private let lock = NSLock()
+    private let gate = DispatchSemaphore(value: 0)
+    private var calls = 0
+    private var isReleased = false
+    private var fails = false
+
+    var entered: Bool { lock.withLock { calls > 0 } }
+
+    func hook() throws {
+        let first = lock.withLock { () -> Bool in
+            calls += 1
+            return calls == 1
+        }
+        if first { _ = gate.wait(timeout: .now() + 10) }
+        if lock.withLock({ fails }) { throw CocoaError(.fileWriteUnknown) }
+    }
+
+    func release() {
+        let shouldSignal = lock.withLock { () -> Bool in
+            defer { isReleased = true }
+            return !isReleased
+        }
+        if shouldSignal { gate.signal() }
+    }
+
+    func releaseFailing() {
+        lock.withLock { fails = true }
+        release()
+    }
+}
+
+/// Whatever `recognizeAgain` actually did, kept as a value so the test can
+/// inspect both the success and the failure case without `try`/`catch` at
+/// every call site.
+private enum RecognizeAgainOutcome: @unchecked Sendable {
+    case success
+    case failure(any Error)
+}
+
+@MainActor
+private func runRecognizeAgain(
+    _ fixture: DictationPipelineFixture, entry: DictationHistoryEntry
+) -> Task<RecognizeAgainOutcome, Never> {
+    Task { @MainActor in
+        do {
+            try await fixture.coordinator.recognizeAgain(entry)
+            return .success
+        } catch {
+            return .failure(error)
+        }
+    }
+}
+
+/// The task's result, or nil at the timeout. Never joins the task.
+@MainActor
+private func outcome<T: Sendable>(
+    of task: Task<T, Never>, within timeout: Duration = .seconds(10)
+) async -> T? {
+    await withTaskGroup(of: T?.self) { group in
+        group.addTask { await task.value }
+        group.addTask {
+            try? await Task.sleep(for: timeout)
+            return nil
+        }
+        defer { group.cancelAll() }
+        return await group.next() ?? nil
+    }
+}
+
+/// Waits for a non-throwing task to finish, up to `timeout`; never hangs the
+/// test if the task is stuck.
+@MainActor
+private func waitForTask(_ task: Task<Void, Never>, within timeout: Duration = .seconds(5)) async {
+    await withTaskGroup(of: Void.self) { group in
+        group.addTask { await task.value }
+        group.addTask { try? await Task.sleep(for: timeout) }
+        await group.next()
+        group.cancelAll()
+    }
+}
+
 @MainActor
 final class GracefulQuitTests: XCTestCase {
     // MARK: Dictation
@@ -290,9 +376,11 @@ final class GracefulQuitTests: XCTestCase {
         let archived = audioFiles(under: fixture.root)
         XCTAssertEqual(archived.count, 1, "the failed append must leave the archived copy")
 
-        let first = await result(of: fixture.coordinator.beginTermination())
+        // Quit takes the dictation over at once, then waits for the paste
+        // already begun; the held delivery keeps it from answering yet.
+        let quit = fixture.coordinator.beginTermination()
+        try await waitForDictation { fixture.coordinator.state == .idle }
 
-        XCTAssertEqual(first, false, "a failed save is not a reason to quit")
         XCTAssertEqual(fixture.coordinator.quitBlockingIDs.count, 1)
         XCTAssertEqual(fixture.coordinator.unsavedDictations.map(\.text), ["keep me"])
         let lastSource = await fixture.mic.lastSource
@@ -302,6 +390,8 @@ final class GracefulQuitTests: XCTestCase {
         // pipeline stays invalidated and must not add late feedback.
         fixture.coordinator.cancelTermination()
         gate.open()
+        let first = await result(of: quit)
+        XCTAssertEqual(first, false, "a failed save is not a reason to quit")
         try await Task.sleep(for: .milliseconds(200))
         XCTAssertNotEqual(
             fixture.indicator.presentedState,
@@ -353,8 +443,8 @@ final class GracefulQuitTests: XCTestCase {
         fixture.coordinator.toggle()
         try await waitForDictation { gate.entered }
 
-        let first = await result(of: fixture.coordinator.beginTermination())
-        XCTAssertEqual(first, false)
+        let quit = fixture.coordinator.beginTermination()
+        try await waitForDictation { fixture.coordinator.state == .idle }
         fixture.coordinator.cancelTermination()
         // Recomputing from the recognized text would give "Claude готов",
         // replacing the finished text again "Changed готов".
@@ -363,6 +453,8 @@ final class GracefulQuitTests: XCTestCase {
             DictionaryEntry(heard: ["Claude Code"], written: "Changed"),
         ])
         gate.open()
+        let first = await result(of: quit)
+        XCTAssertEqual(first, false)
         try await Task.sleep(for: .milliseconds(200))
         try FileManager.default.removeItem(at: brokenIndex)
         let second = await result(of: fixture.coordinator.beginTermination())
@@ -905,6 +997,382 @@ final class GracefulQuitTests: XCTestCase {
         meeting.recorder.releaseUnconfirmedRecording()
 
         XCTAssertFalse(meeting.recorder.hasUnfinishedWork)
+    }
+
+    // MARK: Recognize Again and ⌃⌘V
+
+    /// Quit must see "Recognize Again" at all: on R it is invisible to
+    /// `hasUnfinishedWork` (`state` stays `.idle`), so quit answers at once
+    /// and a late result would write over the entry behind the user's back.
+    /// With the fix, quit takes the operation over in the same turn it is
+    /// accepted — before a save has even started — so the late result
+    /// writes nothing and the entry keeps its original text.
+    func testSignalQuitTakesOverRecognizeAgainAndItsLateResultWritesNothing() async throws {
+        let fixture = try DictationPipelineFixture(text: "original words")
+        defer { fixture.cleanup() }
+        try await fixture.dictate()
+        let recentEntries = try await fixture.store.recent(limit: 1)
+        let entry = try XCTUnwrap(recentEntries.first)
+        await fixture.engine.setText("second pass words")
+        await fixture.engine.holdDecodes()
+        fixture.coordinator.recognizeAgainModelReadyForTesting = true
+        let run = runRecognizeAgain(fixture, entry: entry)
+        try await waitForDictation { await fixture.engine.isHoldingDecode() }
+
+        let delegate = AppDelegate()
+        var finishes: [Bool] = []
+        delegate.finishTermination = { finishes.append($0) }
+        delegate.attach(dictation: fixture.coordinator, meeting: makeMeeting(behavior: .succeed).recorder)
+        delegate.signalled = true
+
+        XCTAssertEqual(delegate.applicationShouldTerminate(NSApp), .terminateCancel)
+        try await waitForDictation { !finishes.isEmpty }
+        // No save had started: quit does not wait for the decode still held.
+        XCTAssertEqual(finishes, [true])
+
+        await fixture.engine.releaseHeldDecode()
+        let result = await outcome(of: run)
+        guard case .failure = result else {
+            return XCTFail("expected Recognize Again to fail once quit took it over: \(String(describing: result))")
+        }
+        try await waitForDictation { fixture.coordinator.recognizingAgainID == nil }
+
+        let recent = try await fixture.store.recent(limit: 5)
+        let updated = try XCTUnwrap(recent.first { $0.id == entry.id })
+        XCTAssertEqual(updated.text, "original words", "the late result must write nothing")
+
+        XCTAssertEqual(delegate.applicationShouldTerminate(NSApp), .terminateNow)
+    }
+
+    /// A person's quit while "Recognize Again" is still recognizing warns
+    /// first, naming the operation; repeating the quit goes ahead the usual
+    /// two-phase way, and the entry keeps its original text once quit took
+    /// the operation over.
+    func testQuitDuringRecognizeAgainWarnsFirst() async throws {
+        let fixture = try DictationPipelineFixture(text: "original words")
+        defer { fixture.cleanup() }
+        try await fixture.dictate()
+        let recentEntries = try await fixture.store.recent(limit: 1)
+        let entry = try XCTUnwrap(recentEntries.first)
+        await fixture.engine.setText("second pass words")
+        await fixture.engine.holdDecodes()
+        fixture.coordinator.recognizeAgainModelReadyForTesting = true
+        let run = runRecognizeAgain(fixture, entry: entry)
+        try await waitForDictation { await fixture.engine.isHoldingDecode() }
+
+        let delegate = AppDelegate()
+        var finishes: [Bool] = []
+        delegate.finishTermination = { finishes.append($0) }
+        delegate.attach(dictation: fixture.coordinator, meeting: makeMeeting(behavior: .succeed).recorder)
+
+        XCTAssertEqual(delegate.applicationShouldTerminate(NSApp), .terminateCancel)
+        XCTAssertEqual(
+            fixture.indicator.presentedState,
+            .meetingFailure(message: "A dictation is being recognized again — quit again to stop; the entry keeps its text")
+        )
+        XCTAssertEqual(fixture.coordinator.recognizingAgainID, entry.id)
+        XCTAssertTrue(finishes.isEmpty, "the warning must not start taking the operation over")
+
+        XCTAssertEqual(delegate.applicationShouldTerminate(NSApp), .terminateCancel)
+        try await waitForDictation { !finishes.isEmpty }
+        XCTAssertEqual(finishes, [true])
+
+        await fixture.engine.releaseHeldDecode()
+        let result = await outcome(of: run)
+        guard case .failure = result else {
+            return XCTFail("expected Recognize Again to fail once quit took it over: \(String(describing: result))")
+        }
+        let recent = try await fixture.store.recent(limit: 5)
+        let updated = try XCTUnwrap(recent.first { $0.id == entry.id })
+        XCTAssertEqual(updated.text, "original words")
+    }
+
+    /// Once "Recognize Again" has actually begun writing its new text, quit
+    /// waits for that save instead of cancelling the operation: the new text
+    /// is what quit then confirms.
+    func testQuitWaitsForTheRecognizeAgainSaveAlreadyStarted() async throws {
+        let hold = RecognizeAgainHold()
+        let fixture = try DictationPipelineFixture(text: "original words", beforeHistoryReplace: { _ in try hold.hook() })
+        defer { fixture.cleanup() }
+        try await fixture.dictate()
+        let recentEntries = try await fixture.store.recent(limit: 1)
+        let entry = try XCTUnwrap(recentEntries.first)
+        await fixture.engine.setText("second pass words")
+        fixture.coordinator.recognizeAgainModelReadyForTesting = true
+        let run = runRecognizeAgain(fixture, entry: entry)
+        try await waitForDictation { hold.entered }
+
+        let delegate = AppDelegate()
+        var finishes: [Bool] = []
+        delegate.finishTermination = { finishes.append($0) }
+        delegate.attach(dictation: fixture.coordinator, meeting: makeMeeting(behavior: .succeed).recorder)
+        delegate.signalled = true
+
+        XCTAssertEqual(delegate.applicationShouldTerminate(NSApp), .terminateCancel)
+        try await Task.sleep(for: .milliseconds(300))
+        XCTAssertTrue(finishes.isEmpty, "a save already begun must be waited for, not cancelled")
+
+        hold.release()
+        try await waitForDictation { !finishes.isEmpty }
+        XCTAssertEqual(finishes, [true])
+
+        let result = await outcome(of: run)
+        guard case .success = result else {
+            return XCTFail("the save succeeded; Recognize Again must report success: \(String(describing: result))")
+        }
+        let recent = try await fixture.store.recent(limit: 5)
+        let updated = try XCTUnwrap(recent.first { $0.id == entry.id })
+        XCTAssertEqual(updated.text, "second pass words")
+    }
+
+    /// A save "Recognize Again" already began that then fails is still
+    /// waited for — quit goes ahead regardless of its outcome, by the
+    /// owner's decision (the original entry and its audio are never at
+    /// risk) — and the save's own error reaches the caller unmasked, not
+    /// replaced by `.stoppedByQuit`.
+    func testQuitAfterAFailedRecognizeAgainSaveGoesAheadAndKeepsTheEntry() async throws {
+        let hold = RecognizeAgainHold()
+        let fixture = try DictationPipelineFixture(text: "original words", beforeHistoryReplace: { _ in try hold.hook() })
+        defer { fixture.cleanup() }
+        try await fixture.dictate()
+        let recentEntries = try await fixture.store.recent(limit: 1)
+        let entry = try XCTUnwrap(recentEntries.first)
+        await fixture.engine.setText("second pass words")
+        fixture.coordinator.recognizeAgainModelReadyForTesting = true
+        let run = runRecognizeAgain(fixture, entry: entry)
+        try await waitForDictation { hold.entered }
+
+        let delegate = AppDelegate()
+        var finishes: [Bool] = []
+        delegate.finishTermination = { finishes.append($0) }
+        delegate.attach(dictation: fixture.coordinator, meeting: makeMeeting(behavior: .succeed).recorder)
+        delegate.signalled = true
+
+        XCTAssertEqual(delegate.applicationShouldTerminate(NSApp), .terminateCancel)
+        try await Task.sleep(for: .milliseconds(300))
+        XCTAssertTrue(finishes.isEmpty, "the save already begun must be waited for")
+
+        hold.releaseFailing()
+        try await waitForDictation { !finishes.isEmpty }
+        XCTAssertEqual(finishes, [true], "a failed save is not a reason to refuse quit")
+
+        let result = await outcome(of: run)
+        guard case let .failure(error) = result else {
+            return XCTFail("expected the save's own failure, not success: \(String(describing: result))")
+        }
+        guard let cocoa = error as? CocoaError, cocoa.code == .fileWriteUnknown else {
+            return XCTFail("the save's own error must not be masked as a quit cancellation: \(error)")
+        }
+
+        let recent = try await fixture.store.recent(limit: 5)
+        let updated = try XCTUnwrap(recent.first { $0.id == entry.id })
+        XCTAssertEqual(updated.text, "original words")
+        let audioURL = await fixture.store.audioURL(for: updated)
+        XCTAssertNotNil(audioURL, "the audio must stay so Recognize Again can be tried again")
+    }
+
+    /// The window between quit being accepted and the termination task
+    /// actually running must not let a save start afterwards: the claim
+    /// happens synchronously inside `beginTermination()`, in the same turn
+    /// quit is accepted, before the held decode's late resumption is even
+    /// scheduled.
+    func testQuitAcceptedAsRecognitionReturnsBeginsNoSave() async throws {
+        final class QuitAcceptedFlag: @unchecked Sendable {
+            private let lock = NSLock()
+            private var accepted = false
+            private(set) var enteredWhileAccepted = false
+            private(set) var enteredAtAll = false
+
+            func markAccepted() { lock.withLock { accepted = true } }
+
+            func hook() {
+                lock.withLock {
+                    enteredAtAll = true
+                    if accepted { enteredWhileAccepted = true }
+                }
+            }
+        }
+
+        let flag = QuitAcceptedFlag()
+        let fixture = try DictationPipelineFixture(text: "original words", beforeHistoryReplace: { _ in flag.hook() })
+        defer { fixture.cleanup() }
+        try await fixture.dictate()
+        let recentEntries = try await fixture.store.recent(limit: 1)
+        let entry = try XCTUnwrap(recentEntries.first)
+        await fixture.engine.setText("second pass words")
+        await fixture.engine.holdDecodes()
+        fixture.coordinator.recognizeAgainModelReadyForTesting = true
+        let run = runRecognizeAgain(fixture, entry: entry)
+        try await waitForDictation { await fixture.engine.isHoldingDecode() }
+
+        let delegate = AppDelegate()
+        var finishes: [Bool] = []
+        delegate.finishTermination = { finishes.append($0) }
+        delegate.attach(dictation: fixture.coordinator, meeting: makeMeeting(behavior: .succeed).recorder)
+        delegate.signalled = true
+
+        await fixture.engine.releaseHeldDecode()
+        // No `await` between the release above and this call: the claim
+        // inside it must run before the held decode's own resumption does.
+        let reply = delegate.applicationShouldTerminate(NSApp)
+        flag.markAccepted()
+
+        XCTAssertEqual(reply, .terminateCancel)
+        try await waitForDictation { !finishes.isEmpty }
+        XCTAssertEqual(finishes, [true])
+        try await waitForDictation { fixture.coordinator.recognizingAgainID == nil }
+
+        XCTAssertFalse(flag.enteredWhileAccepted, "a save must never start after quit was already accepted")
+
+        let result = await outcome(of: run)
+        let recent = try await fixture.store.recent(limit: 5)
+        let updated = try XCTUnwrap(recent.first { $0.id == entry.id })
+        if flag.enteredAtAll {
+            XCTAssertEqual(updated.text, "second pass words", "a save begun before the claim is waited for")
+            guard case .success = result else {
+                return XCTFail("the save ran; Recognize Again must report success: \(String(describing: result))")
+            }
+        } else {
+            XCTAssertEqual(updated.text, "original words")
+        }
+    }
+
+    /// A ⌃⌘V whose delivery has already begun (the clipboard overwritten,
+    /// ⌘V sent) must be waited for until the clipboard is restored, never
+    /// cancelled: cancelling it would cut short `TextInjector.inject`'s own
+    /// 400 ms pause and restore the old clipboard before the target read it.
+    func testSignalQuitWaitsForPasteLastToRestoreTheClipboard() async throws {
+        let fixture = try DictationPipelineFixture(text: "unused")
+        defer { fixture.cleanup() }
+        fixture.coordinator.modifierFlagsForTesting = { [] }
+        try await fixture.dictate()
+        let gate = TestGate()
+        let cancelledInside = Box<Bool?>(nil)
+        fixture.deliveryHook.gate = {
+            await gate.wait()
+            cancelledInside.value = Task.isCancelled
+        }
+        fixture.coordinator.pasteLastKeyDownForTesting()
+        fixture.coordinator.pasteLastKeyUpForTesting()
+        try await waitForDictation { gate.entered }
+
+        let delegate = AppDelegate()
+        var finishes: [Bool] = []
+        delegate.finishTermination = { finishes.append($0) }
+        delegate.attach(dictation: fixture.coordinator, meeting: makeMeeting(behavior: .succeed).recorder)
+        delegate.signalled = true
+
+        XCTAssertEqual(delegate.applicationShouldTerminate(NSApp), .terminateCancel)
+        try await Task.sleep(for: .milliseconds(300))
+        XCTAssertTrue(finishes.isEmpty, "a paste already delivering must be waited for")
+
+        gate.open()
+        try await waitForDictation { !finishes.isEmpty }
+        XCTAssertEqual(finishes, [true])
+
+        XCTAssertEqual(cancelledInside.value, false, "a delivery already begun must not be cancelled")
+    }
+
+    /// An ordinary dictation whose paste has already begun must be waited for
+    /// until the clipboard is restored, as ⌃⌘V's is: quitting in the middle
+    /// would leave the dictation on the clipboard instead of what was copied.
+    func testSignalQuitWaitsForADictationAlreadyPastingToRestoreTheClipboard() async throws {
+        let fixture = try DictationPipelineFixture(text: "held paste words")
+        defer { fixture.cleanup() }
+        let gate = TestGate()
+        let cancelledInside = Box<Bool?>(nil)
+        fixture.deliveryHook.gate = {
+            await gate.wait()
+            cancelledInside.value = Task.isCancelled
+        }
+        fixture.coordinator.beginCaptureForTesting()
+        try await waitForDictation { fixture.coordinator.state == .recording }
+        fixture.coordinator.toggle()
+        try await waitForDictation(timeout: .seconds(30)) { gate.entered }
+
+        let delegate = AppDelegate()
+        var finishes: [Bool] = []
+        delegate.finishTermination = { finishes.append($0) }
+        delegate.attach(dictation: fixture.coordinator, meeting: makeMeeting(behavior: .succeed).recorder)
+        delegate.signalled = true
+
+        XCTAssertEqual(delegate.applicationShouldTerminate(NSApp), .terminateCancel)
+        try await Task.sleep(for: .milliseconds(300))
+        XCTAssertTrue(finishes.isEmpty, "a delivery already pasting must be waited for")
+
+        gate.open()
+        try await waitForDictation { !finishes.isEmpty }
+        XCTAssertEqual(finishes, [true])
+        XCTAssertEqual(cancelledInside.value, false, "a delivery already begun must not be cancelled")
+        let delivered = await fixture.probe.deliveredTexts
+        XCTAssertEqual(delivered, ["held paste words"])
+    }
+
+    /// A ⌃⌘V not delivered yet (still waiting for the keys to release) does
+    /// not hold quit, by `hasUnfinishedWork`'s own account; quit allowed at
+    /// once must still drop it, so it never reaches delivery afterwards.
+    func testQuitAnsweredAtOnceDropsAPasteLastNotDeliveredYet() async throws {
+        let fixture = try DictationPipelineFixture(text: "unused")
+        defer { fixture.cleanup() }
+        try await fixture.dictate()
+        // The ordinary dictation above already delivers once on its own
+        // (auto-paste): only a change from this count proves ⌃⌘V itself
+        // delivered something.
+        let deliveredBefore = await fixture.probe.deliveredTexts.count
+        var delivered = 0
+        fixture.deliveryHook.action = { _ in delivered += 1 }
+        fixture.coordinator.modifierFlagsForTesting = { [.control] }
+        fixture.coordinator.pasteLastKeyDownForTesting()
+        let paste = fixture.coordinator.pasteLastKeyUpForTesting()
+
+        let delegate = AppDelegate()
+        var finishes: [Bool] = []
+        delegate.finishTermination = { finishes.append($0) }
+        delegate.attach(dictation: fixture.coordinator, meeting: makeMeeting(behavior: .succeed).recorder)
+        delegate.signalled = true
+
+        XCTAssertEqual(delegate.applicationShouldTerminate(NSApp), .terminateNow)
+        XCTAssertTrue(finishes.isEmpty, "nothing to finish by this reply's own account")
+
+        fixture.coordinator.modifierFlagsForTesting = { [] }
+        if let paste { await waitForTask(paste, within: .seconds(2)) }
+
+        XCTAssertEqual(delivered, 0, "the dropped paste must never reach delivery")
+        let deliveredAfter = await fixture.probe.deliveredTexts.count
+        XCTAssertEqual(deliveredAfter, deliveredBefore, "the dropped paste must not add a delivery of its own")
+
+        fixture.coordinator.cancelTermination()
+    }
+
+    /// A new dictation may start and finish while an earlier entry is being
+    /// recognized again: the two must not block each other.
+    func testANewDictationStartsWhileADictationIsRecognizedAgain() async throws {
+        let fixture = try DictationPipelineFixture(text: "original words")
+        defer { fixture.cleanup() }
+        try await fixture.dictate()
+        let recentEntries = try await fixture.store.recent(limit: 1)
+        let entry = try XCTUnwrap(recentEntries.first)
+        await fixture.engine.setText("second pass words")
+        await fixture.engine.holdDecodes()
+        fixture.coordinator.recognizeAgainModelReadyForTesting = true
+        let run = runRecognizeAgain(fixture, entry: entry)
+        try await waitForDictation { await fixture.engine.isHoldingDecode() }
+
+        fixture.coordinator.beginCaptureForTesting()
+        try await waitForDictation { fixture.coordinator.state == .recording }
+
+        await fixture.engine.releaseHeldDecode()
+
+        fixture.coordinator.toggle()
+        try await waitForDictation(timeout: .seconds(30)) { fixture.coordinator.state == .idle }
+
+        let result = await outcome(of: run)
+        guard case .success = result else {
+            return XCTFail("Recognize Again must not be disturbed by a concurrent dictation: \(String(describing: result))")
+        }
+        let recent = try await fixture.store.recent(limit: 5)
+        let updated = try XCTUnwrap(recent.first { $0.id == entry.id })
+        XCTAssertEqual(updated.text, "second pass words")
     }
 
     // MARK: Helpers

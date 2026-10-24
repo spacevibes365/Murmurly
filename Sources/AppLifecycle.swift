@@ -32,6 +32,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case unsavedMeetingMark
         /// A meeting's transcript being written to the file the user chose.
         case transcriptFile
+        /// "Recognize Again" is recognizing a saved dictation's audio; quit
+        /// would cancel it before it can replace the entry's text. The entry
+        /// and its audio are unaffected either way.
+        case recognizeAgain
 
         /// Alone in the pill: what is lost and the way out.
         var warning: String {
@@ -50,6 +54,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 String(localized: "A meeting’s changes aren’t saved yet — quit again to lose them")
             case .transcriptFile:
                 String(localized: "A transcript is being saved as a file — quit again to stop; the file may not be written")
+            case .recognizeAgain:
+                String(localized: "A dictation is being recognized again — quit again to stop; the entry keeps its text")
             }
         }
 
@@ -63,6 +69,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             case .unsavedFileText: String(localized: "unsaved Files text")
             case .unsavedMeetingMark: String(localized: "changes to a meeting")
             case .transcriptFile: String(localized: "a transcript being saved as a file")
+            case .recognizeAgain: String(localized: "recognizing a dictation again")
             }
         }
     }
@@ -201,6 +208,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let meeting = self.meeting
         guard dictation?.hasUnfinishedWork == true || meeting?.hasUnfinishedWork == true else {
             AppLog.info("app", "quit: nothing to finish")
+            // Nothing to wait for by `hasUnfinishedWork`'s own account, but a
+            // ⌃⌘V not yet delivered, or a "Recognize Again" quit chose not to
+            // warn about this time, must still be stopped before this reply.
+            dictation?.prepareForImmediateQuit()
             return .terminateNow
         }
         AppLog.info("app", "quit: finishing active recordings first")
@@ -229,6 +240,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func quitLosses() -> Set<QuitLoss> {
         var losses = fileLosses().union(meetingLosses())
+        if dictation?.recognizeAgainWouldBeLost == true {
+            losses.insert(.recognizeAgain)
+        }
         if let transcripts = meeting?.transcripts {
             if transcripts.isTranscribing || transcripts.pending.contains(where: \.transcribe) {
                 losses.insert(.meetingTranscription)

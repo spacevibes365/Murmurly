@@ -205,7 +205,10 @@ final class ModelDownloader: ObservableObject {
     }
 
     nonisolated static func sizeText(_ bytes: Int64) -> String {
-        ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .file
+        formatter.allowsNonnumericFormatting = false
+        return formatter.string(fromByteCount: bytes)
     }
 
     private func show(_ received: Int64, of total: Int64, attempt: UInt) {
