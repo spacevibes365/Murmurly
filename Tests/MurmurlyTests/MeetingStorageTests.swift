@@ -303,6 +303,28 @@ final class MeetingStorageTests: XCTestCase {
         XCTAssertEqual(try MeetingStorage.meetingFolders(in: root.appendingPathComponent("absent")), [])
     }
 
+    /// A chosen meetings folder set to a symbolic link (to the local one,
+    /// say) must still show its meetings in the window: `contentsOfDirectory(
+    /// at:)` throws Cocoa 256 when the URL it is given is itself a link, even
+    /// though the real folder behind it reads fine.
+    func testMeetingFoldersOfARootThatIsALink() throws {
+        let target = root.appendingPathComponent("Target", isDirectory: true)
+        try FileManager.default.createDirectory(at: target, withIntermediateDirectories: true)
+        let meeting = try MeetingAudio.folder("2026-10-06 10-00-00 Meeting", in: target, microphone: [[0, 0]], system: [[0, 0]])
+
+        for linkURL in [
+            URL(fileURLWithPath: root.path + "/RootLink"),
+            root.appendingPathComponent("RootLink", isDirectory: false),
+        ] {
+            try? FileManager.default.removeItem(at: linkURL)
+            try FileManager.default.createSymbolicLink(at: linkURL, withDestinationURL: target)
+
+            let folders = try MeetingStorage.meetingFolders(in: linkURL)
+            XCTAssertEqual(folders.map(\.lastPathComponent), [meeting.lastPathComponent])
+            XCTAssertTrue(folders.first?.path.hasPrefix(linkURL.path) ?? false, "the child's path must keep the link's own spelling")
+        }
+    }
+
     /// A meeting whose folder cannot be listed inside a root that can is
     /// still a meeting: it does not vanish from the list and the count.
     func testMeetingWhoseFolderCannotBeReadIsStillListed() throws {

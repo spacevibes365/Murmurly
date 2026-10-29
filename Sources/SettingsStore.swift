@@ -139,6 +139,16 @@ final class SettingsStore: ObservableObject {
         didSet { d.set(dictionaryInMeetings, forKey: K.dictionaryInMeetings) }
     }
     @Published var dictionaryInFiles: Bool { didSet { d.set(dictionaryInFiles, forKey: K.dictionaryInFiles) } }
+    /// Consent for the `murmurly` helper, read fresh on every call of its
+    /// own — off until a person turns it on, never set by reading it.
+    @Published var agentsMeetings: Bool { didSet { d.set(agentsMeetings, forKey: K.agentsMeetings) } }
+    @Published var agentsDictations: Bool { didSet { d.set(agentsDictations, forKey: K.agentsDictations) } }
+    /// `0` is the whole history; otherwise 30, 90 or 365. `-1` means the
+    /// stored value is not one `HelperContract.periodDays(fromStored:)`
+    /// reads (absent reads as `0`, never `-1`): the same rule the helper
+    /// applies, so the picker and the helper never disagree about a value
+    /// written by hand. Reading never writes anything back.
+    @Published var agentsPeriodDays: Int { didSet { d.set(agentsPeriodDays, forKey: K.agentsPeriodDays) } }
 
     private let d: UserDefaults
     private let encodeDictionary: ([DictionaryEntry]) throws -> Data
@@ -169,6 +179,10 @@ final class SettingsStore: ObservableObject {
         static let dictionaryInDictation = "dictionary.inDictation"
         static let dictionaryInMeetings = "dictionary.inMeetings"
         static let dictionaryInFiles = "dictionary.inFiles"
+        // Shared with the `murmurly` helper: `HelperContract.SettingsKey`.
+        static let agentsMeetings = HelperContract.SettingsKey.agentsMeetings
+        static let agentsDictations = HelperContract.SettingsKey.agentsDictations
+        static let agentsPeriodDays = HelperContract.SettingsKey.periodDays
     }
 
     /// Models live in one folder of the app's own, where the downloader puts
@@ -231,6 +245,13 @@ final class SettingsStore: ObservableObject {
         dictionaryInDictation = d.object(forKey: K.dictionaryInDictation) as? Bool ?? true
         dictionaryInMeetings = d.object(forKey: K.dictionaryInMeetings) as? Bool ?? true
         dictionaryInFiles = d.object(forKey: K.dictionaryInFiles) as? Bool ?? true
+        agentsMeetings = d.object(forKey: K.agentsMeetings) as? Bool ?? false
+        agentsDictations = d.object(forKey: K.agentsDictations) as? Bool ?? false
+        // The helper's own rule: a value it would refuse to read (a string,
+        // a fraction, a negative number, a boolean) reads here as `-1`,
+        // never guessed into 0 or clamped into a picker option. Reading
+        // never writes anything back.
+        agentsPeriodDays = HelperContract.periodDays(fromStored: d.object(forKey: K.agentsPeriodDays)) ?? -1
     }
 
     /// What came of choosing the meetings or the transcripts folder.

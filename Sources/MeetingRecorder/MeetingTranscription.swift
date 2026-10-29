@@ -149,10 +149,8 @@ struct MeetingTranscriber: Sendable {
 
     static let sampleRate = 16_000
     /// Speaker labels in the transcript, in the language of the interface.
-    static var microphoneSpeaker: String { String(localized: "Me", comment: "Transcript speaker: the microphone track") }
-    static var systemSpeaker: String {
-        String(localized: "Others", comment: "Transcript speaker: everyone heard through the system audio")
-    }
+    static var microphoneSpeaker: String { MeetingTranscript.microphoneLabel }
+    static var systemSpeaker: String { MeetingTranscript.systemLabel }
     static let vadModelPath = ModelDownloader.defaultRoot
         .appendingPathComponent(ModelSource.vad.destination, isDirectory: true).path
     /// FluidAudio's own ASR guard (0.3 s); a shorter chunk would fail the request.
@@ -703,10 +701,7 @@ extension MeetingTranscriber {
 
         /// `yyyy-MM-dd HH-mm-ss Meeting`, as `RecordingsStore.createSession` names folders.
         static func date(fromFolderName name: String) -> Date? {
-            let formatter = DateFormatter()
-            formatter.locale = Locale(identifier: "en_US_POSIX")
-            formatter.dateFormat = "yyyy-MM-dd HH-mm-ss"
-            return formatter.date(from: String(name.prefix(19)))
+            MeetingStorage.date(fromFolderName: name)
         }
     }
 }

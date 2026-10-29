@@ -182,6 +182,10 @@ if [[ -n "$developer_id" ]]; then
     "${sign[@]}" "$sparkle/Versions/B/Autoupdate"
     "${sign[@]}" "$sparkle/Versions/B/Updater.app"
     "${sign[@]}" "$sparkle"
+    # The command-line helper runs on its own, launched by an agent or a
+    # terminal, so it carries its own hardened runtime and timestamp; it asks
+    # for no entitlements, and its identifier comes from the plist in its binary.
+    "${sign[@]}" --preserve-metadata=identifier "$app/Contents/Helpers/murmurly"
     # Only builds without a Team ID need library validation off to load
     # Sparkle. Here Sparkle carries the same Team ID, and code loaded into an
     # app with microphone and Accessibility grants inherits them.
@@ -209,7 +213,15 @@ if [[ -n "$developer_id" ]]; then
         || fail "could not read the signature of $app"
     [[ "$signed" != *"<key>com.apple.security.cs.disable-library-validation</key>"* ]] \
         || fail "a Developer ID build must keep library validation on"
+    # The helper must be signed as the app is: same team, hardened runtime.
+    helper_info="$(codesign -dv "$app/Contents/Helpers/murmurly" 2>&1)" \
+        || fail "could not read the signature of the murmurly helper"
+    app_team="$(codesign -dv "$app" 2>&1 | sed -n 's/^TeamIdentifier=//p')"
+    [[ -n "$app_team" && "$helper_info" == *"TeamIdentifier=$app_team"* ]] \
+        || fail "the murmurly helper is not signed by the app's team"
+    [[ "$helper_info" == *"(runtime)"* ]] || fail "the murmurly helper lacks the hardened runtime"
 fi
+[[ -x "$app/Contents/Helpers/murmurly" ]] || fail "the murmurly helper is missing from the app"
 
 codesign --verify --deep --strict "$app" || fail "the app signature failed strict verification"
 architectures="$(lipo -archs "$app/Contents/MacOS/$(build_setting EXECUTABLE_NAME)")"

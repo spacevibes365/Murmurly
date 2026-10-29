@@ -10,8 +10,8 @@ configFiles:
   Release: Signing.xcconfig
 settings:
   base:
-    MARKETING_VERSION: "0.3"
-    CURRENT_PROJECT_VERSION: "3"
+    MARKETING_VERSION: "0.4"
+    CURRENT_PROJECT_VERSION: "4"
     GENERATE_INFOPLIST_FILE: YES
     # The Core ML models need Apple Silicon; an Intel slice would only be dead weight.
     ARCHS: arm64
@@ -32,12 +32,20 @@ packages:
   Sparkle:
     url: https://github.com/sparkle-project/Sparkle
     exactVersion: 2.10.0
+  # Only the murmurly helper links it.
+  MCP:
+    url: https://github.com/modelcontextprotocol/swift-sdk
+    exactVersion: 0.12.1
 targets:
   Murmurly:
     type: application
     platform: macOS
     sources:
-      - Sources
+      # Sources/Helper is the murmurly helper's own entry point; the app takes
+      # the rest, Sources/Archive included.
+      - path: Sources
+        excludes:
+          - Helper/**
       - Resources/Assets.xcassets
       # The interface text and the Info.plist permission texts, with translations.
       - Resources/Localizable.xcstrings
@@ -50,6 +58,14 @@ targets:
       - package: KeyboardShortcuts
       - package: FluidAudio
       - package: Sparkle
+      # Contents/Helpers, not Contents/MacOS: there `murmurly` and `Murmurly`
+      # would be one name on a case-insensitive volume.
+      - target: MurmurlyHelper
+        embed: true
+        codeSign: true
+        copy:
+          destination: wrapper
+          subpath: Contents/Helpers
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: io.github.spacevibes365.Murmurly
@@ -83,6 +99,39 @@ targets:
           # Xcode can otherwise inject get-task-allow, which permits debugger
           # attachment and code injection, into an ordinary `xcodebuild build`.
           # A shipped build must not carry it, and notarization refuses it.
+          CODE_SIGN_INJECT_BASE_ENTITLEMENTS: NO
+  # `murmurly`, the read-only command-line and MCP helper for scripts and AI
+  # agents. It shares Sources/Archive with the app and links none of the speech,
+  # update or hotkey packages, so an agent's call does not load them.
+  MurmurlyHelper:
+    type: tool
+    platform: macOS
+    sources:
+      - Sources/Helper
+      - Sources/Archive
+    dependencies:
+      - package: MCP
+    settings:
+      base:
+        PRODUCT_NAME: murmurly
+        # The module must not be named after the product: `murmurly` and the
+        # app's `Murmurly` modules would collide in one products folder.
+        PRODUCT_MODULE_NAME: MurmurlyHelper
+        PRODUCT_BUNDLE_IDENTIFIER: io.github.spacevibes365.Murmurly.helper
+        # Bundle.main reads the version from the plist built into the binary.
+        CREATE_INFOPLIST_SECTION_IN_BINARY: YES
+        SKIP_INSTALL: YES
+        CODE_SIGN_STYLE: Manual
+        CODE_SIGN_IDENTITY: $(MURMURLY_CODE_SIGN_IDENTITY)
+        ENABLE_HARDENED_RUNTIME: YES
+        SWIFT_VERSION: "6.0"
+        SWIFT_STRICT_CONCURRENCY: complete
+        GCC_TREAT_WARNINGS_AS_ERRORS: YES
+        SWIFT_TREAT_WARNINGS_AS_ERRORS: YES
+      configs:
+        Debug:
+          ENABLE_HARDENED_RUNTIME: NO
+        Release:
           CODE_SIGN_INJECT_BASE_ENTITLEMENTS: NO
   MurmurlyTests:
     type: bundle.unit-test

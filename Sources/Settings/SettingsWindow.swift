@@ -144,6 +144,7 @@ struct SettingsWindow: View {
                         )
                     }
                 }
+                tabLayer(.agents) { standardContent { AgentsSettingsView() } }
                 tabLayer(.permissions) { standardContent { PermissionsSettingsView() } }
             }
         }
@@ -226,6 +227,12 @@ struct SettingsWindow: View {
         case .storage:
             return archiveSnapshot.map { StorageSettingsView.byteText($0.totalBytes) }
                 ?? StorageSettingsView.pendingCountText(failed: archiveFailure != nil)
+        case .agents:
+            let allowed = [
+                settings.agentsMeetings ? String(localized: "Meetings") : nil,
+                settings.agentsDictations ? String(localized: "Dictations") : nil,
+            ].compactMap { $0 }
+            return allowed.isEmpty ? String(localized: "Nothing allowed") : allowed.joined(separator: " · ")
         case .gettingStarted:
             return String(localized: "Speech is recognized on this Mac")
         }
@@ -313,6 +320,11 @@ struct SettingsWindow: View {
             String(localized: "Storage"),
             String(localized: "space folder size move", comment: "Search words for the Storage tab"),
             "externaldrive.fill", .gray
+        )
+        case .agents: (
+            String(localized: "Agents"),
+            String(localized: "cloud model consent read access", comment: "Search words for the Agents tab"),
+            "sparkles", .purple
         )
         case .permissions: (
             String(localized: "Permissions"),

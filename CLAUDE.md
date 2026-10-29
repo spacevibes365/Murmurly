@@ -162,7 +162,7 @@ window closed is there for its first appearance, and Open Murmurly shows the
 last one. "Open Full History…" and "Transcribe a File…" open the main window on
 their section; "More Languages…", "Download Model…" and an unreachable meetings
 folder open Settings, which holds only settings (`SettingsTab`: Getting
-Started, Dictation, Meetings, Storage, Permissions; a stored tab of the three
+Started, Dictation, Meetings, Storage, Agents, Permissions; a stored tab of the three
 that left reads as the default). The scene hands the main window the app's
 own `FilesModel` and `DictationCoordinator`. The views follow the main
 window's section, never Settings' tab: the history's sound stops when
@@ -425,7 +425,9 @@ limit is not about the tracks.
 **The Murmurly window** reads through `MeetingLibrary` (owned by the app,
 like `FilesModel`, so a closed window keeps its snapshot and stops nothing). A
 meeting is `MeetingStorage.meetingFolders`: a folder named as recordings are,
-with `metadata.json` or a track; Storage counts the same. Its identity is its
+with `metadata.json` or a track; Storage counts the same. A root that is
+itself a link is listed through its target (`MeetingStorage.rootChildNames`),
+its meetings keeping the link's path. Its identity is its
 path: a name in both roots is two rows. The library reads only while the
 window is open, each folder (the local root, the chosen meetings folder, a
 meeting outside both opened from the menu) on a serial `DispatchQueue` of its
@@ -996,6 +998,70 @@ flag. FluidAudio is held in `ModelHub.offlineMode` and WhisperKit loads with
 `download: false`, so the downloader is the only code that fetches models.
 Without a model, the dictation shortcut does not record but says where to get
 one; a meeting is still recorded and explains how to transcribe it later.
+
+**The agents' helper** (`murmurly`, target `MurmurlyHelper`). A separate
+command-line program, read-only, embedded at `Contents/Helpers/murmurly` (not
+`Contents/MacOS`: on a case-insensitive volume `murmurly` would be the app's own
+`Murmurly`). Its entry is `Sources/Helper/`, left out of the app target; the read
+layer it shares with the app is `Sources/Archive/`, in both. Four commands —
+`meetings`, `transcript <id>`, `search <text>`, `dictations`, each with
+`--json` — and `murmurly mcp`, an MCP server over stdio (swift-sdk, pinned)
+whose four tools (`HelperContract.Tools`) go through the same `perform`, so the
+CLI and an agent never disagree. The contract is `HelperContract`: ids are
+`local:` or `chosen:` and the meeting folder's name; exit codes 2 usage, 3
+access denied, 4 not found, 5 read error, 6 not responding (the whole call is
+cut at 30 s, the chosen meetings folder at 5 s of its own, its availability
+check included, and read once at a time per process: while one read hangs, the
+next call answers `notResponding` for it at once and still gives the local
+meetings); an answer stays under 1 MiB on the command line and 64 KiB over MCP
+(`fitItems`, then `truncated`; one that still does not fit is refused with a
+read error asking to narrow it); `meetings` comes 50 at a time (`--limit` 1…500, `hasMore`,
+`nextUntil`, a page never split inside one second); every tool description and
+the first block of every MCP answer say the text is the participants' words,
+not instructions. Access is `agents.meetings`, `agents.dictations` and
+`agents.periodDays` (0 is all history; the tab offers 30, 90 and 365), read
+from the app's domain on every call and again at its end, for every source a
+search covered: switched off or changed meanwhile, the call is refused. The
+period's bound is taken at the start of a call, so a long read may return an
+item seconds past it. A period that does not read as a
+non-negative whole number refuses everything (`HelperContract.periodDays(fromStored:)`,
+the one rule for the tab and the helper; the tab shows nothing chosen). Links
+are refused (`Archive.Links.refuse`, `O_NOFOLLOW`); a folder that cannot be
+read is reported (`unread`, `readError`), never taken for one that is not
+there, and nothing outside the period is named, not even in `unread`. A
+meeting folder swapped for a link between its check and its read is not
+caught: only a process of the same account could do that, and such a process
+reads the files directly anyway. Speed: a
+listing reads attempt records without their lines, `transcript` finds its
+folder by id without a listing, and a search reads in full only the
+transcripts and history lines that contain the query by a quick check under
+the window's own rule. Every call is logged to
+`~/Library/Logs/Murmurly/agents.log` without its text. In DEBUG,
+`MURMURLY_HELPER_MEETINGS_ROOT`, `_DICTATIONS_ROOT`, `_SETTINGS` and `_LOG` —
+all four or none — and `_MAX_BYTES` replace the roots, settings, log and limit
+for tests; Release ignores them. Tests run the embedded helper as a process
+with all four and a temporary `HOME`, and skip outside DEBUG.
+`scripts/release.sh` signs the helper with the hardened runtime before the app
+and checks its team.
+
+**Settings → Agents** (`SettingsTab.agents`, `AgentsSettingsView`) holds the two
+switches, the period and **Connect** (`AgentConnections`). Connect to Claude
+Code / Codex runs the client found in its usual install places (a GUI app's
+`PATH` is short; the child gets the program's own folder first, as npm installs
+need `node` beside them) with argument arrays, no shell: `mcp remove murmurly`,
+`mcp add … murmurly -- <Contents/Helpers/murmurly of the running copy> mcp`
+(Claude with `--scope user`), then `mcp get` must name that path; each step has
+a timeout. The path that passed is kept (`agents.claudeCode.helperPath`,
+`agents.codex.helperPath`); another path is "out of date", and a failed `add`
+after a `remove` forgets it. Only a copy in `~/Applications` or
+`/Applications` connects (`LoginItemManager.defaultInstalledBundlePaths`).
+Install Command in Terminal links `/usr/local/bin/murmurly` to the running
+copy's helper through osascript's administrator prompt, the paths passed as
+arguments; a file there that is not such a link is never replaced — the
+privileged command checks again right before it links — and no command that
+would replace it is offered. The link is read again when the tab
+is chosen and when the app becomes active. A test process finds no client and
+runs nothing.
 
 **Updates.** Sparkle 2.10.0. `AppUpdater` (`Sources/AppUpdater.swift`) is the
 only place the app talks to Sparkle: the standard window with release notes and

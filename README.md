@@ -52,6 +52,8 @@ on your Mac: Murmurly never uploads your recordings or text to be transcribed.
 - Delete a meeting's audio or the whole meeting to the Trash, one or several at
   once; optionally, delete the audio of fully transcribed meetings after 7, 30
   or 90 days.
+- AI agents such as Claude Code and Codex can read your meeting transcripts and
+  dictations, when you allow it, through a read-only `murmurly` command.
 - Interface in 12 languages.
 - Automatic updates.
 
@@ -565,6 +567,52 @@ If you switch to an engine that does not know the language you chose, it uses
 Auto; your choice is kept for the other engine, and **Settings → Dictation**
 says so under the language list.
 
+## Use with AI agents
+
+An AI agent such as Claude Code or Codex can read your meeting transcripts and
+dictations through Murmurly, so you can ask it what was decided in yesterday's
+call or find something you dictated last week. It only reads: nothing in
+Murmurly is changed, and no audio is shared.
+
+**Allow it first.** Open **Settings → Agents** and turn on **Meetings**
+(transcripts and meeting titles), **Dictations** (dictation text, without
+audio), or both; under **Period**, choose how far back an agent may look. Both
+switches are off until you turn them on, and the agent is told "access is off"
+until then.
+
+**Connect.** Under **Connect**, click **Connect to Claude Code** or **Connect to
+Codex**. Murmurly finds the program in its usual install places and adds itself
+to that program's settings; start a new session of the agent afterwards. This
+works only for a copy of Murmurly in the Applications folder, as the agent is
+pointed at that copy. If you move Murmurly, the row says the connection is
+out of date: click **Update Connection**. If the program is not
+found, **Copy Command** gives you the command to run in Terminal yourself.
+
+**Command in Terminal.** **Install Command in Terminal** asks for an
+administrator password once and puts a `murmurly` command into
+`/usr/local/bin`, so it works in any new terminal window:
+
+```sh
+murmurly meetings                 # the latest meetings, newest first
+murmurly transcript <id>          # one meeting's transcript, in chunks
+murmurly search "budget"          # meetings and dictations
+murmurly dictations --last 20
+```
+
+Add `--json` for the answer as JSON, and run `murmurly` alone for every option.
+
+**What an agent gets.** Answers come in portions so they do not fill the
+agent's memory: 50 meetings, 200 transcript lines, 20 search results from
+each of meetings and dictations, or 20 dictations at a time. The agent asks for the next meetings or the next lines of
+a transcript itself, and narrows a search or the dictations by date. Each
+answer is what is on disk at that moment. Every request is written, without
+its text, to `~/Library/Logs/Murmurly/agents.log`.
+
+**Privacy.** Murmurly does not send your meetings or dictations anywhere. An
+agent you allow sends what it reads to its own cloud model, under that
+company's terms. The switches are your consent, not a lock: any program
+running under your account can read the files directly.
+
 ## Privacy
 
 - Speech is recognized on your Mac. Murmurly does not upload recordings or text
@@ -587,6 +635,9 @@ says so under the language list.
   or send it. Text you copy yourself with a **Copy** button uses the regular
   clipboard, which macOS may share with your other devices through Universal
   Clipboard.
+- AI agents read nothing until you turn it on in **Settings → Agents**; an agent
+  you allow sends what it reads to its own cloud model. See
+  [Use with AI agents](#use-with-ai-agents).
 - The log (`~/Library/Logs/Murmurly/`, also **Show Log in Finder** in **Settings
   → Permissions**) contains file names and folder paths. Check it before you
   attach it to a bug report.

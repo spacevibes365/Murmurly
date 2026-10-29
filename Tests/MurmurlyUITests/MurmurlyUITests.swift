@@ -77,7 +77,7 @@ final class MurmurlyUITests: XCTestCase {
         XCTAssertEqual(app.windows.count, 1)
         guard app.settingsSidebarSearchIsEmpty() else { return }
 
-        let tabs = ["gettingStarted", "dictation", "meetings", "storage", "permissions"]
+        let tabs = ["gettingStarted", "dictation", "meetings", "storage", "agents", "permissions"]
         for gone in ["dictionary", "history", "files"] {
             XCTAssertFalse(app.buttons["settingsTab.\(gone)"].exists, "Settings still has the \(gone) tab")
         }
@@ -101,6 +101,33 @@ final class MurmurlyUITests: XCTestCase {
             case "dictation":
                 XCTAssertTrue(
                     app.descendants(matching: .any)["dictationLanguagePicker"]
+                        .waitForExistence(timeout: 5)
+                )
+            case "agents":
+                XCTAssertTrue(
+                    app.descendants(matching: .any)["agentsMeetingsToggle"]
+                        .waitForExistence(timeout: 5)
+                )
+                XCTAssertTrue(
+                    app.descendants(matching: .any)["agentsDictationsToggle"]
+                        .waitForExistence(timeout: 5)
+                )
+                XCTAssertTrue(
+                    app.descendants(matching: .any)["agentsPeriodPicker"]
+                        .waitForExistence(timeout: 5)
+                )
+                // In a UI test process no copy of Murmurly is "installed", so these
+                // buttons exist but stay disabled — nothing here is clicked.
+                XCTAssertTrue(
+                    app.descendants(matching: .any)["agentsConnectClaudeButton"]
+                        .waitForExistence(timeout: 5)
+                )
+                XCTAssertTrue(
+                    app.descendants(matching: .any)["agentsConnectCodexButton"]
+                        .waitForExistence(timeout: 5)
+                )
+                XCTAssertTrue(
+                    app.descendants(matching: .any)["agentsInstallCommandButton"]
                         .waitForExistence(timeout: 5)
                 )
             case "permissions":

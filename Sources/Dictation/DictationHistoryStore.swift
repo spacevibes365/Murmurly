@@ -1,90 +1,6 @@
 import Darwin
 import Foundation
 
-struct DictationHistoryEntry: Codable, Equatable, Identifiable, Sendable {
-    static let currentSchemaVersion = 1
-
-    let schemaVersion: Int
-    let id: UUID
-    let source: String
-    let at: Date
-    let duration: TimeInterval
-    let selectedLanguage: String
-    let actualLanguage: String
-    let engine: String?
-    let targetBundleID: String?
-    let targetApplicationName: String?
-    let audioPath: String
-    let text: String
-    /// The recognized text before the personal dictionary changed it; set
-    /// only when it did, so a wrong entry never costs the original words and
-    /// a line without replacements stays byte for byte what it was.
-    let rawText: String?
-    /// Set only for a dictation cut short by a capture failure; absent keys
-    /// keep every ordinary line byte-identical within schema version 1.
-    let interrupted: Bool?
-    /// Set only when such a fragment could not be recognized, so an engine
-    /// error is never shown as silence.
-    let recognitionFailed: Bool?
-    /// Set only when quit saved the audio without waiting for recognition.
-    let recognitionSkipped: Bool?
-
-    init(
-        schemaVersion: Int = currentSchemaVersion,
-        id: UUID,
-        source: String = "dictation",
-        at: Date,
-        duration: TimeInterval,
-        selectedLanguage: String,
-        actualLanguage: String,
-        engine: String? = nil,
-        targetBundleID: String?,
-        targetApplicationName: String?,
-        audioPath: String,
-        text: String,
-        rawText: String? = nil,
-        interrupted: Bool? = nil,
-        recognitionFailed: Bool? = nil,
-        recognitionSkipped: Bool? = nil
-    ) {
-        self.schemaVersion = schemaVersion
-        self.id = id
-        self.source = source
-        self.at = at
-        self.duration = duration
-        self.selectedLanguage = selectedLanguage
-        self.actualLanguage = actualLanguage
-        self.engine = engine
-        self.targetBundleID = targetBundleID
-        self.targetApplicationName = targetApplicationName
-        self.audioPath = audioPath
-        self.text = text
-        self.rawText = rawText
-        self.interrupted = interrupted
-        self.recognitionFailed = recognitionFailed
-        self.recognitionSkipped = recognitionSkipped
-    }
-
-    private enum CodingKeys: String, CodingKey {
-        case schemaVersion = "schema_version"
-        case id
-        case source
-        case at
-        case duration = "duration_seconds"
-        case selectedLanguage = "selected_language"
-        case actualLanguage = "actual_language"
-        case engine
-        case targetBundleID = "target_bundle_id"
-        case targetApplicationName = "target_app_name"
-        case audioPath = "audio_path"
-        case text
-        case rawText = "raw_text"
-        case interrupted
-        case recognitionFailed = "recognition_failed"
-        case recognitionSkipped = "recognition_skipped"
-    }
-}
-
 extension Notification.Name {
     /// Posted by a `DictationHistoryStore`, as the object, after its index
     /// changed: a line appended, an entry deleted, its recognition replaced
@@ -94,7 +10,7 @@ extension Notification.Name {
 
 actor DictationHistoryStore {
     static let shared = DictationHistoryStore()
-    static let historyFileName = "history.jsonl"
+    static let historyFileName = DictationHistoryEntry.historyFileName
 
     let root: URL
     let fileManager = FileManager()
@@ -232,38 +148,9 @@ actor DictationHistoryStore {
         return FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
     }
 
-    func makeEncoder() -> JSONEncoder {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.sortedKeys]
-        encoder.dateEncodingStrategy = .custom { date, encoder in
-            var container = encoder.singleValueContainer()
-            try container.encode(Self.timestampFormatter().string(from: date))
-        }
-        return encoder
-    }
+    func makeEncoder() -> JSONEncoder { DictationHistoryEntry.makeEncoder() }
 
-    func makeDecoder() -> JSONDecoder {
-        let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .custom { decoder in
-            let container = try decoder.singleValueContainer()
-            let value = try container.decode(String.self)
-            guard let date = Self.timestampFormatter().date(from: value) else {
-                throw DecodingError.dataCorruptedError(
-                    in: container,
-                    debugDescription: "Expected fractional UTC ISO8601 timestamp"
-                )
-            }
-            return date
-        }
-        return decoder
-    }
-
-    private nonisolated static func timestampFormatter() -> ISO8601DateFormatter {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        formatter.timeZone = TimeZone(secondsFromGMT: 0)
-        return formatter
-    }
+    func makeDecoder() -> JSONDecoder { DictationHistoryEntry.makeDecoder() }
 
     private nonisolated static func utcYearMonth(from date: Date) -> (year: String, month: String) {
         var calendar = Calendar(identifier: .gregorian)
@@ -279,5 +166,5 @@ actor DictationHistoryStore {
         try beforeHistoryReplace()
     }
 
-    nonisolated static let newline: UInt8 = 0x0A
+    nonisolated static let newline: UInt8 = DictationHistoryEntry.newline
 }

@@ -1,57 +1,5 @@
 import Foundation
 
-private struct ReverseJSONLReader {
-    private let handle: FileHandle
-    private let blockSize: UInt64
-    private var unreadUpperBound: UInt64
-    private var buffer = Data()
-    private var bufferStart: UInt64
-    private var shouldConsumeTrailingDelimiter = true
-
-    init(handle: FileHandle, upperBound: UInt64, blockSize: Int) {
-        self.handle = handle
-        self.blockSize = UInt64(blockSize)
-        self.unreadUpperBound = upperBound
-        self.bufferStart = upperBound
-    }
-
-    mutating func next() throws -> (data: Data, startOffset: UInt64)? {
-        while true {
-            if shouldConsumeTrailingDelimiter, !buffer.isEmpty {
-                shouldConsumeTrailingDelimiter = false
-                if buffer.last == DictationHistoryStore.newline {
-                    buffer.removeLast()
-                }
-            }
-
-            if let delimiter = buffer.lastIndex(of: DictationHistoryStore.newline) {
-                let lineStart = buffer.index(after: delimiter)
-                let line = Data(buffer[lineStart...])
-                let absoluteStart = bufferStart + UInt64(lineStart)
-                buffer.removeSubrange(delimiter..<buffer.endIndex)
-                return (line, absoluteStart)
-            }
-
-            if unreadUpperBound == 0 {
-                guard !buffer.isEmpty else { return nil }
-                let line = buffer
-                buffer.removeAll(keepingCapacity: false)
-                return (line, 0)
-            }
-
-            let count = min(blockSize, unreadUpperBound)
-            let start = unreadUpperBound - count
-            try handle.seek(toOffset: start)
-            let chunk = try handle.read(upToCount: Int(count)) ?? Data()
-            var combined = chunk
-            combined.append(buffer)
-            buffer = combined
-            bufferStart = start
-            unreadUpperBound = start
-        }
-    }
-}
-
 extension DictationHistoryStore {
     private static var historyReadBlockSize: Int { 64 * 1024 }
 
@@ -80,38 +28,16 @@ extension DictationHistoryStore {
         let upperBound = min(cursor ?? fileSize, fileSize)
         guard upperBound > 0 else { return ([], nil) }
 
-        var reader = ReverseJSONLReader(
+        let needle = DictationHistoryEntry.searchNeedle(query)
+        return try DictationHistoryEntry.scanBackward(
             handle: handle,
             upperBound: upperBound,
-            blockSize: Self.historyReadBlockSize
+            limit: limit,
+            blockSize: Self.historyReadBlockSize,
+            decoder: makeDecoder(),
+            include: { needle == nil || $0.matches(needle: needle!) },
+            onMalformed: { AppLog.error("dictation-history", "skipping malformed JSONL line") }
         )
-        let needle = query?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let shouldFilter = !(needle?.isEmpty ?? true)
-        var entries: [DictationHistoryEntry] = []
-
-        while let rawLine = try reader.next() {
-            try Task.checkCancellation()
-            guard !rawLine.data.isEmpty else { continue }
-            let entry: DictationHistoryEntry
-            do {
-                entry = try makeDecoder().decode(DictationHistoryEntry.self, from: rawLine.data)
-            } catch {
-                AppLog.error("dictation-history", "skipping malformed JSONL line")
-                continue
-            }
-            if shouldFilter,
-               let needle,
-               !entry.text.localizedCaseInsensitiveContains(needle) {
-                continue
-            }
-
-            entries.append(entry)
-            if entries.count == limit {
-                let nextCursor = rawLine.startOffset > 0 ? rawLine.startOffset : nil
-                return (entries, nextCursor)
-            }
-        }
-        return (entries, nil)
     }
 
     func recent(limit: Int = 10) throws -> [DictationHistoryEntry] {
@@ -152,8 +78,7 @@ extension DictationHistoryStore {
         let handle = try FileHandle(forReadingFrom: historyURL)
         defer { try? handle.close() }
         let decoder = makeDecoder()
-        let needle = query?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let shouldFilter = !(needle?.isEmpty ?? true)
+        let needle = DictationHistoryEntry.searchNeedle(query)
         var carry = Data()
         var count = 0
         var oldest: Date?
@@ -164,9 +89,7 @@ extension DictationHistoryStore {
                 AppLog.error("dictation-history", "skipping malformed JSONL line during scan")
                 return
             }
-            if shouldFilter,
-               let needle,
-               !entry.text.localizedCaseInsensitiveContains(needle) {
+            if let needle, !entry.matches(needle: needle) {
                 return
             }
             count += 1

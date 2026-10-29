@@ -5,5 +5,6 @@ enum SettingsTab: String, CaseIterable, Sendable {
     case dictation
     case meetings
     case storage
+    case agents
     case permissions
 }
