@@ -8,6 +8,15 @@ protocol MeetingCaptureBackend: Sendable {
     /// session. A start that fails or is cancelled removes it.
     func start(in directory: URL) async throws -> Date
     func stop() async throws -> [URL]
+    /// Seconds of audio already written to the tracks, for the call feed
+    /// watcher's clock; nil when the backend does not know. The default
+    /// (below) answers nil, so the test doubles that stand in for this
+    /// protocol elsewhere keep building without knowing about this card.
+    func writtenSeconds() async -> TimeInterval?
+}
+
+extension MeetingCaptureBackend {
+    func writtenSeconds() async -> TimeInterval? { nil }
 }
 
 /// Owns the production meeting flow: menu/hotkey -> system audio + microphone
@@ -98,6 +107,9 @@ final class MeetingRecorder: ObservableObject {
     private let beepPlayer: @MainActor @Sendable () -> Void
     private let fileViewer: @MainActor @Sendable (URL) -> Void
     private let createSession: @MainActor () throws -> URL
+    private let holderSource: @Sendable () -> Set<String>?
+    private let pageSnapshotSource: @Sendable (_ holders: Set<String>, _ pin: MeetingPageReader.Pin?) async -> MeetingPageSnapshot
+    private let callFeedInterval: Duration
     private weak var settings: SettingsStore?
     private weak var permissions: PermissionManager?
     private weak var dictation: DictationCoordinator?
@@ -123,6 +135,7 @@ final class MeetingRecorder: ObservableObject {
     private var isTerminating = false
     private var quitRequested = false
     private var terminationTask: Task<Bool, Never>?
+    private var callFeedWatcher: CallFeedWatcher?
 
     init(
         capture: any MeetingCaptureBackend,
@@ -137,7 +150,14 @@ final class MeetingRecorder: ObservableObject {
         fileViewer: @escaping @MainActor @Sendable (URL) -> Void = {
             NSWorkspace.shared.activateFileViewerSelecting([$0])
         },
-        createSession: @escaping @MainActor () throws -> URL = { try RecordingsStore().createSession() }
+        createSession: @escaping @MainActor () throws -> URL = { try RecordingsStore().createSession() },
+        holderSource: @escaping @Sendable () -> Set<String>? = { MeetingWatchdog.readHolderBundleIDs() },
+        pageSnapshotSource: @escaping @Sendable (
+            _ holders: Set<String>, _ pin: MeetingPageReader.Pin?
+        ) async -> MeetingPageSnapshot = { holders, pin in
+            await MeetingPageReader.readLive(holders: holders, pin: pin)
+        },
+        callFeedInterval: Duration = .milliseconds(300)
     ) {
         self.capture = capture
         self.indicator = indicator
@@ -147,6 +167,9 @@ final class MeetingRecorder: ObservableObject {
         self.beepPlayer = beepPlayer
         self.fileViewer = fileViewer
         self.createSession = createSession
+        self.holderSource = holderSource
+        self.pageSnapshotSource = pageSnapshotSource
+        self.callFeedInterval = callFeedInterval
     }
 
     var isBusy: Bool { state.isBusy }
@@ -308,6 +331,29 @@ final class MeetingRecorder: ObservableObject {
                     self.beginStop()
                     return
                 }
+                if self.settings?.namesFromCallWindow == true {
+                    let holderSource = self.holderSource
+                    let pageSnapshotSource = self.pageSnapshotSource
+                    let feedSource: @Sendable (MeetingPageReader.Pin?) async -> CallFeedWatcher.Read = { pin in
+                        let holders = holderSource()
+                        // Once pinned, the read never consults holders: an
+                        // unreadable snapshot must not stop the pinned page
+                        // being read.
+                        if holders == nil, pin == nil { return .skipped }
+                        let snapshot = await pageSnapshotSource(holders ?? [], pin)
+                        return CallFeedWatcher.read(from: snapshot)
+                    }
+                    let capture = self.capture
+                    let watcher = CallFeedWatcher(
+                        directory: directory,
+                        snapshotSource: feedSource,
+                        writtenSeconds: { await capture.writtenSeconds() },
+                        isEnabled: { [weak self] in self?.settings?.namesFromCallWindow ?? false },
+                        interval: self.callFeedInterval
+                    )
+                    self.callFeedWatcher = watcher
+                    await watcher.start()
+                }
             } catch is CancellationError {
                 _ = try? await self.capture.stop()
                 self.state = .idle
@@ -359,6 +405,13 @@ final class MeetingRecorder: ObservableObject {
                 self.recordingTrigger = nil
                 self.watchdog?.recordingDidEnd()
                 self.operationTask = nil
+            }
+            // Before `capture.stop()` writes `metadata.json`: a watcher
+            // still appending while the folder is read or moved would make
+            // the copy disagree with the original.
+            if let watcher = self.callFeedWatcher {
+                self.callFeedWatcher = nil
+                await watcher.finish()
             }
             do {
                 let tracks = try await self.capture.stop()
@@ -414,6 +467,14 @@ final class MeetingRecorder: ObservableObject {
     }
 
     private func stopCancelledStart() async {
+        // Required here too even though the start sequence never reaches
+        // this path with a watcher already running (it is started only
+        // after a start that was not cancelled): a later change to that
+        // order must not silently reopen the feed.
+        if let watcher = callFeedWatcher {
+            callFeedWatcher = nil
+            await watcher.finish()
+        }
         do {
             _ = try await capture.stop()
             stopEvidence = .saved

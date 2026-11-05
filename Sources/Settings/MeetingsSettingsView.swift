@@ -47,6 +47,7 @@ struct MeetingsSettingsView: View {
                     ) { settings.meetingAfterStop = .transcribe }
                     .accessibilityIdentifier("meetingAfterStopTranscribe")
                 }
+                namesFromCallWindowGroup
                 audioRule
             }
         }
@@ -84,6 +85,20 @@ struct MeetingsSettingsView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.horizontal, SettingsChrome.rowHorizontalPadding)
             .padding(.vertical, SettingsChrome.rowVerticalPadding)
+        }
+    }
+
+    private var namesFromCallWindowGroup: some View {
+        SettingsGroup("Names in transcripts") {
+            SettingsRow("Names from the call window") {
+                Toggle("", isOn: $settings.namesFromCallWindow)
+                    .labelsHidden()
+                    .accessibilityIdentifier("namesFromCallWindowToggle")
+            }
+            Text("While a meeting is being recorded, Murmurly reads only the participants’ names and the speaking highlight on the call’s page, to name the speakers in the transcript. Nothing leaves this Mac: the names are kept in the meeting’s folder and deleted with it.")
+                .font(.caption).foregroundStyle(.secondary)
+                .padding(.horizontal, SettingsChrome.rowHorizontalPadding)
+                .padding(.vertical, SettingsChrome.rowVerticalPadding)
         }
     }
 

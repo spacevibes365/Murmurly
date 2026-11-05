@@ -7,8 +7,9 @@ download, with their licenses. The same file ships inside the app at
 
 ## Software included in the app
 
-The app uses five Swift packages, each pinned to an exact version in
-`project.yml`. Three are compiled into the app binary; Sparkle is a prebuilt
+The app uses six Swift packages, each pinned to an exact version in
+`project.yml`. Four are compiled into the app binary (WhisperKit,
+KeyboardShortcuts, FluidAudio and webrtc-aec3); Sparkle is a prebuilt
 framework embedded in the app; the MCP Swift SDK, with the packages it links,
 is compiled only into the `murmurly` helper at `Contents/Helpers/murmurly`. The
 Apache License 2.0, used by several of them, is reproduced once at the end of
@@ -23,6 +24,14 @@ this file.
 | — fastcluster, included in FluidAudio | — | BSD-2-Clause |
 | — VBx, included in FluidAudio | — | Apache-2.0 |
 | — NVIDIA NeMo (Sortformer, CTC word spotting), ported in FluidAudio | — | Apache-2.0 |
+| webrtc-aec3 | 0.1.0 | MIT |
+| — WebRTC audio processing (freedesktop webrtc-audio-processing 2.1), included in webrtc-aec3 | 2.1 | BSD-3-Clause, with Google's patent grant |
+| — Ooura FFT, included in WebRTC audio processing | — | Ooura's permissive license |
+| — `spl_sqrt_floor`, included in WebRTC audio processing | — | public domain (Wilco Dijkstra) |
+| — fft (`modules/third_party/fft`), included in WebRTC audio processing | — | permissive (Mark Olesen) |
+| — PFFFT, included in WebRTC audio processing | — | BSD-like (FFTPACK) |
+| — RNNoise, included in WebRTC audio processing | — | BSD-3-Clause |
+| — Abseil, included in webrtc-aec3 | 20240722.0 | Apache-2.0 |
 | Sparkle | 2.10.0 | MIT |
 | — bsdiff / bspatch 4.3, included in Sparkle | — | BSD-2-Clause |
 | — sais-lite, included in Sparkle | — | MIT |
@@ -190,6 +199,292 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
   CORPORATION & AFFILIATES. All rights reserved." (checked at NeMo commit
   `09e7f98196f5053f3c759e1fe76d70e0b4c1e6c7`).
 - FluidAudio does not record which NeMo revision it ported from.
+
+### webrtc-aec3 0.1.0
+
+- Source: <https://github.com/spacevibes365/webrtc-aec3>, tag `0.1.0`, commit
+  `999742d56a8d3b49c3ccb691a5259ae488a049c0`.
+- Linked: the `WebRTCAEC3` library product.
+- License: MIT, covering the package's own wrapper code (`Package.swift`,
+  `Sources/WebRTCAEC3`, `Sources/CWebRTCAEC3/include`,
+  `Sources/CWebRTCAEC3/wrapper`). The vendored WebRTC audio processing and
+  Abseil code it builds on keeps its own licenses, below.
+
+```text
+MIT License
+
+Copyright (c) 2026 Denis Andryushin
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+This licence covers the wrapper code written for this package (Package.swift,
+Sources/WebRTCAEC3, Sources/CWebRTCAEC3/include, Sources/CWebRTCAEC3/wrapper,
+Tests, scripts). The vendored code under Sources/CWebRTCAEC3/webrtc and
+Sources/CWebRTCAEC3/abseil keeps its own licences; see README.md.
+```
+
+#### WebRTC audio processing 2.1
+
+- Source: freedesktop.org's packaging of WebRTC's audio processing,
+  <https://gitlab.freedesktop.org/pulseaudio/webrtc-audio-processing>, tag
+  `v2.1`, commit `846fe90a289f58b7c9303a635142aa2c7caa93e5`; vendored in
+  webrtc-aec3 at `Sources/CWebRTCAEC3/webrtc`.
+- License: BSD-3-Clause (`LICENSE`), with Google's own copy of the same terms
+  (`COPYING`) and a separate patent grant (`PATENTS`), both reproduced below.
+
+```text
+Copyright (c) 2011, The WebRTC project authors. All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are
+met:
+
+  * Redistributions of source code must retain the above copyright
+    notice, this list of conditions and the following disclaimer.
+
+  * Redistributions in binary form must reproduce the above copyright
+    notice, this list of conditions and the following disclaimer in
+    the documentation and/or other materials provided with the
+    distribution.
+
+  * Neither the name of Google nor the names of its contributors may
+    be used to endorse or promote products derived from this software
+    without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+"AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+```
+
+`COPYING` is the same text with "Google Inc." in place of "The WebRTC project
+authors" in the first line; not reproduced twice.
+
+```text
+Additional IP Rights Grant (Patents)
+
+"This implementation" means the copyrightable works distributed by
+Google as part of the WebRTC code package.
+
+Google hereby grants to you a perpetual, worldwide, non-exclusive,
+no-charge, irrevocable (except as stated in this section) patent
+license to make, have made, use, offer to sell, sell, import,
+transfer, and otherwise run, modify and propagate the contents of this
+implementation of the WebRTC code package, where such license applies
+only to those patent claims, both currently owned by Google and
+acquired in the future, licensable by Google that are necessarily
+infringed by this implementation of the WebRTC code package. This
+grant does not include claims that would be infringed only as a
+consequence of further modification of this implementation. If you or
+your agent or exclusive licensee institute or order or agree to the
+institution of patent litigation against any entity (including a
+cross-claim or counterclaim in a lawsuit) alleging that this
+implementation of the WebRTC code package or any code incorporated
+within this implementation of the WebRTC code package constitutes
+direct or contributory patent infringement, or inducement of patent
+infringement, then any patent rights granted to you under this License
+for this implementation of the WebRTC code package shall terminate as
+of the date such litigation is filed.
+```
+
+##### Ooura FFT
+
+- Source: <http://www.kurims.kyoto-u.ac.jp/~ooura/fft.html>, included in
+  WebRTC audio processing at `common_audio/third_party/ooura/LICENSE`.
+
+```text
+http://www.kurims.kyoto-u.ac.jp/~ooura/fft.html
+Copyright Takuya OOURA, 1996-2001
+
+You may use, copy, modify and distribute this code for any purpose (include
+commercial use) and without fee. Please refer to this package when you modify
+this code.
+```
+
+##### spl_sqrt_floor
+
+- Included in WebRTC audio processing at
+  `common_audio/third_party/spl_sqrt_floor/LICENSE`.
+
+```text
+Written by Wilco Dijkstra, 1996. The following email exchange establishes the
+license.
+
+From: Wilco Dijkstra <Wilco.Dijkstra@ntlworld.com>
+Date: Fri, Jun 24, 2011 at 3:20 AM
+Subject: Re: sqrt routine
+To: Kevin Ma <kma@google.com>
+Hi Kevin,
+Thanks for asking. Those routines are public domain (originally posted to
+comp.sys.arm a long time ago), so you can use them freely for any purpose.
+Cheers,
+Wilco
+
+----- Original Message -----
+From: "Kevin Ma" <kma@google.com>
+To: <Wilco.Dijkstra@ntlworld.com>
+Sent: Thursday, June 23, 2011 11:44 PM
+Subject: Fwd: sqrt routine
+Hi Wilco,
+I saw your sqrt routine from several web sites, including
+http://www.finesse.demon.co.uk/steven/sqrt.html.
+Just wonder if there's any copyright information with your Successive
+approximation routines, or if I can freely use it for any purpose.
+Thanks.
+Kevin
+```
+
+##### fft (modules/third_party/fft)
+
+- Source: Mark Olesen, included in WebRTC audio processing at
+  `modules/third_party/fft/LICENSE`.
+
+```text
+Copyright(c)1995,97 Mark Olesen <olesen@me.QueensU.CA>
+   Queen's Univ at Kingston (Canada)
+
+Permission to use, copy, modify, and distribute this software for
+any purpose without fee is hereby granted, provided that this
+entire notice is included in all copies of any software which is
+or includes a copy or modification of this software and in all
+copies of the supporting documentation for such software.
+
+THIS SOFTWARE IS BEING PROVIDED "AS IS", WITHOUT ANY EXPRESS OR
+IMPLIED WARRANTY.  IN PARTICULAR, NEITHER THE AUTHOR NOR QUEEN'S
+UNIVERSITY AT KINGSTON MAKES ANY REPRESENTATION OR WARRANTY OF ANY
+KIND CONCERNING THE MERCHANTABILITY OF THIS SOFTWARE OR ITS
+FITNESS FOR ANY PARTICULAR PURPOSE.
+
+All of which is to say that you can do what you like with this
+source code provided you don't try to sell it as your own and you
+include an unaltered copy of this message (including the
+copyright).
+
+It is also implicitly understood that bug fixes and improvements
+should make their way back to the general Internet community so
+that everyone benefits.
+```
+
+##### PFFFT
+
+- Source: Julien Pommier, based on FFTPACKv4/v5, included in WebRTC audio
+  processing at `third_party/pffft/LICENSE`.
+
+```text
+Copyright (c) 2013  Julien Pommier ( pommier@modartt.com )
+
+Based on original fortran 77 code from FFTPACKv4 from NETLIB,
+authored by Dr Paul Swarztrauber of NCAR, in 1985.
+
+As confirmed by the NCAR fftpack software curators, the following
+FFTPACKv5 license applies to FFTPACKv4 sources. My changes are
+released under the same terms.
+
+FFTPACK license:
+
+http://www.cisl.ucar.edu/css/software/fftpack5/ftpk.html
+
+Copyright (c) 2004 the University Corporation for Atmospheric
+Research ("UCAR"). All rights reserved. Developed by NCAR's
+Computational and Information Systems Laboratory, UCAR,
+www.cisl.ucar.edu.
+
+Redistribution and use of the Software in source and binary forms,
+with or without modification, is permitted provided that the
+following conditions are met:
+
+- Neither the names of NCAR's Computational and Information Systems
+Laboratory, the University Corporation for Atmospheric Research,
+nor the names of its sponsors or contributors may be used to
+endorse or promote products derived from this Software without
+specific prior written permission.
+
+- Redistributions of source code must retain the above copyright
+notices, this list of conditions, and the disclaimer below.
+
+- Redistributions in binary form must reproduce the above copyright
+notice, this list of conditions, and the disclaimer below in the
+documentation and/or other materials provided with the
+distribution.
+
+THIS SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING, BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+NONINFRINGEMENT. IN NO EVENT SHALL THE CONTRIBUTORS OR COPYRIGHT
+HOLDERS BE LIABLE FOR ANY CLAIM, INDIRECT, INCIDENTAL, SPECIAL,
+EXEMPLARY, OR CONSEQUENTIAL DAMAGES OR OTHER LIABILITY, WHETHER IN AN
+ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS WITH THE
+SOFTWARE.
+```
+
+##### RNNoise
+
+- Source: Xiph.Org / Mozilla, included in WebRTC audio processing at
+  `third_party/rnnoise/COPYING`.
+
+```text
+Copyright (c) 2017, Mozilla
+Copyright (c) 2007-2017, Jean-Marc Valin
+Copyright (c) 2005-2017, Xiph.Org Foundation
+Copyright (c) 2003-2004, Mark Borgerding
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions
+are met:
+
+- Redistributions of source code must retain the above copyright
+notice, this list of conditions and the following disclaimer.
+
+- Redistributions in binary form must reproduce the above copyright
+notice, this list of conditions and the following disclaimer in the
+documentation and/or other materials provided with the distribution.
+
+- Neither the name of the Xiph.Org Foundation nor the names of its
+contributors may be used to endorse or promote products derived from
+this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+A PARTICULAR PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE FOUNDATION
+OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+```
+
+#### Abseil 20240722.0
+
+- Source: <https://github.com/abseil/abseil-cpp>, tag `20240722.0`; vendored
+  in webrtc-aec3 at `Sources/CWebRTCAEC3/abseil`.
+- License: Apache License 2.0, text at the end of this file.
 
 ### Sparkle 2.10.0
 
@@ -577,9 +872,10 @@ SOFTWARE.
 ## Apache License 2.0
 
 Applies to swift-transformers (in WhisperKit), FluidAudio, VBx and NVIDIA NeMo
-(in FluidAudio) and the Whisper tokenizer files. The text below is FluidAudio's `LICENSE` file;
-the terms in WhisperKit's `NOTICES` and FluidAudio's
-`ThirdPartyLicenses/vbx-LICENSE.md` are the same.
+(in FluidAudio), Abseil (in webrtc-aec3) and the Whisper tokenizer files. The
+text below is FluidAudio's `LICENSE` file; the terms in WhisperKit's `NOTICES`,
+FluidAudio's `ThirdPartyLicenses/vbx-LICENSE.md` and webrtc-aec3's
+`Sources/CWebRTCAEC3/abseil/LICENSE` are the same.
 
 ```text
                                  Apache License

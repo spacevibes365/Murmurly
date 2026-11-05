@@ -423,6 +423,88 @@ final class MeetingsWindowTests: XCTestCase {
         app.typeKey(.escape, modifierFlags: [])
     }
 
+    /// A meeting with a call feed shows the feed's own person on the system
+    /// line without anything typed; the Names sheet lists that person, and
+    /// renaming them (in digits, as no keyboard layout changes them) shows
+    /// on the card and in the saved file. A second meeting whose feed never
+    /// showed a tile says so on the card.
+    func testCallNamesShowInTheTextAndTheSavedFile() throws {
+        let recorded = "2026-10-13 09-00-00 Meeting"
+        let markdown = "# Meeting\n\nAutomatic transcript.\n\n---\n\n[0:05] **Me:** Начнём.\n\n[0:09] **Others:** Хорошо.\n"
+        let bytes = Data(markdown.utf8)
+        let sha = SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
+        let attempt = """
+            {"version":1,"number":1,"result":"complete","startedAt":"2026-10-13T09:40:00Z","endedAt":"2026-10-13T09:41:00Z",\
+            "transcript":"transcript.md","engines":["whisper"],"languages":["auto"],"failedChunks":0,"cutShort":false,\
+            "missingTracks":[],"speakers":{"microphone":"Me","system":"Others"},\
+            "lines":[{"start":5,"end":7,"source":"microphone"},{"start":9,"end":11,"source":"system"}],\
+            "fingerprint":{"bytes":\(bytes.count),"sha256":"\(sha)"}}
+            """
+        let feed = #"{"v":1,"t":9,"service":"telemost","visible":true,"self":null,"selfSpeaking":false,"people":["Гость Один"],"speaking":[]}"# + "\n"
+        try write([
+            "metadata.json": """
+            {"startedAt":"2026-10-13T09:00:00Z","endedAt":"2026-10-13T09:30:00Z","sampleRate":48000,"state":"done",\
+            "segments":[{"index":0,"system":"system.m4a","mic":"microphone.m4a"}]}
+            """,
+            "system.m4a": "audio", "microphone.m4a": "audio", "transcript.md": markdown,
+            ".attempt 0001 \(UUID().uuidString).murmurly.json": attempt,
+            ".call.murmurly.jsonl": feed,
+        ], into: recorded)
+
+        let withoutTiles = "2026-10-13 08-00-00 Meeting"
+        try write([
+            "metadata.json": """
+            {"startedAt":"2026-10-13T08:00:00Z","endedAt":"2026-10-13T08:10:00Z","sampleRate":48000,"state":"done",\
+            "segments":[{"index":0,"system":"system.m4a","mic":"microphone.m4a"}]}
+            """,
+            "system.m4a": "audio", "microphone.m4a": "audio", "transcript.md": "Just a note, not the app's own form.\n",
+            ".call.murmurly.jsonl": #"{"v":1,"t":1,"service":"telemost","visible":false,"self":null,"selfSpeaking":false,"people":[],"speaking":[]}"# + "\n",
+        ], into: withoutTiles)
+
+        let probe = root.deletingLastPathComponent().appendingPathComponent(root.lastPathComponent + "-probe", isDirectory: true)
+        try FileManager.default.createDirectory(at: probe, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: probe) }
+        let app = launch(["-FileProbeRoot", probe.path])
+        defer { app.terminate() }
+        openMainWindow(in: app)
+        let row = app.descendants(matching: .any)["meetingRow.\(recorded)"]
+        XCTAssertTrue(row.waitForExistence(timeout: 10))
+        row.click()
+        let text = app.textViews["meetingTranscriptText"]
+        XCTAssertTrue(waitUntil(seconds: 10) { (text.value as? String ?? "").contains("Гость Один: Хорошо.") }, "the call feed did not name the line: \(text.value ?? "")")
+
+        let names = app.buttons["meetingNames"]
+        XCTAssertTrue(names.waitForExistence(timeout: 5))
+        XCTAssertTrue(waitUntil { names.isEnabled }, "Names is off for a transcript with its record")
+        names.click()
+        let person = app.textFields["meetingNamesCall.1"]
+        XCTAssertTrue(person.waitForExistence(timeout: 5), "no call feed person in the sheet")
+        person.click()
+        person.typeText("33")
+        app.buttons["meetingNamesSave"].click()
+        XCTAssertTrue(app.descendants(matching: .any)["meetingNamesSheet"].waitForNonExistence(timeout: 5), "the sheet stayed")
+        XCTAssertTrue(waitUntil { (text.value as? String ?? "").contains("33: Хорошо.") }, "the text kept the found name: \(text.value ?? "")")
+
+        app.descendants(matching: .any)["meetingSaveAs"].click()
+        app.menuItems[AppLanguage.text("Markdown…")].click()
+        let saved = probe.appendingPathComponent("meeting-export-1.md")
+        XCTAssertTrue(waitUntil(seconds: 10) { FileManager.default.fileExists(atPath: saved.path) }, "nothing was saved")
+        let file = try String(contentsOf: saved, encoding: .utf8)
+        XCTAssertTrue(file.contains("[0:09] **33:** Хорошо."), file)
+        let folder = root.appendingPathComponent(recorded)
+        let marks = try JSONSerialization.jsonObject(with: Data(contentsOf: folder.appendingPathComponent("murmurly.json"))) as? [String: Any]
+        XCTAssertEqual(marks?["callNames"] as? [String: String], ["Гость Один": "33"])
+
+        // A feed that never showed a tile says so on the card.
+        let other = app.descendants(matching: .any)["meetingRow.\(withoutTiles)"]
+        XCTAssertTrue(other.waitForExistence(timeout: 10))
+        other.click()
+        XCTAssertTrue(
+            waitUntil(seconds: 10) { app.descendants(matching: .any)["meetingCallNamesNotFound"].exists },
+            "the card does not say the feed found no tile"
+        )
+    }
+
     /// Save As with its panel held and the window closed meanwhile saves
     /// nothing, and holds no save: the next Save As, with the window open
     /// again, writes its file.

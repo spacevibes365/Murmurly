@@ -594,6 +594,12 @@ private struct NamesEdit: Identifiable {
     let path: String
     let labels: [MeetingAttempt.Source: String]
     let names: [MeetingAttempt.Source: String]
+    /// Every person the call feed showed a tile for; empty without a feed.
+    let people: [String]
+    /// How each of `people` is renamed now.
+    let callNames: [String: String]
+    /// Whether the feed ever found a tile at all; nil without a feed.
+    let tilesFound: Bool?
 }
 
 /// A new dictionary entry from the transcript: the text and the selection
@@ -825,9 +831,11 @@ private struct MeetingCard: View {
         let refusal = library.markRefusal(for: meeting) ?? library.recordRefusal(for: meeting)
         return Button {
             let marks = library.marks(of: meeting)
+            let call = library.callSummary(of: meeting)
             namesEdit = NamesEdit(
                 identity: meeting.identity, path: meeting.directory.path,
-                labels: library.writtenLabels(of: meeting), names: marks?.speakers ?? [:]
+                labels: library.writtenLabels(of: meeting), names: marks?.speakers ?? [:],
+                people: call?.people ?? [], callNames: marks?.callNames ?? [:], tilesFound: call?.tilesFound
             )
         } label: {
             Image(systemName: "person.2")
@@ -1039,7 +1047,12 @@ private struct MeetingCard: View {
     /// The meeting, version and content shown; the names are part of the
     /// text: another name is another text.
     private func textIdentity(_ meeting: MeetingLibrary.Meeting, _ shown: MeetingTranscript) -> String {
-        "\(meeting.directory.path)/\(library.version ?? "")/\(shown.raw.hashValue)/\(shown.namesNote ?? "")"
+        // The same `namesNote` can stand over two texts naming their lines
+        // differently (a call feed renamed mid-meeting); the lines' own
+        // labels are hashed in too, so such a change still counts as
+        // another text.
+        let labels = (shown.lines ?? []).map(\.speaker).hashValue
+        return "\(meeting.directory.path)/\(library.version ?? "")/\(shown.raw.hashValue)/\(shown.namesNote ?? "")/\(labels)"
     }
 
     /// The selection, only while the text it was made in is the one shown
@@ -1142,8 +1155,7 @@ private struct MeetingCard: View {
 
     /// Names kept for the meeting that the shown text cannot take, and why.
     @ViewBuilder private func textNotes(_ meeting: MeetingLibrary.Meeting) -> some View {
-        if case .loaded = library.text, library.marks(of: meeting)?.speakers.isEmpty == false,
-           let refusal = library.recordRefusal(for: meeting) {
+        if case .loaded = library.text, let refusal = library.namesNotShownRefusal(for: meeting) {
             Label {
                 Text("Speaker names aren’t shown in this transcript: \(refusal)")
                     .fixedSize(horizontal: false, vertical: true)
@@ -1153,6 +1165,17 @@ private struct MeetingCard: View {
             .font(.caption)
             .foregroundStyle(.secondary)
             .accessibilityIdentifier("meetingNamesNotShown")
+        }
+        if library.callSummary(of: meeting)?.tilesFound == false {
+            Label {
+                Text("Names from the call: not found")
+                    .fixedSize(horizontal: false, vertical: true)
+            } icon: {
+                Image(systemName: "info.circle").foregroundStyle(.secondary)
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .accessibilityIdentifier("meetingCallNamesNotFound")
         }
     }
 }
@@ -1451,6 +1474,9 @@ private struct NamesSheet: View {
     let edit: NamesEdit
     @State private var microphone: String
     @State private var system: String
+    /// How to call each of `edit.people`, in the same order; empty for one
+    /// not renamed.
+    @State private var callNames: [String]
     @State private var refusal: String?
     /// The write of a folder elsewhere, until it ends: the sheet stays with
     /// what was typed, its fields off so nothing typed meanwhile is lost
@@ -1461,11 +1487,13 @@ private struct NamesSheet: View {
         self.edit = edit
         _microphone = State(initialValue: edit.names[.microphone] ?? "")
         _system = State(initialValue: edit.names[.system] ?? "")
+        _callNames = State(initialValue: edit.people.map { edit.callNames[$0] ?? "" })
     }
 
     /// What no name may hold, said before Save is pressed.
     private var problem: String? {
         MeetingLibrary.speakerNameRefusal(microphone) ?? MeetingLibrary.speakerNameRefusal(system)
+            ?? callNames.compactMap(MeetingLibrary.speakerNameRefusal).first
     }
 
     var body: some View {
@@ -1498,6 +1526,7 @@ private struct NamesSheet: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
+            callPeople()
             if let refusal {
                 Text(refusal)
                     .font(.caption)
@@ -1531,16 +1560,55 @@ private struct NamesSheet: View {
         .frame(width: 420)
         .onChange(of: microphone) { refusal = nil }
         .onChange(of: system) { refusal = nil }
+        .onChange(of: callNames) { refusal = nil }
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("meetingNamesSheet")
+    }
+
+    /// The call feed's own people, each with a found name and a field for
+    /// how to call them; or, without a tile ever found, the one note in its
+    /// place — the two are never shown together.
+    @ViewBuilder private func callPeople() -> some View {
+        if edit.tilesFound == false {
+            Text("Names from the call: not found")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .accessibilityIdentifier("meetingNamesCallNotFound")
+        } else if !edit.people.isEmpty {
+            Text("People from the call")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            // No `ScrollView` or `List` around this: both left their
+            // `TextField`s unhittable under XCUITest on this very sheet (a
+            // real failure, not a hypothetical). A long list grows the
+            // sheet instead of scrolling — a corner case, said in the report.
+            Grid(alignment: .leadingFirstTextBaseline, horizontalSpacing: 10, verticalSpacing: 8) {
+                ForEach(Array(edit.people.enumerated()), id: \.offset) { index, found in
+                    GridRow {
+                        Text(verbatim: found)
+                        TextField("", text: Binding(
+                            get: { callNames[index] },
+                            set: { callNames[index] = $0 }
+                        ), prompt: Text(verbatim: found))
+                            .disabled(saving != nil)
+                            .accessibilityLabel(Text(verbatim: found))
+                            .accessibilityIdentifier("meetingNamesCall.\(index + 1)")
+                    }
+                }
+            }
+        }
     }
 
     /// Closes only once the names are on disk; a refusal, at once or late,
     /// stays here with the names as typed.
     private func save() {
         refusal = nil
+        var renames: [String: String] = [:]
+        for (found, typed) in zip(edit.people, callNames) { renames[found] = typed }
         saving = Task {
-            let answer = await library.saveNames(typedOn: edit.identity, at: edit.path, microphone: microphone, system: system)
+            let answer = await library.saveNames(
+                typedOn: edit.identity, at: edit.path, microphone: microphone, system: system, callNames: renames
+            )
             guard !Task.isCancelled else { return }
             saving = nil
             if let answer { refusal = answer } else { dismiss() }
@@ -1735,6 +1803,7 @@ enum MeetingText {
         let names = [MeetingAttempt.Source.microphone, .system].compactMap { lost.speakers[$0] ?? nil }
         if names.count == 2 { return String(localized: "The names “\(names[0])” and “\(names[1])” weren’t saved: \(reason)") }
         if let name = names.first { return String(localized: "The speaker’s name “\(name)” wasn’t saved: \(reason)") }
+        if !lost.callNames.isEmpty { return String(localized: "The names from the call weren’t saved: \(reason)") }
         if let title = lost.title ?? nil, !title.isEmpty { return String(localized: "The name “\(title)” wasn’t saved. \(reason)") }
         if let meeting { return String(localized: "Changes to “\(meeting)” weren’t saved: \(reason)") }
         return String(localized: "Changes to this meeting weren’t saved: \(reason)")

@@ -107,6 +107,42 @@ final class SystemAudioCaptureStopTests: XCTestCase {
         _ = try? await capture.stop()
     }
 
+    /// `writtenSeconds()` is the atomic copy of the IOProc's frame count,
+    /// divided by the track's own rate: nil before a session is adopted and
+    /// after it is stopped, and it skips exactly the cycles the equal-frames
+    /// check leaves out of both tracks (an AirPods dropout, `.dropout`).
+    func testWrittenSecondsSkipTheCyclesLeftOutOfTheTracks() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("meeting-stop-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let capture = SystemAudioCapture()
+
+        let beforeAdopt = await capture.writtenSeconds()
+        XCTAssertNil(beforeAdopt)
+
+        try await capture.adoptSessionForTesting(
+            directory: directory, sampleRate: 24_000, systemFrames: 0, microphoneFrames: 0,
+            enqueuedFrames: 0, startedAt: Date()
+        )
+        let afterAdopt = await capture.writtenSeconds()
+        XCTAssertEqual(afterAdopt, 0)
+
+        for cycle in AdoptedMeetingCapture.dropout {
+            await capture.deliverCycleForTesting(frames: cycle.frames, microphone: cycle.microphone)
+        }
+        // 20 whole cycles of 480 frames each, at 24 kHz: 9_600 / 24_000 = 0.4 s.
+        // The three skipped cycles in `.dropout` (a missing stream, an empty
+        // one, one out of step) never reach `writtenFrames`.
+        let writtenAfterDropout = await capture.writtenSeconds()
+        let afterDropout = try XCTUnwrap(writtenAfterDropout)
+        XCTAssertEqual(afterDropout, 0.4, accuracy: 1e-9)
+
+        _ = try await capture.stop()
+        let afterStop = await capture.writtenSeconds()
+        XCTAssertNil(afterStop)
+    }
+
     func testShortTracksAreSuspectWithMeasuredFrames() async throws {
         let session = try await stopAdoptedSession(systemFrames: 1_024, microphoneFrames: 1_024, enqueued: 48_000)
         defer { session.cleanup() }

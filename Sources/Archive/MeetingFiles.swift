@@ -394,6 +394,10 @@ struct MeetingMarks: Sendable, Equatable {
     /// the file's lines say which track each one came from. In `speakers`,
     /// `{"microphone": …, "system": …}`; the transcripts are never changed.
     var speakers: [MeetingAttempt.Source: String] = [:]
+    /// How to call a person the call feed found, keyed by the name the feed
+    /// itself used ("Guest" → "Anya"); empty for a name not renamed, which
+    /// shows as the feed found it. The transcripts are never changed.
+    var callNames: [String: String] = [:]
 
     /// What a meeting's folder holds.
     enum State: Sendable, Equatable {
@@ -487,6 +491,16 @@ struct MeetingMarks: Sendable, Equatable {
                 speakers[source] = name
             }
         }
-        return .success(MeetingMarks(title: title as? String, starred: starred as? Bool ?? false, speakers: speakers))
+        var callNames: [String: String] = [:]
+        if let renames = object["callNames"] {
+            guard let renames = renames as? [String: Any] else { return .failure(.unreadable(String(localized: "a mark of another kind"))) }
+            for (found, name) in renames {
+                guard let name = name as? String else { return .failure(.unreadable(String(localized: "a mark of another kind"))) }
+                callNames[found] = name
+            }
+        }
+        return .success(MeetingMarks(
+            title: title as? String, starred: starred as? Bool ?? false, speakers: speakers, callNames: callNames
+        ))
     }
 }

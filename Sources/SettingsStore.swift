@@ -87,6 +87,13 @@ final class SettingsStore: ObservableObject {
     @Published var meetingAfterStop: MeetingAfterStop {
         didSet { d.set(meetingAfterStop.rawValue, forKey: K.meetingAfterStop) }
     }
+    /// Whether `CallFeedWatcher` reads the call's page while a meeting is
+    /// recorded. On by default; read once at each recording's start and
+    /// again on every step of the watcher's own loop, so turning it off
+    /// mid-meeting stops it there.
+    @Published var namesFromCallWindow: Bool {
+        didSet { d.set(namesFromCallWindow, forKey: K.namesFromCallWindow) }
+    }
     @Published var systemAudioCheck: SystemAudioCheck? {
         didSet { Self.store(systemAudioCheck, in: d, forKey: K.systemAudioCheck) }
     }
@@ -171,6 +178,7 @@ final class SettingsStore: ObservableObject {
         static let autoRecordMeetings = "meeting.autoRecord"
         static let meetingExcludedBundleIDs = "meeting.excludedBundleIDs"
         static let meetingAfterStop = "meeting.afterStop"
+        static let namesFromCallWindow = "meeting.namesFromCallWindow"
         static let systemAudioCheck = "permissions.systemAudioCheck"
         static let meetingsFolder = "meeting.storageFolder"
         static let meetingAudioRetention = "meeting.audioRetentionDays"
@@ -233,6 +241,7 @@ final class SettingsStore: ObservableObject {
         // and a transcript nobody asked for costs only a file.
         meetingAfterStop = d.string(forKey: K.meetingAfterStop)
             .flatMap(MeetingAfterStop.init(rawValue:)) ?? .transcribe
+        namesFromCallWindow = d.object(forKey: K.namesFromCallWindow) as? Bool ?? true
         systemAudioCheck = Self.load(SystemAudioCheck.self, from: d, forKey: K.systemAudioCheck)
         meetingsFolderPath = d.string(forKey: K.meetingsFolder)
         meetingAudioRetention = MeetingAudioRetention(rawValue: d.integer(forKey: K.meetingAudioRetention)) ?? .keep

@@ -79,6 +79,17 @@ final class HelperCommandTests: XCTestCase {
         try JSONSerialization.data(withJSONObject: object).write(to: folder.appendingPathComponent("murmurly.json"))
     }
 
+    private func writeCallNames(_ callNames: [String: String], in folder: URL) throws {
+        let object: [String: Any] = ["version": 1, "callNames": callNames]
+        try JSONSerialization.data(withJSONObject: object).write(to: folder.appendingPathComponent("murmurly.json"))
+    }
+
+    /// A call feed, straight from the watcher's own encoder: the format
+    /// `CallFeed` and this helper agree on.
+    private func writeFeed(_ events: [CallFeed.Event], in folder: URL) throws {
+        try Data(events.map { $0.encodedLine() }.joined().utf8).write(to: folder.appendingPathComponent(CallFeed.fileName))
+    }
+
     private func fingerprint(of text: String) -> MeetingAttempt.Fingerprint {
         let bytes = Data(text.utf8)
         let hex = SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
@@ -279,6 +290,97 @@ final class HelperCommandTests: XCTestCase {
         XCTAssertEqual(response.format, "text")
         XCTAssertEqual(response.lines.map(\.text), ["Just some notes, not the app's own format.", "Second line."])
         XCTAssertNil(response.lines.first?.timecode)
+    }
+
+    /// The embedded helper's `transcript` (and `--json`) labels each line
+    /// exactly as `MeetingTranscript.named(by:call:)` does — the one
+    /// function the window and the helper both call — for the same meeting
+    /// with a call feed and a rename; the helper never prints the "Names:"
+    /// phrase itself (P2: that line is the window's own concern). A feed
+    /// behind a link, or otherwise unreadable, is read as no feed: the
+    /// transcription is not refused, and the track labels show instead
+    /// (P3: one meeting must read as one text, in the window and here).
+    func testTranscriptCarriesTheCallNamesAsTheWindowShowsThem() throws {
+        try writeSettings(periodDays: 0)
+        let folder = try makeMeeting("2026-10-20 10-31-05 Meeting", in: meetingsRoot, startedAt: Date(timeIntervalSince1970: 1_792_000_000))
+        let text = try makeTranscript(in: folder, lines: [("0:01", "Others", "привет"), ("0:03", "Others", "и я")])
+        let lines = [
+            MeetingAttempt.Line(start: 1, end: 3, source: .system),
+            MeetingAttempt.Line(start: 3, end: 5, source: .system),
+        ]
+        let attempt = try writeAttempt(number: 1, result: .complete, transcript: "transcript.md", lines: lines, fingerprint: fingerprint(of: text), in: folder)
+        try writeCallNames(["Гость Один": "Аня"], in: folder)
+        let feedEvents = [
+            CallFeed.Event(t: 1, service: "telemost", visible: true, ownName: nil, selfSpeaking: false, people: ["Гость Один"], speaking: ["Гость Один"]),
+            CallFeed.Event(t: 3, service: "telemost", visible: true, ownName: nil, selfSpeaking: false, people: ["Гость Два"], speaking: ["Гость Два"]),
+        ]
+        try writeFeed(feedEvents, in: folder)
+
+        let result = try run(["transcript", "local:2026-10-20_10-31-05", "--json"])
+        XCTAssertEqual(result.exitCode, 0)
+        let response = try decode(HelperContract.TranscriptResponse.self, from: result.stdout)
+
+        let marks = MeetingMarks.read(in: folder).marks
+        let summary = CallFeed.summary(for: lines, feed: feedEvents)
+        let expected = MeetingTranscript.parse(text).timed(by: attempt).named(by: marks, call: summary)
+        XCTAssertEqual(response.lines.map(\.speaker), expected.lines?.map(\.speaker))
+        XCTAssertEqual(response.lines.map(\.speaker), ["Аня", "Гость Два"])
+        XCTAssertFalse(result.stdout.contains("Names:"), "the helper must not print the Names line itself")
+
+        // A feed behind a link the helper's `.refuse` policy won't follow
+        // is "no feed", not a refused transcription.
+        try FileManager.default.removeItem(at: folder.appendingPathComponent(CallFeed.fileName))
+        let elsewhere = root.appendingPathComponent("elsewhere-feed", isDirectory: true)
+        try FileManager.default.createDirectory(at: elsewhere, withIntermediateDirectories: true)
+        try writeFeed(feedEvents, in: elsewhere)
+        try FileManager.default.createSymbolicLink(
+            at: folder.appendingPathComponent(CallFeed.fileName),
+            withDestinationURL: elsewhere.appendingPathComponent(CallFeed.fileName)
+        )
+        let linked = try run(["transcript", "local:2026-10-20_10-31-05", "--json"])
+        XCTAssertEqual(linked.exitCode, 0, "a linked feed must not refuse the transcription")
+        let linkedResponse = try decode(HelperContract.TranscriptResponse.self, from: linked.stdout)
+        XCTAssertEqual(linkedResponse.lines.map(\.speaker), ["Others", "Others"], "a feed behind a link is read as no feed")
+    }
+
+    /// The per-service highlight lead (`CallFeed.highlightLeads`) is read
+    /// by `CallFeed.summary(for:feed:)`'s own default, the one function the
+    /// window and this helper both call; Telemost has no lead in the shared
+    /// table, so a line that starts just before a highlight lights up gets
+    /// no name through either path — the helper's own `transcript` and a
+    /// manual `CallFeed.summary(for:feed:)` call agree, both keeping the
+    /// track's own label.
+    func testTranscriptAndTheWindowAgreeOnALineStartingJustBeforeAHighlight() throws {
+        try writeSettings(periodDays: 0)
+        let folder = try makeMeeting(
+            "2026-10-21 09-15-00 Meeting", in: meetingsRoot, startedAt: Date(timeIntervalSince1970: 1_792_100_000)
+        )
+        let text = try makeTranscript(in: folder, lines: [("0:00", "Others", "привет")])
+        let lines = [MeetingAttempt.Line(start: 0.2, end: 1.5, source: .system)]
+        let attempt = try writeAttempt(
+            number: 1, result: .complete, transcript: "transcript.md", lines: lines, fingerprint: fingerprint(of: text), in: folder
+        )
+        let feedEvents = [
+            CallFeed.Event(
+                t: 0, service: "telemost", visible: true, ownName: nil, selfSpeaking: false,
+                people: ["Участник А", "Участник Б"], speaking: []
+            ),
+            CallFeed.Event(
+                t: 1, service: "telemost", visible: true, ownName: nil, selfSpeaking: false,
+                people: ["Участник А", "Участник Б"], speaking: ["Участник А"]
+            ),
+        ]
+        try writeFeed(feedEvents, in: folder)
+
+        let result = try run(["transcript", "local:2026-10-21_09-15-00", "--json"])
+        XCTAssertEqual(result.exitCode, 0)
+        let response = try decode(HelperContract.TranscriptResponse.self, from: result.stdout)
+
+        let marks = MeetingMarks.read(in: folder).marks
+        let summary = CallFeed.summary(for: lines, feed: feedEvents)
+        let expected = MeetingTranscript.parse(text).timed(by: attempt).named(by: marks, call: summary)
+        XCTAssertEqual(response.lines.map(\.speaker), expected.lines?.map(\.speaker))
+        XCTAssertEqual(response.lines.map(\.speaker), ["Others"], "no lead for telemost yet, so the line keeps its own label")
     }
 
     func testUnreadableHistoryIsAReadErrorNotAnEmptyList() throws {

@@ -61946,6 +61946,496 @@
           }
         }
       }
+    },
+    "Names from the call window" : {
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "Namen aus dem Anruffenster"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "Nombres desde la ventana de la llamada"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "Noms depuis la fenêtre d’appel"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "Nomi dalla finestra della chiamata"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "通話ウィンドウからの名前"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "통화 창에서 가져온 이름"
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "Imiona z okna połączenia"
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "Nomes da janela da chamada"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Имена из окна созвона"
+          }
+        },
+        "uk" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "Імена з вікна дзвінка"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "来自通话窗口的姓名"
+          }
+        }
+      }
+    },
+    "Names from the call: not found" : {
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "Namen aus dem Anruf: nicht gefunden"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "Nombres de la llamada: no encontrados"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "Noms de l’appel : introuvables"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "Nomi della chiamata: non trovati"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "通話からの名前：見つかりません"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "통화에서 가져온 이름: 찾을 수 없음"
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "Imiona z połączenia: nie znaleziono"
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "Nomes da chamada: não encontrados"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Имена из созвона: не найдены"
+          }
+        },
+        "uk" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "Імена з дзвінка: не знайдено"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "通话中的姓名：未找到"
+          }
+        }
+      }
+    },
+    "Names in transcripts" : {
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "Namen in Transkripten"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "Nombres en las transcripciones"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "Noms dans les transcriptions"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "Nomi nelle trascrizioni"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "文字起こしの名前"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "텍스트 변환본의 이름"
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "Imiona w transkrypcjach"
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "Nomes nas transcrições"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Имена в расшифровках"
+          }
+        },
+        "uk" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "Імена в розшифровках"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "转录中的姓名"
+          }
+        }
+      }
+    },
+    "Names: “%@” is the microphone, “%@” is the system audio. From the call: %@." : {
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "Namen: „%1$@“ ist das Mikrofon, „%2$@“ das Systemaudio. Aus dem Anruf: %3$@."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "Nombres: «%1$@» es el micrófono, «%2$@» es el audio del sistema. De la llamada: %3$@."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "Noms : « %1$@ » est le micro, « %2$@ » le son du système. De l’appel : %3$@."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "Nomi: «%1$@» è il microfono, «%2$@» l’audio di sistema. Dalla chiamata: %3$@."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "名前：「%1$@」はマイク、「%2$@」はシステムオーディオです。通話から：%3$@。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "이름: “%1$@”은(는) 마이크, “%2$@”은(는) 시스템 오디오입니다. 통화에서: %3$@."
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "Imiona: „%1$@” to mikrofon, „%2$@” to dźwięk systemowy. Z połączenia: %3$@."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "Nomes: “%1$@” é o microfone, “%2$@” é o áudio do sistema. Da chamada: %3$@."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Имена: «%1$@» — микрофон, «%2$@» — системный звук. Из созвона: %3$@."
+          }
+        },
+        "uk" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "Імена: «%1$@» — мікрофон, «%2$@» — системний звук. Із дзвінка: %3$@."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "姓名：“%1$@”是麦克风，“%2$@”是系统音频。来自通话：%3$@。"
+          }
+        }
+      }
+    },
+    "People from the call" : {
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "Personen aus dem Anruf"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "Personas de la llamada"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "Personnes de l’appel"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "Persone della chiamata"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "通話の参加者"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "통화의 참가자"
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "Osoby z połączenia"
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "Pessoas da chamada"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Люди из созвона"
+          }
+        },
+        "uk" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "Люди із дзвінка"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "通话中的人员"
+          }
+        }
+      }
+    },
+    "The names from the call weren’t saved: %@" : {
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "Die Namen aus dem Anruf wurden nicht gesichert: %@"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "Los nombres de la llamada no se guardaron: %@"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "Les noms de l’appel n’ont pas été enregistrés : %@"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "I nomi della chiamata non sono stati salvati: %@"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "通話からの名前を保存できませんでした：%@"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "통화에서 가져온 이름을 저장하지 못했습니다: %@"
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "Imiona z połączenia nie zostały zapisane: %@"
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "Os nomes da chamada não foram salvos: %@"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Имена из созвона не сохранены: %@"
+          }
+        },
+        "uk" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "Імена з дзвінка не збереглися: %@"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "通话中的姓名未存储：%@"
+          }
+        }
+      }
+    },
+    "While a meeting is being recorded, Murmurly reads only the participants’ names and the speaking highlight on the call’s page, to name the speakers in the transcript. Nothing leaves this Mac: the names are kept in the meeting’s folder and deleted with it." : {
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "Während ein Meeting aufgenommen wird, liest Murmurly auf der Seite des Anrufs nur die Namen der Teilnehmer und die Sprecher-Hervorhebung, um die Sprecher im Transkript zu benennen. Nichts verlässt diesen Mac: Die Namen werden im Ordner des Meetings aufbewahrt und mit ihm gelöscht."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "Mientras se graba una reunión, Murmurly solo lee en la página de la llamada los nombres de los participantes y el resaltado de quien habla, para nombrar a los interlocutores en la transcripción. Nada sale de este Mac: los nombres se guardan en la carpeta de la reunión y se eliminan junto con ella."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "Pendant qu’une réunion est enregistrée, Murmurly lit uniquement, sur la page de l’appel, les noms des participants et la mise en évidence de la personne qui parle, afin de nommer les intervenants dans la transcription. Rien ne quitte ce Mac : les noms sont conservés dans le dossier de la réunion et supprimés avec lui."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "Mentre una riunione viene registrata, Murmurly legge nella pagina della chiamata solo i nomi dei partecipanti e l’evidenziazione di chi sta parlando, per nominare gli interlocutori nella trascrizione. Nulla lascia questo Mac: i nomi vengono conservati nella cartella della riunione ed eliminati insieme a essa."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "会議を録音している間、Murmurlyは通話のページから参加者の名前と発言中のハイライトだけを読み取り、文字起こしで発言者に名前を付けます。このMacの外には何も送られません。名前は会議のフォルダに保存され、フォルダと一緒に削除されます。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "회의를 녹음하는 동안 Murmurly는 통화 페이지에서 참가자 이름과 말하는 사람 강조 표시만 읽어 텍스트 변환본에서 발언자 이름을 표시합니다. 이 Mac을 벗어나는 데이터는 없습니다. 이름은 회의 폴더에 보관되며 폴더와 함께 삭제됩니다."
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "Podczas nagrywania spotkania Murmurly odczytuje ze strony połączenia tylko imiona uczestników i podświetlenie osoby mówiącej, aby nazwać mówców w transkrypcji. Nic nie opuszcza tego Maca: imiona są przechowywane w folderze spotkania i usuwane wraz z nim."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "Enquanto uma reunião está sendo gravada, o Murmurly lê na página da chamada apenas os nomes dos participantes e o destaque de quem está falando, para nomear os interlocutores na transcrição. Nada sai deste Mac: os nomes são mantidos na pasta da reunião e excluídos junto com ela."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Пока идёт запись созвона, Murmurly читает на странице созвона только имена участников и подсветку говорящего, чтобы подписать говорящих в расшифровке. Ничего не уходит с этого Mac: имена хранятся в папке созвона и удаляются вместе с ней."
+          }
+        },
+        "uk" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "Поки триває запис зустрічі, Murmurly читає на сторінці дзвінка лише імена учасників і підсвітку того, хто говорить, щоб підписати мовців у розшифровці. Нічого не залишає цей Mac: імена зберігаються в папці зустрічі і видаляються разом із нею."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "录制会议期间,Murmurly只读取通话页面上的参会者姓名和发言高亮,以便在转录中标注发言人。没有任何内容离开这台Mac:姓名保存在会议文件夹中,并随文件夹一起删除。"
+          }
+        }
+      }
     }
   },
   "version" : "1.0"

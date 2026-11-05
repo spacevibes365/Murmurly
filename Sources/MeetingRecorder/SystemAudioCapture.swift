@@ -2,6 +2,7 @@ import AudioToolbox
 import AVFoundation
 import CoreAudio
 import Foundation
+import Synchronization
 
 enum SystemAudioCaptureError: LocalizedError, Equatable, Sendable {
     case alreadyRunning
@@ -60,6 +61,11 @@ private final class SystemAudioRuntime: @unchecked Sendable {
     var systemFile: ExtAudioFileRef?
     var microphoneFile: ExtAudioFileRef?
     var frames: Int64 = 0
+    /// A copy of `frames`, for a reader off the realtime thread (the call
+    /// feed watcher's clock): the IOProc stores it with no lock right after
+    /// a cycle's frames are accepted, so a cycle left out of the tracks (the
+    /// equal-frames check, or a write error) never moves it ahead of them.
+    let writtenFrames = Atomic<Int64>(0)
     /// Cycles left out of both tracks, by why (see the IOProc).
     var cyclesWithoutAStream: Int64 = 0
     var cyclesOutOfStep: Int64 = 0
@@ -212,6 +218,7 @@ private func murmurlySystemAudioIOProc(
             runtime.endSilence(at: runtime.frames)
         }
         runtime.frames += Int64(systemFrames)
+        runtime.writtenFrames.store(runtime.frames, ordering: .relaxed)
     }
     return status
 }
@@ -487,6 +494,14 @@ final class SystemAudioTapRecorder: @unchecked Sendable {
         }
         let written = Int(stored.mChannelsPerFrame)
         return (client.mChannelsPerFrame > 0 ? Int(client.mChannelsPerFrame) : written, written)
+    }
+
+    /// Seconds of audio already written to the tracks: the atomic copy of
+    /// the IOProc's frame count, divided by the tracks' own rate — never the
+    /// wall clock, which a dropped headset would run ahead of the files.
+    func writtenSeconds() -> TimeInterval? {
+        guard let runtime, sampleRate > 0 else { return nil }
+        return Double(runtime.writtenFrames.load(ordering: .relaxed)) / sampleRate
     }
 
     deinit { teardown() }
@@ -810,6 +825,13 @@ actor SystemAudioCapture: MeetingCaptureBackend {
         }
     }
 
+    /// `tapRecorder` is set only at the end of a successful `start` and
+    /// cleared as the first line of `stop`, both inside this actor, so a
+    /// call arriving while a stop is under way safely sees nil.
+    func writtenSeconds() async -> TimeInterval? {
+        tapRecorder?.writtenSeconds()
+    }
+
     func stop() async throws -> [URL] {
         guard let recorder = tapRecorder,
               let directory = sessionDirectory,
@@ -1041,6 +1063,7 @@ extension SystemAudioTapRecorder {
             sampleRate: sampleRate
         )
         runtime.frames = enqueuedFrames
+        runtime.writtenFrames.store(enqueuedFrames, ordering: .relaxed)
         // There is no ring to overflow here: a test hands cycles over far
         // faster than a device's clock, and `writesSynchronouslyForTesting`
         // is set before the first `deliverCycleForTesting`.

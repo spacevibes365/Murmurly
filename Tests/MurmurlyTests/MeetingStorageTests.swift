@@ -372,9 +372,12 @@ final class MeetingStorageTests: XCTestCase {
         let own = [
             "metadata.json", "murmurly.json", "system.caf", "microphone.m4a", "mic-1.caf", "mic-1.m4a",
             "transcript.md", "transcript 12.md", MeetingAttempt.fileName(number: 3),
-            ".transcript-\(UUID().uuidString).tmp", ".system.partial.m4a",
+            ".transcript-\(UUID().uuidString).tmp", ".system.partial.m4a", CallFeed.fileName,
         ]
-        let theirs = ["tasks.md", "transcript 1.md", "transcript-notes.md", ".attempt notes", "photo.png"]
+        let theirs = [
+            "tasks.md", "transcript 1.md", "transcript-notes.md", ".attempt notes", "photo.png",
+            "\(CallFeed.fileName).bak",
+        ]
 
         for name in own { XCTAssertTrue(MeetingStorage.isOwnFile(name, tracks: tracks), name) }
         for name in theirs { XCTAssertFalse(MeetingStorage.isOwnFile(name, tracks: tracks), name) }
@@ -516,6 +519,75 @@ final class MeetingStorageTests: XCTestCase {
             for change in [names([.microphone: "Денис"]), MeetingMarks.Change(starred: true)] {
                 XCTAssertThrowsError(try MeetingMarks.write(change, in: folder, expecting: FolderIdentity.of(folder)), body)
             }
+            XCTAssertEqual(try Data(contentsOf: file), Data(body.utf8), "\(body) was written over")
+        }
+    }
+
+    /// A call feed's rename lives in `callNames`, changed in place the same
+    /// way `speakers` is: every other key survives, a star written
+    /// afterward leaves the renames alone, an empty name takes its own key
+    /// out, and `callNames` itself goes only once nothing is left in it.
+    func testCallNamesKeepEveryOtherKeyAndSurviveAStar() throws {
+        let folder = root.appendingPathComponent("2026-10-15 10-00-00 Meeting", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let file = folder.appendingPathComponent(MeetingMarks.fileName)
+        func object() throws -> [String: Any] {
+            try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: file)) as? [String: Any])
+        }
+        func renames(_ change: [String: String?]) -> MeetingMarks.Change {
+            var renames = MeetingMarks.Change()
+            for (found, name) in change { renames.callNames.updateValue(name, forKey: found) }
+            return renames
+        }
+
+        try Data(#"{"version":1,"title":"Планёрка","callNames":{"Гость Один":"старое"},"other":7}"#.utf8).write(to: file)
+        let written = try MeetingMarks.write(
+            renames(["Гость Один": "Аня", "Гость Два": "Борис"]), in: folder, expecting: FolderIdentity.of(folder)
+        )
+        XCTAssertEqual(written, MeetingMarks(title: "Планёрка", callNames: ["Гость Один": "Аня", "Гость Два": "Борис"]))
+        var callNames = try XCTUnwrap(try object()["callNames"] as? [String: Any])
+        XCTAssertEqual(callNames["Гость Один"] as? String, "Аня")
+        XCTAssertEqual(callNames["Гость Два"] as? String, "Борис")
+        XCTAssertEqual(try object()["other"] as? Int, 7)
+
+        // The star changes; the renames stay.
+        try MeetingMarks.write(MeetingMarks.Change(starred: true), in: folder, expecting: FolderIdentity.of(folder))
+        XCTAssertEqual(
+            MeetingMarks.read(in: folder),
+            .read(MeetingMarks(title: "Планёрка", starred: true, callNames: ["Гость Один": "Аня", "Гость Два": "Борис"]))
+        )
+
+        // One rename removed, the other left: the key does not go until empty.
+        try MeetingMarks.write(renames(["Гость Один": nil]), in: folder, expecting: FolderIdentity.of(folder))
+        callNames = try XCTUnwrap(try object()["callNames"] as? [String: Any])
+        XCTAssertNil(callNames["Гость Один"], "removing one rename took the other with it")
+        XCTAssertEqual(callNames["Гость Два"] as? String, "Борис")
+
+        // The last rename out: the key itself goes.
+        try MeetingMarks.write(renames(["Гость Два": nil]), in: folder, expecting: FolderIdentity.of(folder))
+        XCTAssertNil(try object()["callNames"])
+        XCTAssertEqual(try object()["version"] as? Int, 1)
+    }
+
+    /// `callNames` that is not an object, or a found name's value that is
+    /// not a string, makes the file unreadable: nothing is written over
+    /// it, same as a bad `speakers`.
+    func testCallNamesThatAreNotStringsMakeTheMarksUnreadable() throws {
+        let folder = root.appendingPathComponent("2026-10-15 10-00-00 Meeting", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let file = folder.appendingPathComponent(MeetingMarks.fileName)
+        for body in [
+            #"{"version":1,"callNames":["Аня"]}"#, #"{"version":1,"callNames":"Аня"}"#,
+            #"{"version":1,"callNames":{"Гость Один":7}}"#,
+        ] {
+            try Data(body.utf8).write(to: file)
+            guard case .unreadable = MeetingMarks.read(in: folder) else {
+                XCTFail("\(body) read as \(MeetingMarks.read(in: folder))")
+                continue
+            }
+            var renames = MeetingMarks.Change()
+            renames.callNames.updateValue("Аня", forKey: "Гость Один")
+            XCTAssertThrowsError(try MeetingMarks.write(renames, in: folder, expecting: FolderIdentity.of(folder)), body)
             XCTAssertEqual(try Data(contentsOf: file), Data(body.utf8), "\(body) was written over")
         }
     }

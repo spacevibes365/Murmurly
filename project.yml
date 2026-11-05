@@ -32,6 +32,9 @@ packages:
   Sparkle:
     url: https://github.com/sparkle-project/Sparkle
     exactVersion: 2.10.0
+  WebRTCAEC3:
+    url: https://github.com/spacevibes365/webrtc-aec3
+    exactVersion: 0.1.0
   # Only the murmurly helper links it.
   MCP:
     url: https://github.com/modelcontextprotocol/swift-sdk
@@ -58,6 +61,7 @@ targets:
       - package: KeyboardShortcuts
       - package: FluidAudio
       - package: Sparkle
+      - package: WebRTCAEC3
       # Contents/Helpers, not Contents/MacOS: there `murmurly` and `Murmurly`
       # would be one name on a case-insensitive volume.
       - target: MurmurlyHelper

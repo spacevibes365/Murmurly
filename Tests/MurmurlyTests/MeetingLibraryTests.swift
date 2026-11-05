@@ -1722,8 +1722,13 @@ final class MeetingLibraryTests: XCTestCase {
         return try XCTUnwrap(library.meeting(at: folder))
     }
 
-    private func setNames(_ library: MeetingLibrary, _ meeting: MeetingLibrary.Meeting, _ microphone: String, _ system: String) -> String? {
-        library.setNames(typedOn: meeting.identity, at: meeting.directory.path, microphone: microphone, system: system)
+    private func setNames(
+        _ library: MeetingLibrary, _ meeting: MeetingLibrary.Meeting, _ microphone: String, _ system: String,
+        callNames: [String: String] = [:]
+    ) -> String? {
+        library.setNames(
+            typedOn: meeting.identity, at: meeting.directory.path, microphone: microphone, system: system, callNames: callNames
+        )
     }
 
     /// Every file at the top of the folder by name, byte for byte, but the marks.
@@ -1819,6 +1824,146 @@ final class MeetingLibraryTests: XCTestCase {
         )
     }
 
+    // MARK: - The call feed's own names
+
+    /// A meeting with a call feed and a rename gives the same text and the
+    /// same "Names: … From the call: …" line on the card, in Copy Text and
+    /// in every Save As format (Markdown, plain text, SRT).
+    func testCardCopyAndSaveAsGiveOneTextWithTheCallNames() async throws {
+        let meeting = try seed("2026-10-06 10-00-00 Meeting", in: local, metadata: done)
+        try write(recorded([(.system, "Others", "привет"), (.system, "Others", "и я")]), into: meeting)
+        let feed = [
+            CallFeed.Event(t: 1, service: "telemost", visible: true, ownName: nil, selfSpeaking: false, people: ["Гость Один"], speaking: ["Гость Один"]),
+            CallFeed.Event(t: 3, service: "telemost", visible: true, ownName: nil, selfSpeaking: false, people: ["Гость Два"], speaking: ["Гость Два"]),
+        ]
+        try Data(feed.map { $0.encodedLine() }.joined().utf8).write(to: meeting.appendingPathComponent(CallFeed.fileName))
+        let library = try await openLibrary()
+        let row = try await showText(of: meeting, in: library)
+        XCTAssertNil(setNames(library, row, "", "", callNames: ["Гость Один": "Аня"]))
+
+        let shown = try XCTUnwrap(library.shownTranscript(of: row))
+        XCTAssertEqual(shown.lines?.map(\.speaker), ["Аня", "Гость Два"])
+        let note = try XCTUnwrap(shown.namesNote)
+        XCTAssertTrue(note.contains("From the call"), note)
+
+        let copied = TranscriptTextView.attributed(shown).string
+        XCTAssertTrue(copied.contains("Аня: привет"), copied)
+        XCTAssertTrue(copied.contains("Гость Два: и я"), copied)
+        XCTAssertTrue(copied.contains(note), "Copy Text does not say who is who")
+
+        let markdown = try XCTUnwrap(shown.exported(as: .markdown))
+        XCTAssertTrue(markdown.contains("**Аня:**"), markdown)
+        XCTAssertTrue(markdown.contains(note), markdown)
+        let plain = try XCTUnwrap(shown.exported(as: .text))
+        XCTAssertTrue(plain.contains("Аня: привет"), plain)
+        let srt = try XCTUnwrap(shown.exported(as: .subtitles))
+        XCTAssertTrue(srt.contains("Аня: привет"), srt)
+        XCTAssertTrue(srt.contains("Гость Два: и я"), srt)
+    }
+
+    /// Saving a rename writes `callNames`, the card shows the renamed name,
+    /// and an empty field or the found name itself gives the found name
+    /// back; `*` is refused, same as a track name.
+    func testCallNamesAreSavedAndShownAndEmptyGivesTheFoundNameBack() async throws {
+        let meeting = try seed("2026-10-06 10-00-00 Meeting", in: local, metadata: done)
+        try write(recorded([(.system, "Others", "привет")]), into: meeting)
+        let feed = [CallFeed.Event(t: 1, service: "telemost", visible: true, ownName: nil, selfSpeaking: false, people: ["Гость Один"], speaking: [])]
+        try Data(feed.map { $0.encodedLine() }.joined().utf8).write(to: meeting.appendingPathComponent(CallFeed.fileName))
+        let library = try await openLibrary()
+        let row = try await showText(of: meeting, in: library)
+
+        XCTAssertNil(setNames(library, row, "", "", callNames: ["Гость Один": "Аня"]))
+        XCTAssertEqual(MeetingMarks.read(in: meeting), .read(MeetingMarks(callNames: ["Гость Один": "Аня"])))
+        XCTAssertEqual(library.shownTranscript(of: row)?.lines?.map(\.speaker), ["Аня"])
+
+        // Empty gives the found name back: the key is removed, not left empty.
+        XCTAssertNil(setNames(library, row, "", "", callNames: ["Гость Один": ""]))
+        XCTAssertEqual(MeetingMarks.read(in: meeting), .read(MeetingMarks()))
+        XCTAssertEqual(library.shownTranscript(of: row)?.lines?.map(\.speaker), ["Гость Один"])
+
+        // Typing the found name itself does the same.
+        XCTAssertNil(setNames(library, row, "", "", callNames: ["Гость Один": "Борис"]))
+        XCTAssertNil(setNames(library, row, "", "", callNames: ["Гость Один": "Гость Один"]))
+        XCTAssertEqual(MeetingMarks.read(in: meeting), .read(MeetingMarks()))
+
+        XCTAssertNotNil(setNames(library, row, "", "", callNames: ["Гость Один": "Б*орис"]), "a name with * was taken")
+        XCTAssertEqual(MeetingMarks.read(in: meeting), .read(MeetingMarks()), "the refused name was written")
+    }
+
+    /// A rename of a call feed's person is refused while this very folder
+    /// is being recorded, same as a track name, and nothing is written.
+    func testCallNamesAreRefusedWhileTheMeetingIsRecorded() async throws {
+        let recorder = makeRecorder()
+        let library = makeLibrary(recorder: recorder)
+        library.windowOpened()
+        recorder.toggle()
+        try await until { recorder.state == .recording }
+        let live = MeetingLibrary.canonical(try XCTUnwrap(recorder.currentSession?.directory))
+        library.refresh()
+        try await until { library.local.fresh && library.meeting(at: live) != nil }
+        let row = try XCTUnwrap(library.meeting(at: live))
+
+        XCTAssertEqual(
+            setNames(library, row, "", "", callNames: ["Гость Один": "Аня"]),
+            String(localized: "The meeting is being recorded.")
+        )
+        XCTAssertFalse(exists(live.appendingPathComponent(MeetingMarks.fileName)))
+        XCTAssertTrue(library.pendingMarks.isEmpty)
+
+        recorder.toggle()
+        try await until { recorder.currentSession == nil }
+    }
+
+    /// A feed with a garbage line, a truncated tail and invalid UTF-8 still
+    /// names every line it can: the readable event names its line, the rest
+    /// keep the track's own label, and reading the text never throws.
+    func testATornFeedStillNamesTheReadableLines() async throws {
+        let meeting = try seed("2026-10-06 10-00-00 Meeting", in: local, metadata: done)
+        try write(recorded([(.system, "Others", "привет"), (.system, "Others", "и я")]), into: meeting)
+        let valid = [
+            CallFeed.Event(t: 1, service: "telemost", visible: true, ownName: nil, selfSpeaking: false, people: ["Гость Один"], speaking: ["Гость Один"]),
+            CallFeed.Event(
+                t: 2, service: "telemost", visible: true, ownName: nil, selfSpeaking: false,
+                people: ["Гость Один", "Гость Два"], speaking: []
+            ),
+        ]
+        var bytes = Data(valid.map { $0.encodedLine() }.joined().utf8)
+        bytes.append(Data("not json at all\n".utf8))
+        bytes.append(Data([0xC3, 0x28])) // invalid UTF-8, no trailing newline: a truncated last line
+        try bytes.write(to: meeting.appendingPathComponent(CallFeed.fileName))
+
+        let library = try await openLibrary()
+        let row = try await showText(of: meeting, in: library)
+        let shown = try XCTUnwrap(library.shownTranscript(of: row))
+        XCTAssertEqual(shown.lines?.map(\.speaker), ["Гость Один", "Others"])
+    }
+
+    /// A call feed file that is a link to another file reads as no feed
+    /// here too, the same answer the embedded helper gives (P3: one meeting
+    /// must read as one text, in the window and in the helper), and the
+    /// transcript's own read is not refused by it.
+    func testACallFeedBehindALinkReadsAsNoFeed() async throws {
+        let meeting = try seed("2026-10-06 10-00-00 Meeting", in: local, metadata: done)
+        try write(recorded([(.system, "Others", "привет"), (.system, "Others", "и я")]), into: meeting)
+        let feed = [
+            CallFeed.Event(t: 1, service: "telemost", visible: true, ownName: nil, selfSpeaking: false, people: ["Гость Один"], speaking: []),
+            CallFeed.Event(t: 3, service: "telemost", visible: true, ownName: nil, selfSpeaking: false, people: ["Гость Два"], speaking: []),
+        ]
+        let elsewhere = local.appendingPathComponent("elsewhere-feed", isDirectory: true)
+        try FileManager.default.createDirectory(at: elsewhere, withIntermediateDirectories: true)
+        try Data(feed.map { $0.encodedLine() }.joined().utf8).write(to: elsewhere.appendingPathComponent(CallFeed.fileName))
+        try FileManager.default.createSymbolicLink(
+            at: meeting.appendingPathComponent(CallFeed.fileName),
+            withDestinationURL: elsewhere.appendingPathComponent(CallFeed.fileName)
+        )
+
+        let library = try await openLibrary()
+        let row = try await showText(of: meeting, in: library)
+        let shown = try XCTUnwrap(library.shownTranscript(of: row))
+        XCTAssertEqual(shown.lines?.map(\.speaker), ["Others", "Others"], "a feed behind a link is read as no feed")
+        XCTAssertNil(library.callSummary(of: row), "a linked feed must not be reported as read")
+    }
+
     /// The names are the meeting's, not a transcript's: a transcription
     /// asked for again, in an engine and language of its own, writes a new
     /// version named as the first, and the queue leaves murmurly.json alone.
@@ -1895,6 +2040,33 @@ final class MeetingLibraryTests: XCTestCase {
         XCTAssertEqual(library.shownTranscript(of: row)?.lines?.map(\.speaker), ["Me", "Others"])
         XCTAssertNil(setNames(library, row, "", ""))
         XCTAssertEqual(library.trackLabels(of: row), [.microphone: "Me", .system: "Others"], "an empty name kept the player's name")
+    }
+
+    /// The "Speaker names aren't shown" note is not only about track names:
+    /// a call feed or a rename that would have named a line, had the record
+    /// matched, is also a reason to explain why it doesn't — not just a
+    /// meeting with `speakers` set in its marks. Without any of the three
+    /// (no track names, no `callNames` and no feed read) there is nothing
+    /// the note would be explaining, so it stays nil even with no record.
+    func testNamesNotShownNoteCoversTheCallFeedToo() async throws {
+        let plain = "# Meeting\n\n---\n\n[0:05] **Guest:** привет\n"
+        let feed = [CallFeed.Event(t: 1, service: "telemost", visible: true, ownName: nil, selfSpeaking: false, people: ["Гость"], speaking: [])]
+        let withFeed = try seed("2026-10-06 10-00-00 Meeting", in: local, metadata: done, files: ["transcript.md": plain])
+        try Data(feed.map { $0.encodedLine() }.joined().utf8).write(to: withFeed.appendingPathComponent(CallFeed.fileName))
+        let withoutAnything = try seed("2026-10-06 11-00-00 Meeting", in: local, metadata: done, files: ["transcript.md": plain])
+        let library = try await openLibrary()
+
+        let withFeedRow = try await showText(of: withFeed, in: library)
+        XCTAssertNotNil(library.callSummary(of: withFeedRow))
+        XCTAssertEqual(library.marks(of: withFeedRow)?.speakers ?? [:], [:], "no track names set")
+        XCTAssertEqual(
+            library.namesNotShownRefusal(for: withFeedRow),
+            String(localized: "There are no records of this meeting’s transcriptions: which track each line came from isn’t known.")
+        )
+
+        let withoutRow = try await showText(of: withoutAnything, in: library)
+        XCTAssertNil(library.callSummary(of: withoutRow))
+        XCTAssertNil(library.namesNotShownRefusal(for: withoutRow), "nothing to explain without track names, callNames or a feed")
     }
 
     /// The names sheet is opened before the queue moves the meeting: while
@@ -2707,6 +2879,26 @@ final class MeetingLibraryTests: XCTestCase {
         try await until { library.meeting(at: meeting)?.audio == .known(files: [], missing: ["system.m4a", "microphone.m4a"]) }
     }
 
+    /// The call feed is an own file, not a track: it is not among the
+    /// meeting's `otherFiles`, and Delete Audio leaves it behind — in the
+    /// folder, not in the Trash.
+    func testDeletingAudioKeepsTheCallFeed() async throws {
+        let meeting = try seed("2026-10-06 10-00-01 Meeting", in: local, metadata: done, files: [
+            "transcript.md": transcript("текст"), CallFeed.fileName: "{\"v\":1}\n",
+        ])
+        let library = try await openLibrary()
+        XCTAssertEqual(library.meeting(at: meeting)?.otherFiles, [])
+        let plan = library.removalPlan(for: [meeting], kind: .audio)
+        XCTAssertEqual(plan.refused, [])
+        XCTAssertEqual(plan.items.count, 1)
+
+        let lines = try await deleted(library, [meeting], .audio)
+
+        XCTAssertEqual(lines.map(\.outcome), [.trashed])
+        XCTAssertFalse(inTrash().contains(CallFeed.fileName))
+        XCTAssertTrue(exists(meeting.appendingPathComponent(CallFeed.fileName)))
+    }
+
     /// Only plain names directly in the folder count as tracks, and nothing
     /// is followed through a link: a track named by a path, a track that is a
     /// link, a folder reached by a link — none is deleted, each says why.
@@ -2757,6 +2949,27 @@ final class MeetingLibraryTests: XCTestCase {
         XCTAssertTrue(exists(copies.appendingPathComponent("2026-10-06 10-00-00 Meeting.md")), "the transcript's copy went too")
         XCTAssertNil(library.selection)
         try await until { library.meeting(at: meeting) == nil }
+    }
+
+    /// Deleting a whole meeting takes the call feed with the folder, as an
+    /// own file: `RemovalItem.others` does not list it (a real other file,
+    /// `tasks.md`, still does), and it ends up in the Trash inside the
+    /// folder, not loose beside it.
+    func testDeletingAMeetingTakesTheCallFeedButNotAsAnotherFile() async throws {
+        let meeting = try seed("2026-10-06 10-00-01 Meeting", in: local, metadata: done, files: [
+            "tasks.md": "дела", CallFeed.fileName: "{\"v\":1}\n",
+        ])
+        let library = try await openLibrary()
+
+        let plan = library.removalPlan(for: [meeting], kind: .meeting)
+        XCTAssertEqual(plan.items.first?.others, ["tasks.md"])
+        let lines = try await deleted(library, [meeting], .meeting)
+
+        XCTAssertEqual(lines.map(\.outcome), [.trashed])
+        XCTAssertFalse(exists(meeting))
+        let places = try FileManager.default.contentsOfDirectory(at: trashFolder, includingPropertiesForKeys: nil)
+        let trashed = try XCTUnwrap(places.first).appendingPathComponent(meeting.lastPathComponent)
+        XCTAssertTrue(exists(trashed.appendingPathComponent(CallFeed.fileName)), "the call feed went to the Trash with the rest of the folder")
     }
 
     /// The menu's "Show Last Recording…" and the warning about a recording's

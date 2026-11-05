@@ -185,6 +185,8 @@ extension Archive {
         var starred: Bool { folder.marks.marks?.starred ?? false }
         /// Only the names the user set in `murmurly.json`; empty when none.
         var speakers: [MeetingAttempt.Source: String] { folder.marks.marks?.speakers ?? [:] }
+        /// How the user renamed a person the call feed found; empty when none.
+        var callNames: [String: String] { folder.marks.marks?.callNames ?? [:] }
         /// By number: `folder.versions` is sorted by it already.
         var latest: TranscriptVersion? { folder.versions.last }
         var completeness: LastAttempt { folder.lastAttempt }
@@ -378,7 +380,13 @@ extension Archive {
         } else {
             attempt = latest.attempt
         }
-        return MeetingTranscript.parse(text).timed(by: attempt).named(meeting.speakers)
+        // A link the links policy won't follow, or an otherwise unreadable
+        // feed file, is "no feed" here, same as the window: the feed is
+        // extra information, and this read must not refuse a transcription
+        // over a damaged side file the window itself would recover from.
+        let feed = try? CallFeed.read(in: meeting.folder.directory, links: links)
+        let call = feed.map { CallFeed.summary(for: attempt?.lines ?? [], feed: $0) }
+        return MeetingTranscript.parse(text).timed(by: attempt).named(by: meeting.folder.marks.marks, call: call)
     }
 
     /// Whether `query` is found in each meeting's newest transcript, by the

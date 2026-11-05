@@ -76,6 +76,22 @@ final class MeetingMoveTests: XCTestCase {
         XCTAssertEqual(moved.microphone?.deletingLastPathComponent().lastPathComponent, folder.lastPathComponent)
     }
 
+    /// The call feed moves with the rest of the folder, byte for byte, and
+    /// leaves no copy behind locally — it is an ordinary file of the
+    /// meeting's own, carried the same way as `murmurly.json`.
+    func testMoveCarriesTheCallFeed() throws {
+        let folder = try meeting("2026-10-07 10-00-14 Meeting")
+        try Data("{\"v\":1,\"t\":0,\"service\":\"telemost\",\"visible\":true,\"self\":null,\"selfSpeaking\":false,\"people\":[\"Гость\"],\"speaking\":[]}\n".utf8)
+            .write(to: folder.appendingPathComponent(CallFeed.fileName))
+        let before = try MeetingAudio.digests(of: folder)
+
+        let place = try MeetingStorage.move(folder, into: target, localRoot: local, mounts: mounts)
+
+        XCTAssertEqual(try MeetingAudio.digests(of: place), before)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: place.appendingPathComponent(CallFeed.fileName).path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: folder.path))
+    }
+
     /// A file the copy cannot read: the half copy goes, the local folder stays.
     func testFailedCopyLeavesNoPartialAndKeepsTheLocalFolder() throws {
         let folder = try meeting("2026-10-07 10-00-02 Meeting")

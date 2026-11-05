@@ -103,31 +103,135 @@ struct MeetingTranscript: Sendable, Equatable {
         named.lines = zip(lines, spans).map { line, span in
             Line(timecode: line.timecode, speaker: names[span.source] ?? line.speaker, text: line.text)
         }
-        // The note says who is who for both tracks, the one not named by
-        // its label from the file.
+        let labels = writtenLabels(lines: lines, spans: spans)
+        named.names = names
+        named.speakerNames = MeetingAttempt.Speakers(
+            microphone: names[.microphone] ?? labels[.microphone] ?? MeetingTranscript.microphoneLabel,
+            system: names[.system] ?? labels[.system] ?? MeetingTranscript.systemLabel
+        )
+        named.callNamesShown = []
+        return named
+    }
+
+    /// Each line named on its own (by index, as `named(_:)` names it by
+    /// `lines[i].source`), only with the record's exact spans: the user's
+    /// Names-sheet name for the microphone first, then the feed's pick for
+    /// that line (the system's pick renamed through `renames`, found-name to
+    /// shown name); the track's own label last. Without a feed, or with one
+    /// that names no line at all, the result is `named(_:)`'s, byte for
+    /// byte: a feed is extra information, never a reason to show less than
+    /// the Names sheet already would.
+    func named(
+        _ names: [MeetingAttempt.Source: String], feed: [CallFeed.Event], renames: [String: String]
+    ) -> MeetingTranscript {
+        guard case .exact(let spans) = timing else { return named(names) }
+        return named(names, picked: CallFeed.pickedNames(for: spans, feed: feed), renames: renames)
+    }
+
+    /// The one function both the card and the helper call: the user's names
+    /// for the tracks, then the call feed's summary (its per-line picks,
+    /// renamed through `callNames`), exactly as `named(_:feed:renames:)`
+    /// above. Without a call summary, or with one that names no line at
+    /// all, this is `named(marks.speakers)`'s result, byte for byte — a
+    /// meeting without a feed reads exactly as it did before this feature.
+    func named(by marks: MeetingMarks?, call: CallFeed.Summary?) -> MeetingTranscript {
+        guard let call else { return named(marks?.speakers ?? [:]) }
+        return named(marks?.speakers ?? [:], picked: call.picked, renames: marks?.callNames ?? [:])
+    }
+
+    /// The shared core of both `named` overloads above: `picked` is already
+    /// computed (`CallFeed.pickedNames`'s own answer, or a `Summary`'s).
+    private func named(
+        _ names: [MeetingAttempt.Source: String], picked: [String?], renames: [String: String]
+    ) -> MeetingTranscript {
+        guard case .exact(let spans) = timing, let lines, picked.contains(where: { $0 != nil }) else {
+            return named(names)
+        }
+
+        var result = self
+        var fromCall: [String] = []
+        var fromCallSeen = Set<String>()
+        func note(_ name: String) {
+            guard !fromCallSeen.contains(name) else { return }
+            fromCallSeen.insert(name)
+            fromCall.append(name)
+        }
+        // `zip`, not `lines.indices`, the same guard `named(_:)` uses: a
+        // `timing` built by hand with a different number of spans than
+        // lines must not index past either array's end.
+        result.lines = Array(zip(zip(lines, spans), picked).map { pair, picked in
+            let (line, span) = pair
+            let speaker: String
+            switch span.source {
+            case .microphone:
+                if let picked, names[.microphone] == nil {
+                    speaker = picked
+                    note(picked)
+                } else {
+                    speaker = names[.microphone] ?? picked ?? line.speaker
+                }
+            case .system:
+                if let picked {
+                    // The dictionary's value is cleaned the same way a
+                    // feed name is (K5): a stray `*` in "how to call them"
+                    // must not reach the Markdown label unescaped. Empty
+                    // after cleaning keeps the feed's own found name,
+                    // never an empty label.
+                    speaker = renames[picked].flatMap(CallFeed.Event.cleanedName) ?? picked
+                    note(speaker)
+                } else {
+                    speaker = names[.system] ?? line.speaker
+                }
+            }
+            return Line(timecode: line.timecode, speaker: speaker, text: line.text)
+        })
+        let labels = writtenLabels(lines: lines, spans: spans)
+        result.names = names
+        result.speakerNames = MeetingAttempt.Speakers(
+            microphone: names[.microphone] ?? labels[.microphone] ?? MeetingTranscript.microphoneLabel,
+            system: names[.system] ?? labels[.system] ?? MeetingTranscript.systemLabel
+        )
+        result.callNamesShown = fromCall
+        return result
+    }
+
+    /// Each track's label as the file wrote it (or the record's own label),
+    /// the last fallback when neither the user nor the feed names it.
+    private func writtenLabels(
+        lines: [Line], spans: [MeetingAttempt.Line]
+    ) -> [MeetingAttempt.Source: String] {
         var labels = [MeetingAttempt.Source: String]()
         for (line, span) in zip(lines, spans) where labels[span.source] == nil { labels[span.source] = line.speaker }
         if let written = self.labels {
             labels[.microphone] = labels[.microphone] ?? written.microphone
             labels[.system] = labels[.system] ?? written.system
         }
-        named.names = names
-        named.speakerNames = MeetingAttempt.Speakers(
-            microphone: names[.microphone] ?? labels[.microphone] ?? MeetingTranscript.microphoneLabel,
-            system: names[.system] ?? labels[.system] ?? MeetingTranscript.systemLabel
-        )
-        return named
+        return labels
     }
 
     /// Who speaks on each track once named, for the note after the header.
     private var speakerNames: MeetingAttempt.Speakers?
+    /// The call feed's own names that actually stood on a line, once named
+    /// through it: the microphone's own-tile name only when it took the
+    /// place of a track name, every system pick (after `callNames`)
+    /// whatever the track name said — the same rule `named(_:picked:renames:)`
+    /// uses to pick a line's speaker. Without repeats, in first order; empty
+    /// when the text was not named through a call feed.
+    private(set) var callNamesShown: [String] = []
 
     /// After the header, untouched, when the user's names took the place of
     /// the labels: the header's own note is about the labels, which are gone.
+    /// With a call feed that named at least one line, the people it named
+    /// are listed too, after the track names.
     var namesNote: String? {
-        speakerNames.map {
-            String(localized: "Names: “\($0.microphone)” is the microphone, “\($0.system)” is the system audio.")
+        guard let speakerNames else { return nil }
+        guard !callNamesShown.isEmpty else {
+            return String(localized: "Names: “\(speakerNames.microphone)” is the microphone, “\(speakerNames.system)” is the system audio.")
         }
+        let people = callNamesShown.formatted(.list(type: .and))
+        return String(
+            localized: "Names: “\(speakerNames.microphone)” is the microphone, “\(speakerNames.system)” is the system audio. From the call: \(people)."
+        )
     }
 
     /// The text as the window shows it and "Copy Text" copies it: the

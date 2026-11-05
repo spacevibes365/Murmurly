@@ -678,12 +678,21 @@ also shows the meeting audio's size and how many meetings have none left
 (`ArchiveSnapshot.MeetingAudio`).
 
 **Meeting transcription** (`MeetingTranscription.swift`). `MeetingTranscriber`
-finds speech with the Silero VAD, cuts each track into chunks, recognizes them
-with the selected engine, drops microphone chunks whose words mostly appear in
-the system track at the same time (echo; split on spaces, so it does nothing for
-languages written without them), interleaves both tracks by time, applies the
-personal dictionary to each line, and writes `transcript.md` (never
-overwriting an existing one). `MeetingTranscriptionQueue`
+first subtracts the system track's echo from the microphone with WebRTC AEC3
+(package `WebRTCAEC3`), so a call on the Mac's speakers keeps the user's own
+words: the far side, louder in the microphone than the user, had made the VAD
+join them into one chunk the echo filter below then dropped whole. The two
+tracks are streamed in 1 s blocks into a work file, so an hour's audio is never
+held in memory; if the canceller or the system track fails, the error is logged
+and the raw microphone is used, and the job goes on. Only the app turns it on
+(`cancelsEcho`, set by `MeetingTranscriber.live`): tests whose tracks are
+constant levels, not speech, leave it off. It then finds speech with the Silero
+VAD, cuts each track into chunks, recognizes them with the selected engine,
+drops microphone chunks whose words mostly appear in the system track at the
+same time (what is left of the echo after AEC3; split on spaces, so it does
+nothing for languages written without them), interleaves both tracks by time,
+applies the personal dictionary to each line, and writes `transcript.md`
+(never overwriting an existing one). `MeetingTranscriptionQueue`
 then compresses the tracks to 24-bit ALAC `.m4a`, verified sample by sample,
 can move finished meetings to a user-chosen folder, and can copy each transcript
 into another folder. The queue remembers where its own moves put each folder in

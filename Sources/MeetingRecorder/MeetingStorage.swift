@@ -299,7 +299,9 @@ extension MeetingStorage {
     /// the user put there, which the window shows and nothing removes.
     /// `tracks` are the names `metadata.json` lists.
     static func isOwnFile(_ name: String, tracks: [String]) -> Bool {
-        if ["metadata.json", "murmurly.json"].contains(name) || defaultTrackNames.contains(name) { return true }
+        if ["metadata.json", "murmurly.json", CallFeed.fileName].contains(name) || defaultTrackNames.contains(name) {
+            return true
+        }
         let stems = Set(tracks.map { ($0 as NSString).deletingPathExtension })
         let stem = (name as NSString).deletingPathExtension
         if stems.contains(stem), name.lowercased().hasSuffix(".caf") || name.lowercased().hasSuffix(".m4a") { return true }
@@ -1102,14 +1104,20 @@ extension MeetingMarks {
         /// Only the tracks named here change. Set with `updateValue`: a
         /// subscript assignment of a literal nil would drop the change itself.
         var speakers: [MeetingAttempt.Source: String?] = [:]
+        /// Only the found names given here change: `nil` removes that one
+        /// rename (the feed's found name shows again), as `speakers` does
+        /// for a track. An empty dictionary changes nothing on disk — the
+        /// loop below runs only over the keys actually given.
+        var callNames: [String: String?] = [:]
 
-        var isEmpty: Bool { title == nil && starred == nil && speakers.isEmpty }
+        var isEmpty: Bool { title == nil && starred == nil && speakers.isEmpty && callNames.isEmpty }
 
         func applied(to marks: MeetingMarks) -> MeetingMarks {
             var marks = marks
             if let title { marks.title = title }
             if let starred { marks.starred = starred }
             for (source, name) in speakers { marks.speakers[source] = name }
+            for (found, name) in callNames { marks.callNames[found] = name }
             return marks
         }
 
@@ -1118,6 +1126,7 @@ extension MeetingMarks {
             if let title = later.title { self.title = title }
             if let starred = later.starred { self.starred = starred }
             for (source, name) in later.speakers { speakers.updateValue(name, forKey: source) }
+            for (found, name) in later.callNames { callNames.updateValue(name, forKey: found) }
         }
     }
 
@@ -1161,6 +1170,14 @@ extension MeetingMarks {
                 if let name { names[source.rawValue] = name } else { names.removeValue(forKey: source.rawValue) }
             }
             if names.isEmpty { object.removeValue(forKey: "speakers") } else { object["speakers"] = names }
+        }
+        if !change.callNames.isEmpty {
+            // The object read, changed in place: a key of a later version in it stays.
+            var renames = object["callNames"] as? [String: Any] ?? [:]
+            for (found, name) in change.callNames {
+                if let name { renames[found] = name } else { renames.removeValue(forKey: found) }
+            }
+            if renames.isEmpty { object.removeValue(forKey: "callNames") } else { object["callNames"] = renames }
         }
         guard case .success(let marks) = parse(object) else { throw Refusal.unreadable(String(localized: "a mark of another kind")) }
         let written = try JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys])

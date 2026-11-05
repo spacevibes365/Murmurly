@@ -6,11 +6,14 @@ import CryptoKit
 import FluidAudio
 import Foundation
 import SwiftUI
+import WebRTCAEC3
 
 /// Turns a saved meeting folder into `transcript.md` with the app's own engine:
-/// each track is cut into speech chunks by Silero VAD, every chunk is one short
-/// request to the shared engine cache, the microphone's copy of the remote side
-/// is dropped as echo, and the two tracks are interleaved by time.
+/// the system track's echo is subtracted from the microphone (WebRTC AEC3)
+/// before each track is cut into speech chunks by Silero VAD, every chunk is
+/// one short request to the shared engine cache, what is left of the remote
+/// side's echo in the microphone's words is dropped, and the two tracks are
+/// interleaved by time.
 ///
 /// Nonisolated on purpose: converting two hours of audio and running the VAD
 /// over it must never run on the main actor, or the menu and the hotkey freeze.
@@ -171,6 +174,10 @@ struct MeetingTranscriber: Sendable {
     /// The engine the dictation holds now (`DictationCoordinator.heldEngine`);
     /// a chunk in another engine waits for it. None by default.
     var heldByDictation: @Sendable () async -> EngineDescriptor? = { nil }
+    /// Subtracts the system track's echo from the microphone before the VAD
+    /// (WebRTC AEC3). Off by default: tests' tracks are constant levels, which
+    /// the canceller would bend; the app turns it on in `live`.
+    var cancelsEcho = false
 
     func transcribe(
         _ folder: Folder,
@@ -193,15 +200,34 @@ struct MeetingTranscriber: Sendable {
         var report = Report()
         report.microphoneSpeaker = Self.microphoneSpeaker
         report.systemSpeaker = Self.systemSpeaker
-        let tracks: [(URL?, Float, String, String, WritableKeyPath<Report, [Utterance]>)] = [
-            (folder.microphone, folder.microphoneGain, report.microphoneSpeaker, String(localized: "microphone"), \.microphone),
-            (folder.system, folder.systemGain, report.systemSpeaker, String(localized: "others"), \.system),
+        // Read once per job, before any chunk is recognized: a feed grown
+        // while the job runs must not change the names already handed out.
+        let feed: [CallFeed.Event]
+        do {
+            if let events = try CallFeed.read(in: folder.directory, links: .refuse) {
+                feed = events
+                AppLog.info("meeting-transcript", "call feed events=\(events.count)")
+            } else {
+                feed = []
+            }
+        } catch {
+            feed = []
+            AppLog.error("meeting-transcript", "call feed unreadable: \(error.localizedDescription)")
+        }
+        let microphoneReference: (url: URL, gain: Float)? = cancelsEcho
+            ? folder.system.map { ($0, folder.systemGain) } : nil
+        let tracks: [(URL?, Float, String, String, WritableKeyPath<Report, [Utterance]>, (url: URL, gain: Float)?)] = [
+            (
+                folder.microphone, folder.microphoneGain, report.microphoneSpeaker,
+                String(localized: "microphone"), \.microphone, microphoneReference
+            ),
+            (folder.system, folder.systemGain, report.systemSpeaker, String(localized: "others"), \.system, nil),
         ]
         do {
-            for case let (url?, gain, speaker, name, list) in tracks {
+            for case let (url?, gain, speaker, name, list, reference) in tracks {
                 try await transcribeTrack(
                     url, gain: gain, speaker: speaker, name: name, into: list, work: work,
-                    choice: choice, detect: detect, report: &report, progress: progress
+                    choice: choice, detect: detect, reference: reference, report: &report, progress: progress
                 )
             }
         } catch {
@@ -215,7 +241,9 @@ struct MeetingTranscriber: Sendable {
 
         let echo = Self.removingEcho(microphone: report.microphone, system: report.system)
         report.echoRemoved = echo.removed
-        report.lines = Self.finished(echo.kept + report.system, dictionary: replacer)
+        report.lines = Self.finished(
+            echo.kept + report.system, microphoneSpeaker: report.microphoneSpeaker, feed: feed, dictionary: replacer
+        )
         try Task.checkCancellation()
         guard !report.lines.isEmpty else {
             // Speech was found and not one chunk of it came back: a failure,
@@ -260,7 +288,7 @@ struct MeetingTranscriber: Sendable {
         do {
             try await transcribeTrack(
                 url, gain: 1, speaker: "", name: String(localized: "file"), into: \.system, work: work,
-                choice: choice, detect: detect, report: &report, progress: progress
+                choice: choice, detect: detect, reference: nil, report: &report, progress: progress
             )
         } catch {
             // As with a meeting, a break keeps what was recognized; the user's
@@ -294,6 +322,7 @@ struct MeetingTranscriber: Sendable {
         work: URL,
         choice: SettingsSnapshot.Choice?,
         detect: SpeechDetector,
+        reference: (url: URL, gain: Float)?,
         report: inout Report,
         progress: @Sendable (Step) async -> Void
     ) async throws {
@@ -313,9 +342,16 @@ struct MeetingTranscriber: Sendable {
         // and the engine get the original level back, since a quieter track
         // is recognized worse.
         let source: any AudioSampleSource = gain == 1 ? disk : GainRestoredSource(base: disk, gain: gain)
+        var heard = source
+        var cleanedFile: URL?
+        if let reference, let cleaning = try await cancellingEcho(in: source, reference: reference, work: work) {
+            heard = cleaning.source
+            cleanedFile = cleaning.file
+        }
+        defer { if let cleanedFile { try? FileManager.default.removeItem(at: cleanedFile) } }
         try Task.checkCancellation()
         await progress(.detecting(track: name))
-        let ranges = try await detect(source)
+        let ranges = try await detect(heard)
         var track = TrackReport(name: name, chunks: ranges.count)
         track.speechSeconds = Double(ranges.reduce(0) { $0 + $1.count }) / Double(Self.sampleRate)
         defer { report.tracks.append(track) }
@@ -335,7 +371,7 @@ struct MeetingTranscriber: Sendable {
             )
             let chunk = work.appendingPathComponent("chunk-\(index).caf")
             defer { try? FileManager.default.removeItem(at: chunk) }
-            try Self.writeChunk(from: source, range: range, to: chunk)
+            try Self.writeChunk(from: heard, range: range, to: chunk)
 
             let engine = try await engine(for: choice, progress: progress)
             if !report.engines.contains(engine.label) { report.engines.append(engine.label) }
@@ -382,6 +418,96 @@ struct MeetingTranscriber: Sendable {
         }
         if track.skippedChunks > 0 {
             AppLog.info("meeting-transcript", "\(name): skipped \(track.skippedChunks) chunks under 0.3 s")
+        }
+    }
+
+    /// The microphone with the system track's echo subtracted, streamed in 1 s
+    /// blocks through one canceller into a Float32 file in `work`; an hour is
+    /// 57.6 M samples, too much to hold. Nil when the canceller or the system
+    /// track fails: the raw microphone goes on as before, and the system track
+    /// reports its own error when its turn comes.
+    private func cancellingEcho(
+        in microphone: any AudioSampleSource,
+        reference: (url: URL, gain: Float),
+        work: URL
+    ) async throws -> (source: CleanedSource, file: URL)? {
+        let started = ContinuousClock.now
+        let disk: DiskBackedAudioSampleSource
+        do {
+            disk = try AudioSourceFactory()
+                .makeDiskBackedSource(from: reference.url, targetSampleRate: Self.sampleRate).source
+        } catch {
+            AppLog.error("meeting-transcript", "echo cancellation skipped: \(error.localizedDescription)")
+            return nil
+        }
+        defer { disk.cleanup() }
+        let system: any AudioSampleSource = reference.gain == 1 ? disk : GainRestoredSource(base: disk, gain: reference.gain)
+
+        let file = work.appendingPathComponent("microphone-echo-cancelled-\(UUID().uuidString).f32")
+        guard FileManager.default.createFile(atPath: file.path, contents: nil) else {
+            AppLog.error("meeting-transcript", "echo cancellation skipped: couldn’t create the work file")
+            return nil
+        }
+        do {
+            let canceller = try EchoCanceller(sampleRate: Self.sampleRate)
+            let handle = try FileHandle(forWritingTo: file)
+            defer { try? handle.close() }
+            var written = 0
+            let block = Self.sampleRate
+            var offset = 0
+            let total = microphone.sampleCount
+            while offset < total {
+                try Task.checkCancellation()
+                let count = min(block, total - offset)
+                var micBlock = [Float](repeating: 0, count: count)
+                try micBlock.withUnsafeMutableBufferPointer {
+                    try microphone.copySamples(into: $0.baseAddress!, offset: offset, count: count)
+                }
+                var refBlock = [Float](repeating: 0, count: count)
+                let available = max(0, min(count, system.sampleCount - offset))
+                if available > 0 {
+                    try refBlock.withUnsafeMutableBufferPointer {
+                        try system.copySamples(into: $0.baseAddress!, offset: offset, count: available)
+                    }
+                }
+                // The output lags the input by a fixed 8 ms (128 samples at 16 kHz),
+                // the same length overall; a quarter of a VAD frame, so it is left.
+                let out = try canceller.process(microphone: micBlock, reference: refBlock)
+                try out.withUnsafeBytes { try handle.write(contentsOf: Data($0)) }
+                written += out.count
+                offset += count
+                await Task.yield()
+            }
+            let tail = try canceller.finish()
+            if !tail.isEmpty {
+                try tail.withUnsafeBytes { try handle.write(contentsOf: Data($0)) }
+                written += tail.count
+            }
+            guard written == total else {
+                AppLog.error("meeting-transcript", "echo cancellation skipped: wrote \(written) of \(total) samples")
+                try? handle.close()
+                try? FileManager.default.removeItem(at: file)
+                return nil
+            }
+            try handle.close()
+            let mapped = try Data(contentsOf: file, options: .alwaysMapped)
+            AppLog.info(
+                "meeting-transcript",
+                "echo cancelled: \(String(format: "%.1f", Double(total) / Double(Self.sampleRate))) s "
+                    + "of microphone in \(String(format: "%.2f", Self.seconds(since: started))) s"
+            )
+            return (CleanedSource(samples: mapped), file)
+        } catch is CancellationError {
+            try? FileManager.default.removeItem(at: file)
+            throw CancellationError()
+        } catch {
+            if Task.isCancelled {
+                try? FileManager.default.removeItem(at: file)
+                throw CancellationError()
+            }
+            AppLog.error("meeting-transcript", "echo cancellation skipped: \(error.localizedDescription)")
+            try? FileManager.default.removeItem(at: file)
+            return nil
         }
     }
 
@@ -505,6 +631,25 @@ private struct GainRestoredSource: AudioSampleSource {
     }
 }
 
+/// The echo-cancelled microphone, mapped from its Float32 work file.
+private struct CleanedSource: AudioSampleSource {
+    let samples: Data
+    private let floatStride = MemoryLayout<Float>.stride
+
+    var sampleCount: Int { samples.count / floatStride }
+
+    func copySamples(into destination: UnsafeMutablePointer<Float>, offset: Int, count: Int) throws {
+        guard count > 0, sampleCount > 0 else { return }
+        let clampedOffset = max(0, offset)
+        guard clampedOffset < sampleCount else { return }
+        let available = min(sampleCount - clampedOffset, count)
+        samples.withUnsafeBytes { rawBuffer in
+            let floatBuffer = rawBuffer.bindMemory(to: Float.self)
+            destination.update(from: floatBuffer.baseAddress!.advanced(by: clampedOffset), count: available)
+        }
+    }
+}
+
 // MARK: - Production wiring
 
 extension MeetingTranscriber {
@@ -537,7 +682,8 @@ extension MeetingTranscriber {
             currentEngine: { choice in
                 try await MainActor.run { try Engine.forMeeting(settings.snapshot.applying(choice)) }
             },
-            dictionary: dictionary(of: settings)
+            dictionary: dictionary(of: settings),
+            cancelsEcho: true
         )
     }
 
@@ -809,8 +955,11 @@ extension MeetingTranscriber {
     /// on each line's text. After echo removal, which counts words, and
     /// after merging, so a phrase split between two chunks of one speaker
     /// is found too. Speakers, times and the recognized tracks stay as they are.
-    static func finished(_ utterances: [Utterance], dictionary: DictionaryReplacer?) -> [Utterance] {
-        var lines = merged(utterances)
+    static func finished(
+        _ utterances: [Utterance], microphoneSpeaker: String = "", feed: [CallFeed.Event] = [],
+        dictionary: DictionaryReplacer?
+    ) -> [Utterance] {
+        var lines = merged(utterances, microphoneSpeaker: microphoneSpeaker, feed: feed)
         guard let dictionary else { return lines }
         let replaced = dictionary.replacing(in: lines.map(\.text))
         for index in lines.indices { lines[index].text = replaced.texts[index] }
@@ -825,24 +974,56 @@ extension MeetingTranscriber {
     static let maximumBlockSeconds = 60.0
 
     /// Time order, then neighbouring chunks of one speaker joined while the
-    /// pause is short and the block stays under a minute.
-    static func merged(_ utterances: [Utterance]) -> [Utterance] {
+    /// pause is short and the block stays under a minute. With a call feed,
+    /// two neighbouring SYSTEM chunks the feed's picking names differently
+    /// (a name against none included) are never joined, whatever the gap and
+    /// block length say: a name once given to a line cannot be taken back by
+    /// gluing it to a chunk the feed says is someone else. The microphone
+    /// track and a run without a feed are unaffected: `feed` empty, or every
+    /// picked name nil, glues exactly as before.
+    static func merged(_ utterances: [Utterance], microphoneSpeaker: String = "", feed: [CallFeed.Event] = []) -> [Utterance] {
         let ordered = utterances.enumerated().sorted {
             ($0.element.start, $0.offset) < ($1.element.start, $1.offset)
         }.map(\.element)
-        var lines: [Utterance] = []
-        for utterance in ordered {
-            if var last = lines.last,
-               last.speaker == utterance.speaker,
-               utterance.start - last.end < glueGap,
-               utterance.end - last.start <= maximumBlockSeconds {
-                last.text += " " + utterance.text
-                last.end = max(last.end, utterance.end)
-                lines[lines.count - 1] = last
-            } else {
-                lines.append(utterance)
+        let names: [String?]
+        if feed.isEmpty {
+            names = Array(repeating: nil, count: ordered.count)
+        } else {
+            let asLines = ordered.map {
+                MeetingAttempt.Line(
+                    start: $0.start, end: $0.end,
+                    source: $0.speaker == microphoneSpeaker ? .microphone : .system
+                )
             }
+            names = CallFeed.pickedNames(for: asLines, feed: feed)
         }
+
+        var lines: [Utterance] = []
+        var lastName: String?
+        var splits = 0
+        for (index, utterance) in ordered.enumerated() {
+            let name = names[index]
+            if let last = lines.last {
+                let sameSpeaker = last.speaker == utterance.speaker
+                let withinGap = utterance.start - last.end < glueGap
+                let withinBlock = utterance.end - last.start <= maximumBlockSeconds
+                let isSystem = utterance.speaker != microphoneSpeaker
+                if sameSpeaker, withinGap, withinBlock, !isSystem || lastName == name {
+                    var merged = last
+                    merged.text += " " + utterance.text
+                    merged.end = max(last.end, utterance.end)
+                    lines[lines.count - 1] = merged
+                    lastName = name
+                    continue
+                }
+                if sameSpeaker, withinGap, withinBlock, isSystem, lastName != name {
+                    splits += 1
+                }
+            }
+            lines.append(utterance)
+            lastName = name
+        }
+        if splits > 0 { AppLog.info("meeting-transcript", "call feed splits=\(splits)") }
         return lines
     }
 

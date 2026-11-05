@@ -113,6 +113,11 @@ final class MeetingLibrary: ObservableObject {
         /// The folder the transcripts folder setting leads to, read right
         /// before a meeting goes to the Trash.
         var copiesFolder: @Sendable (_ folder: URL) -> FolderIdentity.Reach = { FolderIdentity.reach($0) }
+        /// The meeting folder's call feed; nil for one with no file, a link
+        /// or an otherwise unreadable one alike (P3: the helper reads the
+        /// same file the same way, so one meeting gives one text whether it
+        /// is read here or there).
+        var feed: @Sendable (_ folder: URL) -> [CallFeed.Event]? = { try? CallFeed.read(in: $0, links: .refuse) }
 
         static let disk = Reader(
             root: { MeetingLibrary.readRoot($0, place: $1) },
@@ -218,6 +223,9 @@ final class MeetingLibrary: ObservableObject {
     @Published private(set) var selectedFolders: Set<URL> = []
     @Published private(set) var version: String?
     @Published private(set) var text = Text.none
+    /// The shown text's meeting's call feed, read alongside it; nil without
+    /// a feed, while the text is not loaded, or `again` until the answer.
+    @Published private(set) var call: CallFeed.Summary?
     @Published private(set) var isWindowOpen = false
     /// The main window's section, in memory only and kept while the window
     /// is closed: a command given then is there for its first appearance,
@@ -797,7 +805,15 @@ final class MeetingLibrary: ObservableObject {
     func shownTranscript(of meeting: Meeting) -> MeetingTranscript? {
         guard selection == meeting.directory, case .loaded(let transcript) = text,
               let meeting = self.meeting(at: meeting.directory) else { return nil }
-        return transcript.named(marks(of: meeting)?.speakers ?? [:])
+        return transcript.named(by: marks(of: meeting), call: call)
+    }
+
+    /// The shown meeting's call feed summed up, for the Names sheet and the
+    /// card's note: nil without a feed, or while the text is not loaded —
+    /// the same condition `shownTranscript(of:)` reads under.
+    func callSummary(of meeting: Meeting) -> CallFeed.Summary? {
+        guard selection == meeting.directory, case .loaded = text else { return nil }
+        return call
     }
 
     /// Who speaks on each track, for the player: the user's name for it
@@ -897,7 +913,16 @@ final class MeetingLibrary: ObservableObject {
     /// it was opened on, as a name typed. Only a name that differs from the
     /// one kept changes; an empty one gives the transcript's label back.
     /// Returns why they were not taken, or nil.
-    func setNames(typedOn identity: FolderIdentity?, at path: String, microphone: String, system: String) -> String? {
+    /// `callNames`: only the found names given here change, by `found` name
+    /// from the call feed; a name typed empty, or exactly the found name
+    /// itself, gives the found name back (removes the rename) rather than
+    /// being dropped from the dictionary — a key left out of `callNames`
+    /// entirely changes nothing on disk, so the sheet must always pass every
+    /// person it showed, cleared or not.
+    func setNames(
+        typedOn identity: FolderIdentity?, at path: String, microphone: String, system: String,
+        callNames: [String: String] = [:]
+    ) -> String? {
         guard let meeting = typed(on: identity, at: path) else {
             return String(localized: "The meeting moved while the names were typed.")
         }
@@ -908,6 +933,11 @@ final class MeetingLibrary: ObservableObject {
             let name = Self.speakerName(typed)
             if name != marks.speakers[source] { change.speakers.updateValue(name, forKey: source) }
         }
+        for (found, typed) in callNames {
+            if let refusal = Self.speakerNameRefusal(typed) { return refusal }
+            let name = Self.speakerName(typed).flatMap { $0 == found ? nil : $0 }
+            if name != marks.callNames[found] { change.callNames.updateValue(name, forKey: found) }
+        }
         guard !change.isEmpty else { return nil }
         return self.change(change, of: meeting)
     }
@@ -916,8 +946,13 @@ final class MeetingLibrary: ObservableObject {
     /// the main actor, until that write has ended: nil once the names are on
     /// disk, else why not, with the names, so the sheet that waits on it
     /// says a late refusal where they are still typed.
-    func saveNames(typedOn identity: FolderIdentity?, at path: String, microphone: String, system: String) async -> String? {
-        if let refusal = setNames(typedOn: identity, at: path, microphone: microphone, system: system) { return refusal }
+    func saveNames(
+        typedOn identity: FolderIdentity?, at path: String, microphone: String, system: String,
+        callNames: [String: String] = [:]
+    ) async -> String? {
+        if let refusal = setNames(
+            typedOn: identity, at: path, microphone: microphone, system: system, callNames: callNames
+        ) { return refusal }
         guard let identity else { return nil }
         for await pending in $pendingMarks.values where !pending.contains(identity) { break }
         return markFailures[identity].map { MeetingText.marksNotSaved($0.lost, reason: $0.reason, meeting: nil) }
@@ -949,6 +984,18 @@ final class MeetingLibrary: ObservableObject {
         }
         let attempt = meeting.versions.first { $0.name == version }?.attempt
         return Self.recordRefusal(transcript, attempt: attempt, meetingHasRecords: meeting.lastAttempt != .none)
+    }
+
+    /// Why the shown transcript doesn't show speaker names, for the card's
+    /// note: nil when there is nothing it would have shown anyway (no track
+    /// names, no call-feed renames and no feed read for this meeting), so a
+    /// meeting with none of those never grows the note just because the
+    /// record does not match.
+    func namesNotShownRefusal(for meeting: Meeting) -> String? {
+        let marks = marks(of: meeting)
+        guard marks?.speakers.isEmpty == false || marks?.callNames.isEmpty == false
+            || callSummary(of: meeting) != nil else { return nil }
+        return recordRefusal(for: meeting)
     }
 
     /// Why the transcript shown cannot be saved as subtitles, or nil: no
@@ -2025,9 +2072,13 @@ final class MeetingLibrary: ObservableObject {
               meeting.versions.contains(where: { $0.name == version }),
               let path = listingPath(of: meeting) else {
             text = .none
+            call = nil
             return
         }
-        if !again || text == .none { text = .loading }
+        if !again || text == .none {
+            text = .loading
+            call = nil
+        }
         let attempt = meeting.versions.first { $0.name == version }?.attempt
         channel(path).textWanted = TextRequest(meeting: selection, version: version, token: textToken, attempt: attempt)
         runNext(path)
@@ -2041,13 +2092,17 @@ final class MeetingLibrary: ObservableObject {
         let file = request.meeting.appendingPathComponent(request.version)
         channel.queue.async { [weak self] in
             let text: Text
+            var call: CallFeed.Summary?
             do {
                 text = .loaded(MeetingTranscript.parse(try reader.text(file)).timed(by: request.attempt))
+                if let feed = reader.feed(request.meeting) {
+                    call = CallFeed.summary(for: request.attempt?.lines ?? [], feed: feed)
+                }
             } catch {
                 text = .failed(error.localizedDescription)
             }
             DispatchQueue.main.async {
-                MainActor.assumeIsolated { self?.finishText(request, on: path, text: text) }
+                MainActor.assumeIsolated { self?.finishText(request, on: path, text: text, call: call) }
             }
         }
         watchForAnswer(path, token: token)
@@ -2055,11 +2110,12 @@ final class MeetingLibrary: ObservableObject {
 
     /// Shown only for the meeting and version it was read for, and only if
     /// no newer text was asked for since.
-    private func finishText(_ request: TextRequest, on path: String, text: Text) {
+    private func finishText(_ request: TextRequest, on path: String, text: Text, call: CallFeed.Summary?) {
         channels[path]?.busy = false
         update(path) { $0.notResponding = false }
         if request.token == textToken, request.meeting == selection, request.version == version {
             self.text = text
+            self.call = call
         }
         runNext(path)
     }

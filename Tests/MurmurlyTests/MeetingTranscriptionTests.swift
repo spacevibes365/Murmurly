@@ -1116,6 +1116,57 @@ final class MeetingTranscriptionTests: XCTestCase {
         XCTAssertEqual(attempt.lines.first?.end ?? 0, 3, accuracy: 0.1)
     }
 
+    /// Two system chunks close enough to glue on their own (a 0.3 s gap)
+    /// are kept apart because a call feed in the meeting's folder names
+    /// them differently; the attempt record and `transcript.md` still agree
+    /// on how many lines there are.
+    func testMeetingWithAFeedWritesOneLinePerSpeakerAndAMatchingRecord() async throws {
+        let folder = try makeFolder(
+            microphone: [Region(start: 1.5, end: 3, level: 0.1)],
+            system: [Region(start: 4.5, end: 6, level: 0.5), Region(start: 6.3, end: 7.5, level: 0.6)]
+        )
+        let feed = [
+            CallFeed.Event(t: 0, service: "telemost", visible: true, ownName: nil, selfSpeaking: false, people: ["Анна"], speaking: ["Анна"]),
+            CallFeed.Event(t: 6.1, service: "telemost", visible: true, ownName: nil, selfSpeaking: false, people: ["Борис"], speaking: ["Борис"]),
+        ]
+        try Data(feed.map { $0.encodedLine() }.joined().utf8)
+            .write(to: folder.appendingPathComponent(CallFeed.fileName))
+
+        let queue = try await transcribedThroughQueue(folder, replies: [
+            0.1: "мой вопрос", 0.5: "ответ собеседника", 0.6: "и ещё одна мысль",
+        ])
+
+        guard case .saved? = queue.lastOutcome else { return XCTFail("outcome \(String(describing: queue.lastOutcome))") }
+        let attempt = try XCTUnwrap(MeetingAttempt.entries(in: folder).last?.attempt)
+        XCTAssertEqual(attempt.result, .complete)
+        XCTAssertEqual(attempt.lines.map(\.source), [.microphone, .system, .system])
+        let markdown = try Data(contentsOf: folder.appendingPathComponent("transcript.md"))
+        let fileLines = String(decoding: markdown, as: UTF8.self).split(separator: "\n").filter { $0.hasPrefix("[") }
+        XCTAssertEqual(attempt.lines.count, fileLines.count)
+    }
+
+    /// A feed this app cannot read (a folder in the feed's own place, not a
+    /// plain file) does not fail the job: the meeting transcribes as if
+    /// there were no feed at all, and close chunks still glue.
+    func testUnreadableFeedTranscribesAsWithoutOne() async throws {
+        let folder = try makeFolder(
+            microphone: [],
+            system: [Region(start: 4.5, end: 6, level: 0.5), Region(start: 6.3, end: 7.5, level: 0.6)]
+        )
+        try FileManager.default.createDirectory(
+            at: folder.appendingPathComponent(CallFeed.fileName), withIntermediateDirectories: true
+        )
+
+        let queue = try await transcribedThroughQueue(folder, replies: [0.5: "ответ собеседника", 0.6: "и ещё одна мысль"])
+
+        guard case .saved? = queue.lastOutcome else { return XCTFail("outcome \(String(describing: queue.lastOutcome))") }
+        let attempt = try XCTUnwrap(MeetingAttempt.entries(in: folder).last?.attempt)
+        XCTAssertEqual(attempt.result, .complete)
+        XCTAssertEqual(attempt.lines.map(\.source), [.system])
+        let markdown = try Data(contentsOf: folder.appendingPathComponent("transcript.md"))
+        XCTAssertTrue(String(decoding: markdown, as: UTF8.self).contains("ответ собеседника и ещё одна мысль"))
+    }
+
     /// One piece not recognized among many: the menu still says saved, as
     /// before, but the record does not call the transcript complete — only
     /// the audio could fill the gap.
@@ -1719,6 +1770,28 @@ final class MeetingTranscriptionTests: XCTestCase {
         XCTAssertEqual(log.all().filter { $0.hasPrefix("asked:") }, ["asked:auto", "asked:auto", "asked:es"])
     }
 
+    /// A call feed sitting right next to the file is never read by the
+    /// Files pipeline: two close chunks that a feed naming them differently
+    /// would split in a meeting still glue here, exactly as without one.
+    func testFileTranscriptionIgnoresAFeedNextToTheFile() async throws {
+        let file = root.appendingPathComponent("interview.caf")
+        try writeTrack(file, rate: 44_100, duration: 10, regions: [
+            Region(start: 1, end: 2, level: 0.1),
+            Region(start: 2.3, end: 3, level: 0.2),
+        ])
+        let feed = [
+            CallFeed.Event(t: 0, service: "telemost", visible: true, ownName: nil, selfSpeaking: false, people: ["Анна"], speaking: []),
+            CallFeed.Event(t: 2.1, service: "telemost", visible: true, ownName: nil, selfSpeaking: false, people: ["Борис"], speaking: []),
+        ]
+        try Data(feed.map { $0.encodedLine() }.joined().utf8)
+            .write(to: root.appendingPathComponent(CallFeed.fileName))
+        let factory = LevelEngineFactory(replies: [0.1: "привет всем", 0.2: "начнём"])
+
+        let lines = try await makeTranscriber(factory: factory).transcribeFile(file) { _ in }
+
+        XCTAssertEqual(lines.map(\.text), ["привет всем начнём"])
+    }
+
     func testTranscriptHeaderNamesTheLanguagesUsed() throws {
         let folder = MeetingTranscriber.Folder(
             directory: root.appendingPathComponent("meeting"), startedAt: nil, microphone: nil, system: nil
@@ -1769,6 +1842,74 @@ final class MeetingTranscriptionTests: XCTestCase {
         XCTAssertEqual(blocks.first?.text, "реплика 0 реплика 1 реплика 2 реплика 3 реплика 4")
         XCTAssertEqual(lines.suffix(2).map(\.text), ["вопрос", "ещё вопрос"])
         XCTAssertEqual(lines.map(\.start), lines.map(\.start).sorted())
+    }
+
+    /// A call feed event, as the watcher writes it; invented names only.
+    private func feedEvent(
+        t: TimeInterval, visible: Bool = true, people: [String] = [], speaking: [String] = []
+    ) -> CallFeed.Event {
+        CallFeed.Event(t: t, service: "telemost", visible: visible, ownName: nil, selfSpeaking: false, people: people, speaking: speaking)
+    }
+
+    /// Two system chunks the feed names differently, back to back inside the
+    /// usual glue gap: without a feed they would join into one line, but a
+    /// name once given cannot be taken back by gluing it to someone else's.
+    func testFeedSplitsSystemChunksOfTwoSpeakers() {
+        let first = utterance("Others", "добрый день", 0, 5)
+        let second = utterance("Others", "начнём", 5.2, 10)
+        let feed = [
+            feedEvent(t: 0, people: ["Анна"], speaking: ["Анна"]),
+            feedEvent(t: 5, people: ["Борис"], speaking: ["Борис"]),
+        ]
+
+        let lines = MeetingTranscriber.merged([first, second], microphoneSpeaker: "Me", feed: feed)
+
+        XCTAssertEqual(lines.map(\.text), ["добрый день", "начнём"])
+    }
+
+    /// The same two chunks, but the feed says one person the whole time:
+    /// gluing is unchanged from a run without a feed at all.
+    func testFeedKeepsOneSpeakersChunksGlued() {
+        let first = utterance("Others", "добрый день", 0, 5)
+        let second = utterance("Others", "начнём", 5.2, 10)
+        let feed = [feedEvent(t: 0, people: ["Анна"])]
+
+        let lines = MeetingTranscriber.merged([first, second], microphoneSpeaker: "Me", feed: feed)
+
+        XCTAssertEqual(lines.map(\.text), ["добрый день начнём"])
+    }
+
+    /// A named chunk next to one the feed does not name at all (two people
+    /// on screen, neither highlighted) is a mixed pair, not a match: nil
+    /// against a name is still a difference, so the two stay apart.
+    func testFeedDoesNotGlueANamedChunkToAnUnnamedOne() {
+        let first = utterance("Others", "добрый день", 0, 5)
+        let second = utterance("Others", "начнём", 5.2, 10)
+        let feed = [
+            feedEvent(t: 0, people: ["Анна"], speaking: ["Анна"]),
+            feedEvent(t: 5, people: ["Анна", "Борис"]),
+        ]
+
+        let lines = MeetingTranscriber.merged([first, second], microphoneSpeaker: "Me", feed: feed)
+
+        XCTAssertEqual(lines.map(\.text), ["добрый день", "начнём"])
+    }
+
+    /// Two system chunks the feed cannot name at all (two people on screen
+    /// the whole time, nobody highlighted) glue exactly as without a feed;
+    /// the microphone track is unaffected by the feed either way.
+    func testFeedLeavesMicrophoneAndUnnamedChunksAsBefore() {
+        let firstSystem = utterance("Others", "вопрос", 0, 5)
+        let secondSystem = utterance("Others", "ответ", 5.2, 10)
+        let firstOwn = utterance("Me", "да, давайте", 20, 23)
+        let secondOwn = utterance("Me", "вопрос", 23.2, 26)
+        let feed = [feedEvent(t: 0, people: ["Анна", "Борис"])]
+
+        let lines = MeetingTranscriber.merged(
+            [firstSystem, secondSystem, firstOwn, secondOwn], microphoneSpeaker: "Me", feed: feed
+        )
+
+        XCTAssertEqual(lines.map(\.text), ["вопрос ответ", "да, давайте вопрос"])
     }
 
     /// A save that failed and then worked to another place leaves
@@ -2414,12 +2555,15 @@ final class MeetingTranscriptionTests: XCTestCase {
             let folder = try makeFolder(microphone: [Region(start: 1, end: 2.5, level: 0.1)], system: [], name: name)
                 .standardizedFileURL
             let installed = try installedModels(models)
-            let queue = MeetingTranscriptionQueue(transcriber: .live(
+            var transcriber = MeetingTranscriber.live(
                 settings: settings,
                 models: installed,
                 cache: WhisperKitCache(factory: factory, parakeetFactory: factory),
                 speechDetector: { _ in detections.set(detections.get() + 1); return Self.levelDetector }
-            ))
+            )
+            // A constant level, not speech; AEC3 would bend it.
+            transcriber.cancelsEcho = false
+            let queue = MeetingTranscriptionQueue(transcriber: transcriber)
             queue.enqueue(folder, choice: whisper)
             // Queued and under way, but its task has not run yet.
             if let removed {
@@ -3557,13 +3701,17 @@ final class MeetingTranscriptionTests: XCTestCase {
             MeetingTranscriptionTests.levelDetector
         }
     ) throws -> MeetingTranscriptionQueue {
-        MeetingTranscriptionQueue(
-            transcriber: .live(
-                settings: settings,
-                models: try models ?? installedModels(),
-                cache: cache,
-                speechDetector: speechDetector
-            ),
+        var transcriber = MeetingTranscriber.live(
+            settings: settings,
+            models: try models ?? installedModels(),
+            cache: cache,
+            speechDetector: speechDetector
+        )
+        // These tracks are constant levels, not speech; AEC3 would bend them.
+        // Echo cancellation itself is covered by MeetingEchoCancellationTests.
+        transcriber.cancelsEcho = false
+        return MeetingTranscriptionQueue(
+            transcriber: transcriber,
             meetingsRoot: meetingsRoot ?? root.appendingPathComponent("Meetings", isDirectory: true),
             destinations: destinations
         )

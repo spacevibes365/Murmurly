@@ -216,6 +216,20 @@ final class MeetingWatchdog {
             || (bundleID.hasPrefix("com.apple.") && bundleID.hasSuffix("-Settings.extension"))
     }
 
+    /// Bundle IDs of the processes holding audio input right now, by the same
+    /// filter the watchdog uses. A holder without a bundle ID can't be mapped
+    /// to a window, so it is dropped here.
+    nonisolated static func holderBundleIDs(in snapshot: [ProcessSnapshot], ownPID: pid_t) -> Set<String> {
+        Set(holders(in: snapshot, ownPID: ownPID).compactMap(\.bundleID))
+    }
+
+    /// `nil` when the process list could not be read (or in a test copy, where
+    /// `readSystemSnapshot` reads nothing): not the same as "nobody holds the
+    /// microphone", and the call feed skips that read altogether.
+    nonisolated static func readHolderBundleIDs() -> Set<String>? {
+        readSystemSnapshot().map { holderBundleIDs(in: $0, ownPID: ProcessInfo.processInfo.processIdentifier) }
+    }
+
     /// Only an automatic attempt has a time limit; a manual session has none.
     nonisolated static func automaticLimitReached(
         _ state: LogicState, recorderState: MeetingRecorder.State, now: Date
