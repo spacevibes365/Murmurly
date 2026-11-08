@@ -48,6 +48,7 @@ struct MeetingsSettingsView: View {
                     .accessibilityIdentifier("meetingAfterStopTranscribe")
                 }
                 namesFromCallWindowGroup
+                liveTranscriptGroup
                 audioRule
             }
         }
@@ -96,6 +97,20 @@ struct MeetingsSettingsView: View {
                     .accessibilityIdentifier("namesFromCallWindowToggle")
             }
             Text("While a meeting is being recorded, Murmurly reads only the participants’ names and the speaking highlight on the call’s page, to name the speakers in the transcript. Nothing leaves this Mac: the names are kept in the meeting’s folder and deleted with it.")
+                .font(.caption).foregroundStyle(.secondary)
+                .padding(.horizontal, SettingsChrome.rowHorizontalPadding)
+                .padding(.vertical, SettingsChrome.rowVerticalPadding)
+        }
+    }
+
+    private var liveTranscriptGroup: some View {
+        SettingsGroup("Live transcript") {
+            SettingsRow("Live transcript") {
+                Toggle("", isOn: $settings.liveTranscript)
+                    .labelsHidden()
+                    .accessibilityIdentifier("liveTranscriptToggle")
+            }
+            Text("Show what is said in a floating panel while a meeting is recorded.")
                 .font(.caption).foregroundStyle(.secondary)
                 .padding(.horizontal, SettingsChrome.rowHorizontalPadding)
                 .padding(.vertical, SettingsChrome.rowVerticalPadding)

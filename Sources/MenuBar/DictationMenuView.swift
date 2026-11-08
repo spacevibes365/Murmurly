@@ -62,6 +62,10 @@ struct DictationMenuView: View {
     @ObservedObject var updater: AppUpdater
     /// Not observed: the menu only asks it to show a meeting.
     let library: MeetingLibrary
+    /// A state-only stand-in in a test that never built a real one
+    /// (`MeetingRecorderTests`): its `isShown` is always false, so "Show
+    /// Live Transcript" simply never offers itself there.
+    @ObservedObject var liveTranscript: LiveTranscriptPanel = LiveTranscriptPanel(renderingEnabled: false)
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
@@ -145,6 +149,10 @@ struct DictationMenuView: View {
         Button { meeting.toggle() } label: { meetingButtonLabel }
             .disabled(meetingButtonDisabled)
             .accessibilityIdentifier("meetingRecorderButton")
+        if liveTranscript.canReopen {
+            Button("Show Live Transcript") { liveTranscript.show() }
+                .accessibilityIdentifier("showLiveTranscriptMenuItem")
+        }
         if let last = meeting.lastRecordingLocation {
             Button("Show Last Recording…") { show(last) }
         }

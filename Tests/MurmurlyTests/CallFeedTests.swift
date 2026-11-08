@@ -29,9 +29,12 @@ final class CallFeedTests: XCTestCase {
 
     private func event(
         t: TimeInterval, service: String = "telemost", visible: Bool = true, ownName: String? = nil,
-        people: [String] = [], speaking: [String] = []
+        people: [String] = [], speaking: [String] = [], offscreen: Bool = false
     ) -> CallFeed.Event {
-        CallFeed.Event(t: t, service: service, visible: visible, ownName: ownName, selfSpeaking: false, people: people, speaking: speaking)
+        CallFeed.Event(
+            t: t, service: service, visible: visible, ownName: ownName, selfSpeaking: false, people: people,
+            speaking: speaking, offscreen: offscreen
+        )
     }
 
     // MARK: - Picking
@@ -1032,5 +1035,386 @@ final class CallFeedTests: XCTestCase {
 
         let withSharedTable = CallFeed.pickedNames(for: [line], feed: feed)
         XCTAssertEqual(withSharedTable[0], "Участник А")
+    }
+
+    // MARK: - The line before the call was ever seen with people on screen
+
+    /// The system track's first line starts well before the feed's first
+    /// sighting of the call with people on screen (`knownFrom`, here 48.87):
+    /// the stretch from the line's own start (45.98) up to that point is
+    /// "not yet known", not "hidden" the way an already-seen call's closed
+    /// tab is. The remainder after `knownFrom` (2.43 s of the line's 5.32 s,
+    /// 45.7 %) clears both the 2 s floor and the 40 % floor, so the 60 %
+    /// share and the ×2 margin are judged on that remainder alone: 2.43 s
+    /// credited out of 2.43 s remaining is a clean 100 %, and the line is
+    /// named. On the code before this fix the share is judged on the whole
+    /// 5.32 s instead (45.7 %, short of 60 %), so this assertion fails there
+    /// — the test this card's fix exists to turn green.
+    func testFirstLineBeforeTheCallWasEverSeenIsNamedFromTheRest() {
+        let feed = [
+            event(t: 1.14, people: []),
+            event(t: 3.50, visible: false),
+            event(t: 48.87, people: ["Участник А", "Участник Б"], speaking: ["Участник А"]),
+        ]
+        let line = MeetingAttempt.Line(start: 45.98, end: 51.30, source: .system)
+        let picked = CallFeed.pickedNames(for: [line], feed: feed)
+        XCTAssertEqual(picked[0], "Участник А")
+    }
+
+    /// The same shape of line and feed as above, but the first sighting
+    /// comes late enough that what remains of the line is short of the
+    /// shift's own floors. At a remainder of 1.90 s out of 5.0 s (38 %,
+    /// under both the 2 s and the 40 % floor) the shift never opens and the
+    /// line keeps the whole-line share (38 %), short of 60 % — no name,
+    /// same as before this fix. Move the first sighting 0.13 s earlier and
+    /// the remainder is 2.03 s out of the same 5.0 s (40.6 %, just past both
+    /// floors): the shift opens, the remainder is credited to the one
+    /// person whole, and the line is named — a share the code before this
+    /// fix never reaches (2.03 s of 5.0 s is 40.6 %, short of 60 %), so this
+    /// second assertion is the one that fails there.
+    func testUnseenOpeningNeedsTwoSecondsAndFortyPercentLeft() {
+        let line = MeetingAttempt.Line(start: 45.0, end: 50.0, source: .system)
+
+        let tooLate = [
+            event(t: 1.14, people: []),
+            event(t: 3.50, visible: false),
+            event(t: 48.10, people: ["Участник А", "Участник Б"], speaking: ["Участник А"]),
+        ]
+        XCTAssertNil(CallFeed.pickedNames(for: [line], feed: tooLate)[0])
+
+        let justInTime = [
+            event(t: 1.14, people: []),
+            event(t: 3.50, visible: false),
+            event(t: 47.97, people: ["Участник А", "Участник Б"], speaking: ["Участник А"]),
+        ]
+        XCTAssertEqual(CallFeed.pickedNames(for: [line], feed: justInTime)[0], "Участник А")
+    }
+
+    /// The round-3 rule is untouched: when the call was already seen with
+    /// people (here at 1.14, long before this line even starts) and the tab
+    /// is then closed mid-call (3.50), the line's share is still judged
+    /// against its whole length, never the remainder alone — `knownFrom`
+    /// here (1.14) is not after the line's own start (45.98), so the shift
+    /// never considers this line at all. The same 2.43 s of credit out of
+    /// the line's 5.32 s (45.7 %) stays short of 60 % and the line keeps no
+    /// name, exactly as before this fix.
+    func testTabHiddenAfterTheCallWasAlreadySeenStillMeasuresTheFullLine() {
+        let feed = [
+            event(t: 1.14, people: ["Участник А", "Участник Б"], speaking: []),
+            event(t: 3.50, visible: false),
+            event(t: 48.87, people: ["Участник А", "Участник Б"], speaking: ["Участник А"]),
+        ]
+        let line = MeetingAttempt.Line(start: 45.98, end: 51.30, source: .system)
+        let picked = CallFeed.pickedNames(for: [line], feed: feed)
+        XCTAssertNil(picked[0])
+    }
+
+    /// A speaker change right at the border between "not yet known" and
+    /// "known": the first person is credited from the first sighting
+    /// (48.87) until the second takes over, and only the second's own share
+    /// of the remainder (2.43 s after 48.87) decides the name — the first
+    /// person's seconds before the switch are never counted for the second,
+    /// nor folded into some looser whole-line tally. A switch at 49.20
+    /// gives the second person 2.10 s of the 2.43 s remainder (86.4 %,
+    /// clearing both the 60 % share and the ×2 margin over the first
+    /// person's 0.33 s): named. A switch at 49.90 gives the second person
+    /// only 1.40 s of 2.43 s (57.6 %, short of 60 %): no name. A switch at
+    /// 49.77 gives the second person 1.53 s of 2.43 s (63.0 %, past the
+    /// share) but only 1.53 s against the first person's 0.90 s remaining
+    /// (short of the required ×2): no name either. The code before this fix
+    /// judges the second person's share against the whole 5.32 s line
+    /// (39.5 % at 49.20), so the first assertion fails there.
+    func testSpeakerChangeAtTheFirstSightingIsJudgedOnTheRest() {
+        let line = MeetingAttempt.Line(start: 45.98, end: 51.30, source: .system)
+        func feed(switchingAt switchTime: TimeInterval) -> [CallFeed.Event] {
+            [
+                event(t: 1.14, people: []),
+                event(t: 3.50, visible: false),
+                event(t: 48.87, people: ["Участник А", "Участник Б"], speaking: ["Участник А"]),
+                event(t: switchTime, people: ["Участник А", "Участник Б"], speaking: ["Участник Б"]),
+            ]
+        }
+
+        XCTAssertEqual(CallFeed.pickedNames(for: [line], feed: feed(switchingAt: 49.20))[0], "Участник Б")
+        XCTAssertNil(CallFeed.pickedNames(for: [line], feed: feed(switchingAt: 49.90))[0])
+        XCTAssertNil(CallFeed.pickedNames(for: [line], feed: feed(switchingAt: 49.77))[0])
+    }
+
+    /// A lead (here Zoom's own 1.2 s from the shared table) can open a
+    /// credited interval before the feed's first sighting of the call with
+    /// people — but the remainder after that sighting (4.2) is only 1.8 s
+    /// of the line's 6 s, short of the shift's 2 s floor. The shift stays
+    /// closed, and the whole-line share (3.0 s of lead-plus-highlight
+    /// credit out of 6 s, 50 %) stays short of 60 % as before: no name.
+    /// Guards against a version of the fix that opens the shift from the
+    /// lead-widened credited interval's own start rather than the event
+    /// `knownFrom` is defined from — that softer rule would instead measure
+    /// 3.0 s against a 4.2 s-knownFrom-to-line-start... it would, in fact,
+    /// widen the remainder back out past 2 s and wrongly name the line.
+    func testLeadBeforeTheFirstSightingDoesNotOpenTheShortcut() {
+        let feed = [
+            event(t: 0, service: "zoom", people: [], speaking: []),
+            event(t: 4.2, service: "zoom", people: ["Участник А", "Участник Б"], speaking: ["Участник А"]),
+        ]
+        let line = MeetingAttempt.Line(start: 0, end: 6, source: .system)
+        let picked = CallFeed.pickedNames(for: [line], feed: feed)
+        XCTAssertNil(picked[0])
+    }
+
+    /// A highlight with nobody in `people` at all (a caption-only reader
+    /// that reports `speaking` without ever filling the tile list) never
+    /// counts as a sighting of the call with people on screen, so
+    /// `knownFrom` stays nil and the shift never opens: the line's 2.5 s of
+    /// credit out of its 5 s (50 %) is judged against the whole line, as
+    /// before, and stays short of 60 % — no name.
+    func testHighlightWithoutAPeopleListNeverOpensTheShortcut() {
+        let feed = [event(t: 2.5, people: [], speaking: ["Гость"])]
+        let line = MeetingAttempt.Line(start: 0, end: 5, source: .system)
+        let picked = CallFeed.pickedNames(for: [line], feed: feed)
+        XCTAssertNil(picked[0])
+    }
+
+    // MARK: - A call window on another desktop (#59 tail)
+
+    /// `offscreen: true` round-trips through the encoder; `false` writes no
+    /// key at all, byte for byte as a line written before this field
+    /// existed — and a line of that old shape, with no key, reads as
+    /// `offscreen == false`. A line with an unknown extra key is still read
+    /// (the decoder is synthesized `Decodable`: an unrecognized key is
+    /// skipped, not a decode failure), which also covers a future key a
+    /// line like this might one day carry.
+    func testOffscreenFlagRoundTripsAndOldLinesReadOnScreen() {
+        let offscreenEvent = event(t: 1, people: ["Гость"], offscreen: true)
+        XCTAssertTrue(offscreenEvent.encodedLine().contains("\"offscreen\":true"))
+        XCTAssertEqual(CallFeed.parse(offscreenEvent.encodedLine()), [offscreenEvent])
+
+        let onScreenEvent = event(t: 1, people: ["Гость"], offscreen: false)
+        XCTAssertFalse(onScreenEvent.encodedLine().contains("offscreen"))
+        XCTAssertEqual(CallFeed.parse(onScreenEvent.encodedLine()), [onScreenEvent])
+
+        let oldLine = """
+        {"v":1,"t":0,"service":"telemost","visible":true,"self":null,"selfSpeaking":false,"people":["Гость"],"speaking":[]}
+        """
+        XCTAssertEqual(CallFeed.parse(oldLine).first?.offscreen, false)
+
+        let futureKeyLine = """
+        {"v":1,"t":0,"service":"telemost","visible":true,"self":null,"selfSpeaking":false,"people":["Гость"],"speaking":[],"future":1}
+        """
+        XCTAssertEqual(CallFeed.parse(futureKeyLine).count, 1)
+    }
+
+    /// A highlight read off screen keeps its credit only for
+    /// `CallFeed.offscreenHighlightLimit` (10 s) after the `speaking` set
+    /// last changed — a page Chrome froze on another desktop must not give
+    /// the last speaker every line for as long as nobody looks at that
+    /// desktop again. [0, 12) keeps 10 of its 12 s credited (past the 60 %
+    /// share): named. [0, 16) still clears the share at the 10 s boundary
+    /// (62.5 %); [0, 17) falls just short (58.8 %) — the two lines next to
+    /// each other pin the 10 s limit itself, not just "somewhere under
+    /// 18 s". [12, 30) and [0, 30) get none of that credit at all: no name.
+    /// The very same feed read on screen (no `offscreen` key at all) keeps
+    /// naming every line, exactly as before this card.
+    func testFrozenOffscreenHighlightCountsAtMostTenSeconds() {
+        let frozen = CallFeed.parse(
+            """
+            {"v":1,"t":0,"service":"telemost","visible":true,"self":null,"selfSpeaking":false,"people":["Арина Веткина","Борис Луков"],"speaking":["Арина Веткина"],"offscreen":true}
+            {"v":1,"t":15,"service":"telemost","visible":true,"self":null,"selfSpeaking":false,"people":["Арина Веткина","Борис Луков","Вера Сомова"],"speaking":["Арина Веткина"],"offscreen":true}
+            """
+        )
+        XCTAssertEqual(frozen.count, 2)
+        func picked(start: TimeInterval, end: TimeInterval) -> String? {
+            CallFeed.pickedNames(for: [MeetingAttempt.Line(start: start, end: end, source: .system)], feed: frozen)[0]
+        }
+        XCTAssertEqual(picked(start: 0, end: 12), "Арина Веткина")
+        XCTAssertEqual(picked(start: 0, end: 16), "Арина Веткина")
+        XCTAssertNil(picked(start: 0, end: 17))
+        XCTAssertNil(picked(start: 12, end: 30))
+        XCTAssertNil(picked(start: 0, end: 30))
+
+        let onScreen = CallFeed.parse(
+            """
+            {"v":1,"t":0,"service":"telemost","visible":true,"self":null,"selfSpeaking":false,"people":["Арина Веткина","Борис Луков"],"speaking":["Арина Веткина"]}
+            {"v":1,"t":15,"service":"telemost","visible":true,"self":null,"selfSpeaking":false,"people":["Арина Веткина","Борис Луков","Вера Сомова"],"speaking":["Арина Веткина"]}
+            """
+        )
+        func pickedOnScreen(start: TimeInterval, end: TimeInterval) -> String? {
+            CallFeed.pickedNames(for: [MeetingAttempt.Line(start: start, end: end, source: .system)], feed: onScreen)[0]
+        }
+        XCTAssertEqual(pickedOnScreen(start: 0, end: 30), "Арина Веткина")
+
+        // The single-other rule (unaffected by the freeze) still applies
+        // off screen: one person on the whole call, their own tile
+        // confirmed — named for the full 30 s even though nothing changed.
+        let singleOther = CallFeed.parse(
+            """
+            {"v":1,"t":0,"service":"telemost","visible":true,"self":"Я Сам","selfSpeaking":false,"selfVisible":true,"people":["Борис Луков"],"speaking":["Борис Луков"],"offscreen":true}
+            """
+        )
+        XCTAssertEqual(
+            CallFeed.pickedNames(for: [MeetingAttempt.Line(start: 0, end: 30, source: .system)], feed: singleOther)[0],
+            "Борис Луков"
+        )
+    }
+
+    /// A page that keeps changing its highlight while off screen (pauses
+    /// alone give an empty `speaking` set) never crosses the 10 s freeze at
+    /// all — every change resets the clock — so the names come out exactly
+    /// as they would on screen. A version of the fix that measured 10 s
+    /// from the very start of being off screen, rather than from the last
+    /// change, would wrongly give `nil` for [0, 25).
+    func testLiveOffscreenHighlightNamesAsOnScreen() {
+        let people = ["Арина Веткина", "Борис Луков"]
+        let live = CallFeed.parse(
+            """
+            {"v":1,"t":0,"service":"telemost","visible":true,"self":null,"selfSpeaking":false,"people":["Арина Веткина","Борис Луков"],"speaking":["Арина Веткина"],"offscreen":true}
+            {"v":1,"t":4,"service":"telemost","visible":true,"self":null,"selfSpeaking":false,"people":["Арина Веткина","Борис Луков"],"speaking":[],"offscreen":true}
+            {"v":1,"t":5,"service":"telemost","visible":true,"self":null,"selfSpeaking":false,"people":["Арина Веткина","Борис Луков"],"speaking":["Арина Веткина"],"offscreen":true}
+            {"v":1,"t":9,"service":"telemost","visible":true,"self":null,"selfSpeaking":false,"people":["Арина Веткина","Борис Луков"],"speaking":[],"offscreen":true}
+            {"v":1,"t":10,"service":"telemost","visible":true,"self":null,"selfSpeaking":false,"people":["Арина Веткина","Борис Луков"],"speaking":["Арина Веткина"],"offscreen":true}
+            {"v":1,"t":14,"service":"telemost","visible":true,"self":null,"selfSpeaking":false,"people":["Арина Веткина","Борис Луков"],"speaking":[],"offscreen":true}
+            {"v":1,"t":15,"service":"telemost","visible":true,"self":null,"selfSpeaking":false,"people":["Арина Веткина","Борис Луков"],"speaking":["Арина Веткина"],"offscreen":true}
+            {"v":1,"t":19,"service":"telemost","visible":true,"self":null,"selfSpeaking":false,"people":["Арина Веткина","Борис Луков"],"speaking":[],"offscreen":true}
+            {"v":1,"t":20,"service":"telemost","visible":true,"self":null,"selfSpeaking":false,"people":["Арина Веткина","Борис Луков"],"speaking":["Арина Веткина"],"offscreen":true}
+            {"v":1,"t":24,"service":"telemost","visible":true,"self":null,"selfSpeaking":false,"people":["Арина Веткина","Борис Луков"],"speaking":[],"offscreen":true}
+            {"v":1,"t":25,"service":"telemost","visible":true,"self":null,"selfSpeaking":false,"people":["Арина Веткина","Борис Луков"],"speaking":["Борис Луков"],"offscreen":true}
+            {"v":1,"t":29,"service":"telemost","visible":true,"self":null,"selfSpeaking":false,"people":["Арина Веткина","Борис Луков"],"speaking":[],"offscreen":true}
+            {"v":1,"t":30,"service":"telemost","visible":true,"self":null,"selfSpeaking":false,"people":["Арина Веткина","Борис Луков"],"speaking":["Борис Луков"],"offscreen":true}
+            {"v":1,"t":34,"service":"telemost","visible":true,"self":null,"selfSpeaking":false,"people":["Арина Веткина","Борис Луков"],"speaking":[],"offscreen":true}
+            {"v":1,"t":35,"service":"telemost","visible":true,"self":null,"selfSpeaking":false,"people":["Арина Веткина","Борис Луков"],"speaking":["Борис Луков"],"offscreen":true}
+            {"v":1,"t":39,"service":"telemost","visible":true,"self":null,"selfSpeaking":false,"people":["Арина Веткина","Борис Луков"],"speaking":[],"offscreen":true}
+            """
+        )
+        XCTAssertEqual(live.count, 16)
+        XCTAssertTrue(live.allSatisfy { $0.people == people })
+        let picked = CallFeed.pickedNames(
+            for: [
+                MeetingAttempt.Line(start: 0, end: 25, source: .system),
+                MeetingAttempt.Line(start: 25, end: 40, source: .system),
+            ],
+            feed: live
+        )
+        XCTAssertEqual(picked[0], "Арина Веткина")
+        XCTAssertEqual(picked[1], "Борис Луков")
+
+        let onScreenLive = live.map { event in
+            CallFeed.Event(
+                t: event.t, service: event.service, visible: event.visible, ownName: event.ownName,
+                selfSpeaking: event.selfSpeaking, people: event.people, speaking: event.speaking,
+                selfVisible: event.selfVisible, offscreen: false
+            )
+        }
+        let pickedOnScreen = CallFeed.pickedNames(
+            for: [
+                MeetingAttempt.Line(start: 0, end: 25, source: .system),
+                MeetingAttempt.Line(start: 25, end: 40, source: .system),
+            ],
+            feed: onScreenLive
+        )
+        XCTAssertEqual(picked, pickedOnScreen)
+    }
+
+    /// K2 of the other-desktop card: the page comes back on screen at 4 s,
+    /// well inside the 10 s freeze limit, and stays on screen until a later
+    /// closing event (`visible: false`, as a stop writes). The line after
+    /// the return must be named exactly as it would be read on screen the
+    /// whole time — the freeze must never reach past the moment the page
+    /// stopped being off screen.
+    func testHighlightReturningOnScreenWithinTheLimitIsNamedAsOnScreen() {
+        let feed = [
+            event(t: 0, people: ["Арина Веткина", "Борис Луков"], speaking: ["Арина Веткина"], offscreen: true),
+            event(t: 4, people: ["Арина Веткина", "Борис Луков"], speaking: ["Арина Веткина"], offscreen: false),
+            event(t: 20, visible: false),
+        ]
+        let picked = CallFeed.pickedNames(
+            for: [MeetingAttempt.Line(start: 0, end: 20, source: .system)], feed: feed
+        )
+        XCTAssertEqual(picked[0], "Арина Веткина")
+    }
+
+    /// K2: a highlight change that happens while the page is on screen,
+    /// between two off-screen reads, is measured here through the same
+    /// picking function a transcript line would use — `speaking` toggling
+    /// to a different name while on screen must still name that line, never
+    /// be mistaken for a frozen off-screen highlight.
+    func testHighlightChangeOnScreenBetweenOffscreenReadsStillNamesTheLine() {
+        let feed = [
+            event(t: 0, people: ["Арина Веткина", "Борис Луков"], speaking: ["Арина Веткина"], offscreen: true),
+            event(t: 2, people: ["Арина Веткина", "Борис Луков"], speaking: ["Борис Луков"], offscreen: false),
+            event(t: 4, people: ["Арина Веткина", "Борис Луков"], speaking: ["Борис Луков"], offscreen: true),
+        ]
+        let picked = CallFeed.pickedNames(
+            for: [MeetingAttempt.Line(start: 2, end: 14, source: .system)], feed: feed
+        )
+        XCTAssertEqual(picked[0], "Борис Луков")
+    }
+
+    /// K2: Zoom's and Jitsi's own highlight lead (1.2 s / 0.5 s) may start
+    /// earlier than a pending off-screen cut. The cut must never be
+    /// inserted behind the lead's own interval — doing so would both break
+    /// the rising `start` order `systemName`'s binary search depends on and
+    /// wrongly cut a highlight the lead had already credited. A line that
+    /// exactly spans the lead's own window must come out named in full, not
+    /// split by a misplaced cut.
+    func testServiceLeadBeforeAPendingCutIsNeverInsertedBehindIt() {
+        let zoomFeed = [
+            event(t: 0, people: ["Арина Веткина", "Борис Луков"], speaking: ["Арина Веткина"], offscreen: true),
+            event(
+                t: 10.5, service: "zoom", people: ["Арина Веткина", "Борис Луков"], speaking: ["Борис Луков"],
+                offscreen: false
+            ),
+        ]
+        let zoomPicked = CallFeed.pickedNames(
+            for: [MeetingAttempt.Line(start: 9.3, end: 10.5, source: .system)], feed: zoomFeed
+        )
+        XCTAssertEqual(zoomPicked[0], "Борис Луков")
+
+        let jitsiFeed = [
+            event(t: 0, people: ["Арина Веткина", "Борис Луков"], speaking: ["Арина Веткина"], offscreen: true),
+            event(
+                t: 10.3, service: "jitsi", people: ["Арина Веткина", "Борис Луков"], speaking: ["Борис Луков"],
+                offscreen: false
+            ),
+        ]
+        let jitsiPicked = CallFeed.pickedNames(
+            for: [MeetingAttempt.Line(start: 9.8, end: 10.3, source: .system)], feed: jitsiFeed
+        )
+        XCTAssertEqual(jitsiPicked[0], "Борис Луков")
+    }
+
+    /// K3: the feed breaks off mid-freeze — the recording stopped before a
+    /// closing `visible: false` line could apply the 10 s cut, so the only
+    /// event at all is an off-screen one whose highlight never changes
+    /// again. The credit must still stop at the limit rather than naming
+    /// the whole line, which only `buildIntervals` applying the pending cut
+    /// after its last event (not just between two events) can do.
+    func testFeedEndingMidFreezeStillAppliesTheCutoff() {
+        let feed = [
+            event(t: 0, people: ["Арина Веткина", "Борис Луков"], speaking: ["Арина Веткина"], offscreen: true)
+        ]
+        let picked = CallFeed.pickedNames(
+            for: [MeetingAttempt.Line(start: 0, end: 30, source: .system)], feed: feed
+        )
+        XCTAssertNil(picked[0], "must not go on naming the frozen speaker past the 10 s limit")
+    }
+
+    /// Locks the freeze cutoff to exactly 10 s, not merely "somewhere under
+    /// 30 s": at a 16 s line the named share is 10/16 ≈ 62.5 %, just past
+    /// `CallFeed.dominantShare` (60 %), and at 17 s it is 10/17 ≈ 58.8 %,
+    /// just short of it. A cutoff anywhere in roughly 15–18 s would still
+    /// pass both assertions, so each line's own math is spelled out here.
+    func testFeedEndingMidFreezeLocksTheCutoffToTenSeconds() {
+        let feed = [
+            event(t: 0, people: ["Арина Веткина", "Борис Луков"], speaking: ["Арина Веткина"], offscreen: true)
+        ]
+
+        let justInside = CallFeed.pickedNames(
+            for: [MeetingAttempt.Line(start: 0, end: 16, source: .system)], feed: feed
+        )
+        XCTAssertEqual(justInside[0], "Арина Веткина", "10/16 ≈ 62.5 % still clears the 60 % share")
+
+        let justOutside = CallFeed.pickedNames(
+            for: [MeetingAttempt.Line(start: 0, end: 17, source: .system)], feed: feed
+        )
+        XCTAssertNil(justOutside[0], "10/17 ≈ 58.8 % no longer clears the 60 % share")
     }
 }

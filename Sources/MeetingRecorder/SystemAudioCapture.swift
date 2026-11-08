@@ -52,6 +52,220 @@ enum SystemAudioCaptureError: LocalizedError, Equatable, Sendable {
     }
 }
 
+/// A snapshot of the live audio ring (`LiveAudioRing.read()`): the same
+/// frames that went into the meeting's tracks, read by the meeting's
+/// `LiveTranscript`. `firstFrame` counts the same way as `writtenFrames`.
+struct LiveAudio: Sendable {
+    let sampleRate: Double
+    let microphoneChannels: Int
+    let firstFrame: Int64
+    let system: [Float]
+    let microphone: [Float]
+    let dropped: Int64
+}
+
+/// A preallocated ring of the same audio the IOProc writes to the meeting's
+/// two tracks, for a live-transcript pipeline to read while the call is still
+/// going. One writer (the IOProc, `write`) and one reader (the capture actor,
+/// serialized by the actor, `read`); `@unchecked Sendable` because every
+/// field below is owned by exactly one side and the two talk only through the
+/// atomics, in release/acquire pairs that this type documents at each use.
+///
+/// The buffers are raw memory, not Swift arrays: the IOProc may not allocate,
+/// lock or lose time to copy-on-write. Both are zero-filled in `init`, before
+/// capture starts, so the first cycles never fault in fresh pages on the
+/// realtime thread.
+private final class LiveAudioRing: @unchecked Sendable {
+    let sampleRate: Double
+    let capacity: Int
+    /// Channels the IOProc's microphone buffer actually carries this cycle.
+    let streamMicrophoneChannels: Int
+    /// Channels kept in the ring: equal to `streamMicrophoneChannels` for one
+    /// or two of them, 1 (channel 0) for three or more — the same split the
+    /// microphone file makes (`createFirstChannelFile`).
+    let microphoneChannels: Int
+
+    private let systemBuffer: UnsafeMutablePointer<Float>
+    private let microphoneBuffer: UnsafeMutablePointer<Float>
+
+    /// Frames written to the ring so far, by the writer's own count (not the
+    /// track's `firstFrame`, which can jump after a drop). Writer: `.releasing`
+    /// after the samples are copied. Reader: `.acquiring`, before it reads
+    /// anything else published alongside it (`baseFrame`, `basePosition`,
+    /// `droppedTotal`).
+    private let written = Atomic<Int64>(0)
+    /// Frames the reader has taken out of the ring. Reader: `.releasing`
+    /// after it has copied the samples out, so the writer only overwrites
+    /// space the reader is done with. Writer: `.acquiring`, before deciding
+    /// whether there is room for a new cycle.
+    private let readIndex = Atomic<Int64>(0)
+    /// Frames dropped by a full ring, published the same way as `written`:
+    /// writer `wrappingAdd(ordering: .releasing)`, reader
+    /// `load(ordering: .acquiring)`. A plain `.relaxed` pair would let the
+    /// reader's acquire of `written` land before a drop recorded just after
+    /// it, pushing that loss into the snapshot after the one it belongs to.
+    private let droppedTotal = Atomic<Int64>(0)
+    /// The track frame number of ring position `basePosition`, i.e. of
+    /// `written`/`read` when the ring was last empty and a new base was set.
+    /// `.relaxed`: both are written by the writer strictly before the
+    /// release-store of `written` that makes the cycle visible, and read by
+    /// the reader strictly after the acquire-load of `written` that makes the
+    /// cycle visible, so the acquire/release pair on `written` already
+    /// orders them.
+    private let baseFrame = Atomic<Int64>(0)
+    private let basePosition = Atomic<Int64>(0)
+
+    // Writer-only (the IOProc never runs concurrently with itself).
+    private var writePosition: Int64 = 0
+    private var nextFrame: Int64 = 0
+    private var needsBase = true
+
+    // Reader-only (the capture actor serializes every call).
+    private var reportedDropped: Int64 = 0
+
+    init(sampleRate: Double, capacity: Int, streamMicrophoneChannels: Int, microphoneChannels: Int) {
+        self.sampleRate = sampleRate
+        self.capacity = capacity
+        self.streamMicrophoneChannels = streamMicrophoneChannels
+        self.microphoneChannels = microphoneChannels
+        let system = UnsafeMutablePointer<Float>.allocate(capacity: capacity)
+        system.initialize(repeating: 0, count: capacity)
+        systemBuffer = system
+        let microphoneCount = capacity * microphoneChannels
+        let microphone = UnsafeMutablePointer<Float>.allocate(capacity: microphoneCount)
+        microphone.initialize(repeating: 0, count: microphoneCount)
+        microphoneBuffer = microphone
+    }
+
+    deinit {
+        systemBuffer.deinitialize(count: capacity)
+        systemBuffer.deallocate()
+        microphoneBuffer.deinitialize(count: capacity * microphoneChannels)
+        microphoneBuffer.deallocate()
+    }
+
+    /// Copies one IOProc cycle in. Only raw-memory copies: no allocation,
+    /// lock, log or `await`. `system` and `microphone` must each hold at
+    /// least `frames` frames (the microphone at `streamMicrophoneChannels`
+    /// per frame); the caller (the IOProc) already knows this from the
+    /// cycle's own buffers.
+    ///
+    /// A new base — the point where `firstFrame` starts applying to ring
+    /// position `writePosition` — is set only while the ring is empty
+    /// (`readIndex == written`): changing it while the reader might still be
+    /// mid-copy of the old base would let one snapshot claim a `firstFrame`
+    /// that doesn't match part of its own samples. So a cycle that doesn't
+    /// continue the previous one (after a drop, or at the very first cycle)
+    /// is itself dropped unless the ring is already empty; once it is, that
+    /// cycle becomes the new base. A cycle larger than the whole ring can
+    /// never fit either way, even into an empty ring.
+    func write(system: UnsafePointer<Float>, microphone: UnsafePointer<Float>, frames: Int, firstFrame: Int64) {
+        guard frames > 0 else { return }
+        let w = writePosition
+        let r = readIndex.load(ordering: .acquiring)
+        let unread = Int(w - r)
+        if needsBase || firstFrame != nextFrame {
+            guard unread == 0, frames <= capacity else {
+                _ = droppedTotal.wrappingAdd(Int64(frames), ordering: .releasing)
+                needsBase = true
+                return
+            }
+            baseFrame.store(firstFrame, ordering: .relaxed)
+            basePosition.store(w, ordering: .relaxed)
+            needsBase = false
+        } else if unread + frames > capacity {
+            _ = droppedTotal.wrappingAdd(Int64(frames), ordering: .releasing)
+            needsBase = true
+            return
+        }
+        copyIn(systemBuffer, position: w, count: frames, channels: 1, from: system)
+        if streamMicrophoneChannels == microphoneChannels {
+            copyIn(microphoneBuffer, position: w, count: frames, channels: microphoneChannels, from: microphone)
+        } else {
+            // Three or more microphone channels: keep channel 0 only, the
+            // same channel `createFirstChannelFile`'s converter keeps.
+            for i in 0..<frames {
+                let index = Int((w + Int64(i)) % Int64(capacity))
+                microphoneBuffer[index] = microphone[i * streamMicrophoneChannels]
+            }
+        }
+        writePosition = w + Int64(frames)
+        nextFrame = firstFrame + Int64(frames)
+        written.store(writePosition, ordering: .releasing)
+    }
+
+    /// Everything unread, as one snapshot, or nil when the writer has put
+    /// nothing new in since the last `read()`. The only reader, serialized by
+    /// the capture actor.
+    func read() -> LiveAudio? {
+        let w = written.load(ordering: .acquiring)
+        let r = readIndex.load(ordering: .relaxed) // only this reader ever moves it
+        guard w > r else { return nil }
+        let base = baseFrame.load(ordering: .relaxed)
+        let basePos = basePosition.load(ordering: .relaxed)
+        let first = base + (r - basePos)
+        let count = Int(w - r)
+        var systemSamples = [Float](repeating: 0, count: count)
+        var microphoneSamples = [Float](repeating: 0, count: count * microphoneChannels)
+        systemSamples.withUnsafeMutableBufferPointer { destination in
+            copyOut(destination.baseAddress!, from: systemBuffer, position: r, count: count, channels: 1)
+        }
+        microphoneSamples.withUnsafeMutableBufferPointer { destination in
+            copyOut(destination.baseAddress!, from: microphoneBuffer, position: r, count: count, channels: microphoneChannels)
+        }
+        let totalDropped = droppedTotal.load(ordering: .acquiring)
+        let dropped = totalDropped - reportedDropped
+        reportedDropped = totalDropped
+        readIndex.store(w, ordering: .releasing)
+        return LiveAudio(
+            sampleRate: sampleRate,
+            microphoneChannels: microphoneChannels,
+            firstFrame: first,
+            system: systemSamples,
+            microphone: microphoneSamples,
+            dropped: dropped
+        )
+    }
+
+    /// Copies `count` frames of `channels` samples each from `source` into
+    /// `dest`, a ring of this capacity, starting at ring position `position`
+    /// (wrapped), splitting the copy in two only where the ring wraps.
+    private func copyIn(
+        _ dest: UnsafeMutablePointer<Float>,
+        position: Int64,
+        count: Int,
+        channels: Int,
+        from source: UnsafePointer<Float>
+    ) {
+        let start = Int(position % Int64(capacity)) * channels
+        let total = count * channels
+        let firstPart = min(total, capacity * channels - start)
+        dest.advanced(by: start).update(from: source, count: firstPart)
+        if firstPart < total {
+            dest.update(from: source.advanced(by: firstPart), count: total - firstPart)
+        }
+    }
+
+    /// The mirror of `copyIn`: copies `count` frames of `channels` samples
+    /// each out of ring `source` starting at ring position `position`
+    /// (wrapped) into `dest`.
+    private func copyOut(
+        _ dest: UnsafeMutablePointer<Float>,
+        from source: UnsafePointer<Float>,
+        position: Int64,
+        count: Int,
+        channels: Int
+    ) {
+        let start = Int(position % Int64(capacity)) * channels
+        let total = count * channels
+        let firstPart = min(total, capacity * channels - start)
+        dest.update(from: source.advanced(by: start), count: firstPart)
+        if firstPart < total {
+            dest.advanced(by: firstPart).update(from: source, count: total - firstPart)
+        }
+    }
+}
+
 private final class SystemAudioRuntime: @unchecked Sendable {
     private let errorLock = NSLock()
     private var firstErrorStatus: OSStatus?
@@ -85,11 +299,20 @@ private final class SystemAudioRuntime: @unchecked Sendable {
     let microphoneBufferIndex: Int
     let systemBytesPerFrame: UInt32
     let microphoneBytesPerFrame: UInt32
+    /// The live-audio ring, or nil when the format didn't allow one (see
+    /// `SystemAudioTapRecorder.liveRing`). Set once, before the first cycle;
+    /// the IOProc only reads it, through `write`, which fences its own
+    /// writer-side state.
+    let live: LiveAudioRing?
     #if DEBUG
     /// Test-only: an adopted session writes synchronously (see
     /// `adoptedForTesting`). Written once, before the first cycle; the IOProc
     /// only reads it.
     var writesSynchronouslyForTesting = false
+    /// Test-only: makes the next synchronous write cycle fail without
+    /// touching either file (`deliverCycleForTesting(failingWrite:)`). The
+    /// IOProc clears it right after using it, so it applies to one cycle.
+    var failsWritesForTesting = false
     #endif
 
     init(
@@ -99,7 +322,8 @@ private final class SystemAudioRuntime: @unchecked Sendable {
         microphoneBufferIndex: Int,
         systemBytesPerFrame: UInt32,
         microphoneBytesPerFrame: UInt32,
-        sampleRate: Double
+        sampleRate: Double,
+        live: LiveAudioRing?
     ) {
         self.systemFile = systemFile
         self.microphoneFile = microphoneFile
@@ -107,6 +331,7 @@ private final class SystemAudioRuntime: @unchecked Sendable {
         self.microphoneBufferIndex = microphoneBufferIndex
         self.systemBytesPerFrame = systemBytesPerFrame
         self.microphoneBytesPerFrame = microphoneBytesPerFrame
+        self.live = live
         // A headset's microphone starts with up to ~1.5 s of zeros; a live
         // one never sends 10 s of them.
         self.silenceLimit = Int64(sampleRate * 10)
@@ -194,8 +419,14 @@ private func murmurlySystemAudioIOProc(
     // instead: there is no ring to overflow, and both writers' progress is
     // guaranteed by the call itself.
     if runtime.writesSynchronouslyForTesting {
-        systemStatus = ExtAudioFileWrite(systemFile, systemFrames, &systemData)
-        microphoneStatus = ExtAudioFileWrite(microphoneFile, systemFrames, &microphoneData)
+        if runtime.failsWritesForTesting {
+            systemStatus = kAudioFileUnspecifiedError
+            microphoneStatus = noErr
+            runtime.failsWritesForTesting = false
+        } else {
+            systemStatus = ExtAudioFileWrite(systemFile, systemFrames, &systemData)
+            microphoneStatus = ExtAudioFileWrite(microphoneFile, systemFrames, &microphoneData)
+        }
     } else {
         systemStatus = ExtAudioFileWriteAsync(systemFile, systemFrames, &systemData)
         microphoneStatus = ExtAudioFileWriteAsync(microphoneFile, systemFrames, &microphoneData)
@@ -217,8 +448,19 @@ private func murmurlySystemAudioIOProc(
         } else {
             runtime.endSilence(at: runtime.frames)
         }
+        let firstFrame = runtime.frames
         runtime.frames += Int64(systemFrames)
         runtime.writtenFrames.store(runtime.frames, ordering: .relaxed)
+        if let live = runtime.live,
+           let systemData = system.buffer.mData,
+           let microphoneData = microphone.buffer.mData {
+            live.write(
+                system: systemData.assumingMemoryBound(to: Float.self),
+                microphone: microphoneData.assumingMemoryBound(to: Float.self),
+                frames: Int(systemFrames),
+                firstFrame: firstFrame
+            )
+        }
     }
     return status
 }
@@ -358,6 +600,10 @@ final class SystemAudioTapRecorder: @unchecked Sendable {
                 throw error
             }
 
+            let liveAudioOffReason = Self.liveAudioUnsupportedReason(microphone: microphoneFormat, system: systemFormat)
+            let live = liveAudioOffReason == nil
+                ? Self.liveRing(microphone: microphoneFormat, system: systemFormat, firstChannelOnly: firstChannelOnly)
+                : nil
             let runtime = SystemAudioRuntime(
                 systemFile: systemFile,
                 microphoneFile: microphoneFile,
@@ -365,7 +611,8 @@ final class SystemAudioTapRecorder: @unchecked Sendable {
                 microphoneBufferIndex: microphoneIndex,
                 systemBytesPerFrame: systemFormat.mBytesPerFrame,
                 microphoneBytesPerFrame: microphoneFormat.mBytesPerFrame,
-                sampleRate: clockRate
+                sampleRate: clockRate,
+                live: live
             )
             self.runtime = runtime
             var proc: AudioDeviceIOProcID?
@@ -388,6 +635,7 @@ final class SystemAudioTapRecorder: @unchecked Sendable {
                 "shared clock @ \(Int(sampleRate)) Hz; mic \(microphoneFormat.mChannelsPerFrame)ch"
                     + (firstChannelOnly ? ", first channel written" : "")
                     + (systemStream.mSampleRate != sampleRate ? "; tap declares \(Int(systemStream.mSampleRate)) Hz" : "")
+                    + (liveAudioOffReason.map { "; live audio off: \($0)" } ?? "")
             )
         } catch {
             teardown()
@@ -502,6 +750,12 @@ final class SystemAudioTapRecorder: @unchecked Sendable {
     func writtenSeconds() -> TimeInterval? {
         guard let runtime, sampleRate > 0 else { return nil }
         return Double(runtime.writtenFrames.load(ordering: .relaxed)) / sampleRate
+    }
+
+    /// A snapshot of the live audio ring, or nil when nothing new is there,
+    /// there is no session, or this format never got a ring.
+    func liveAudio() -> LiveAudio? {
+        runtime?.live?.read()
     }
 
     deinit { teardown() }
@@ -661,6 +915,56 @@ final class SystemAudioTapRecorder: @unchecked Sendable {
             )
         }
         return file
+    }
+
+    /// Why a live-audio ring can't be built from these formats, or nil when
+    /// it can. The ring reads raw `Float` samples straight out of the IOProc's
+    /// buffers, so it needs Float32, packed, interleaved PCM and a known rate
+    /// — anything else would read as garbage.
+    private static func liveAudioUnsupportedReason(
+        microphone: AudioStreamBasicDescription,
+        system: AudioStreamBasicDescription
+    ) -> String? {
+        guard system.mSampleRate > 0 else { return "no clock rate" }
+        guard isFloatPackedInterleaved(system) else { return "system stream not Float32 packed interleaved" }
+        guard isFloatPackedInterleaved(microphone) else { return "microphone stream not Float32 packed interleaved" }
+        return nil
+    }
+
+    /// One channel makes interleaved and non-interleaved the same bytes, so
+    /// the non-interleaved flag only disqualifies a format with two or more
+    /// channels (several buffers per stream — the ring reads one).
+    private static func isFloatPackedInterleaved(_ format: AudioStreamBasicDescription) -> Bool {
+        guard format.mFormatID == kAudioFormatLinearPCM,
+              (format.mFormatFlags & kAudioFormatFlagIsFloat) != 0,
+              format.mBitsPerChannel == 32,
+              format.mChannelsPerFrame > 0,
+              format.mBytesPerFrame == 4 * format.mChannelsPerFrame else {
+            return false
+        }
+        return format.mChannelsPerFrame == 1 || (format.mFormatFlags & kAudioFormatFlagIsNonInterleaved) == 0
+    }
+
+    /// A ~30 s ring at the given formats' rate, or nil when
+    /// `liveAudioUnsupportedReason` already refused them. `capacityFrames`
+    /// overrides the ~30 s default; test-only (a real session never passes
+    /// it).
+    private static func liveRing(
+        microphone: AudioStreamBasicDescription,
+        system: AudioStreamBasicDescription,
+        firstChannelOnly: Bool,
+        capacityFrames: Int? = nil
+    ) -> LiveAudioRing? {
+        guard liveAudioUnsupportedReason(microphone: microphone, system: system) == nil else { return nil }
+        let streamChannels = Int(microphone.mChannelsPerFrame)
+        let channels = firstChannelOnly ? 1 : streamChannels
+        let capacity = capacityFrames ?? Int((system.mSampleRate * 30).rounded(.up))
+        return LiveAudioRing(
+            sampleRate: system.mSampleRate,
+            capacity: capacity,
+            streamMicrophoneChannels: streamChannels,
+            microphoneChannels: channels
+        )
     }
 
     private static func waitForInputStreams(
@@ -830,6 +1134,12 @@ actor SystemAudioCapture: MeetingCaptureBackend {
     /// call arriving while a stop is under way safely sees nil.
     func writtenSeconds() async -> TimeInterval? {
         tapRecorder?.writtenSeconds()
+    }
+
+    /// Same lifetime guarantee as `writtenSeconds()`: nil once `stop()` has
+    /// cleared `tapRecorder`.
+    func liveAudio() async -> LiveAudio? {
+        tapRecorder?.liveAudio()
     }
 
     func stop() async throws -> [URL] {
@@ -1012,13 +1322,18 @@ extension SystemAudioTapRecorder {
         microphoneFrames: UInt32,
         enqueuedFrames: Int64,
         microphoneChannels: UInt32 = 1,
-        microphoneSignalChannel: UInt32 = 0
+        microphoneSignalChannel: UInt32 = 0,
+        declaredSystemRate: Double? = nil,
+        liveCapacityFrames: Int? = nil,
+        microphoneNonInterleaved: Bool = false
     ) throws -> SystemAudioTapRecorder {
-        func format(channels: UInt32) -> AudioStreamBasicDescription {
-            AudioStreamBasicDescription(
-                mSampleRate: sampleRate,
+        func format(channels: UInt32, rate: Double, nonInterleaved: Bool = false) -> AudioStreamBasicDescription {
+            var flags: AudioFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked
+            if nonInterleaved { flags |= kAudioFormatFlagIsNonInterleaved }
+            return AudioStreamBasicDescription(
+                mSampleRate: rate,
                 mFormatID: kAudioFormatLinearPCM,
-                mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked,
+                mFormatFlags: flags,
                 mBytesPerPacket: 4 * channels,
                 mFramesPerPacket: 1,
                 mBytesPerFrame: 4 * channels,
@@ -1027,14 +1342,19 @@ extension SystemAudioTapRecorder {
                 mReserved: 0
             )
         }
-        let systemFile = try createFile(at: systemURL, format: format(channels: 1), operation: "test system track")
+        let systemFile = try createFile(
+            at: systemURL, format: format(channels: 1, rate: sampleRate), operation: "test system track"
+        )
         let microphoneFile = microphoneChannels >= 3
             ? try createFirstChannelFile(
                 at: microphoneURL,
-                streamFormat: format(channels: microphoneChannels),
+                streamFormat: format(channels: microphoneChannels, rate: sampleRate),
                 operation: "test microphone track"
             )
-            : try createFile(at: microphoneURL, format: format(channels: microphoneChannels), operation: "test microphone track")
+            : try createFile(
+                at: microphoneURL, format: format(channels: microphoneChannels, rate: sampleRate),
+                operation: "test microphone track"
+            )
         let tracks = [
             (systemFile, systemFrames, UInt32(1), UInt32(0)),
             (microphoneFile, microphoneFrames, microphoneChannels, microphoneSignalChannel),
@@ -1053,6 +1373,27 @@ extension SystemAudioTapRecorder {
                 try check(ExtAudioFileWrite(file, frames, &list), "test track write")
             }
         }
+        // Goes through the real `trackFormats`/`liveRing`, like `start()`, so
+        // a declared tap rate different from the clock is refused the same
+        // way (test 2). The non-interleaved flag only varies this decision
+        // call, never the file's own format.
+        let live: LiveAudioRing?
+        switch SystemAudioCapture.trackFormats(
+            clockRate: sampleRate,
+            microphone: format(channels: microphoneChannels, rate: sampleRate, nonInterleaved: microphoneNonInterleaved),
+            system: format(channels: 1, rate: declaredSystemRate ?? sampleRate),
+            microphoneChannels: microphoneChannels
+        ) {
+        case let .record(microphoneFormat, systemFormat):
+            live = liveRing(
+                microphone: microphoneFormat,
+                system: systemFormat,
+                firstChannelOnly: microphoneChannels >= 3,
+                capacityFrames: liveCapacityFrames
+            )
+        case .refuse:
+            live = nil
+        }
         let runtime = SystemAudioRuntime(
             systemFile: systemFile,
             microphoneFile: microphoneFile,
@@ -1060,7 +1401,8 @@ extension SystemAudioTapRecorder {
             microphoneBufferIndex: 1,
             systemBytesPerFrame: 4,
             microphoneBytesPerFrame: 4 * microphoneChannels,
-            sampleRate: sampleRate
+            sampleRate: sampleRate,
+            live: live
         )
         runtime.frames = enqueuedFrames
         runtime.writtenFrames.store(enqueuedFrames, ordering: .relaxed)
@@ -1080,8 +1422,20 @@ extension SystemAudioTapRecorder {
     /// 0.1 and every microphone sample `microphone` (0 is the exact silence
     /// of a microphone that sends nothing). A 0 in `frames` is an empty
     /// buffer; a missing entry, a stream that is gone.
-    func deliverCycleForTesting(frames: [UInt32], microphone: Float = 0.1) -> OSStatus {
+    /// `systemSamples`/`microphoneSamples`, given, replace the constant
+    /// signal for that stream (length: frames × that stream's channels,
+    /// interleaved, the whole cycle in one array — only used when the count
+    /// matches). `failingWrite` makes this one cycle's write fail without
+    /// touching either file (see `SystemAudioRuntime.failsWritesForTesting`).
+    func deliverCycleForTesting(
+        frames: [UInt32],
+        microphone: Float = 0.1,
+        systemSamples: [Float]? = nil,
+        microphoneSamples: [Float]? = nil,
+        failingWrite: Bool = false
+    ) -> OSStatus {
         guard let runtime else { return kAudioHardwareNotRunningError }
+        runtime.failsWritesForTesting = failingWrite
         let list = AudioBufferList.allocate(maximumBuffers: max(frames.count, 1))
         list.count = frames.count
         defer {
@@ -1094,7 +1448,14 @@ extension SystemAudioTapRecorder {
             var data: UnsafeMutableRawPointer?
             if samples > 0 {
                 let memory = UnsafeMutablePointer<Float>.allocate(capacity: samples)
-                memory.initialize(repeating: index == 0 ? 0.1 : microphone, count: samples)
+                let provided = index == 0 ? systemSamples : microphoneSamples
+                if let provided, provided.count == samples {
+                    provided.withUnsafeBufferPointer { buffer in
+                        memory.initialize(from: buffer.baseAddress!, count: samples)
+                    }
+                } else {
+                    memory.initialize(repeating: index == 0 ? 0.1 : microphone, count: samples)
+                }
                 data = UnsafeMutableRawPointer(memory)
             }
             list[index] = AudioBuffer(
@@ -1125,7 +1486,10 @@ extension SystemAudioCapture {
         startedAt: Date,
         endedAt: Date? = nil,
         microphoneChannels: UInt32 = 1,
-        microphoneSignalChannel: UInt32 = 0
+        microphoneSignalChannel: UInt32 = 0,
+        declaredSystemRate: Double? = nil,
+        liveCapacityFrames: Int? = nil,
+        microphoneNonInterleaved: Bool = false
     ) throws {
         let systemURL = directory.appendingPathComponent("system.caf")
         tapRecorder = try SystemAudioTapRecorder.adoptedForTesting(
@@ -1136,7 +1500,10 @@ extension SystemAudioCapture {
             microphoneFrames: microphoneFrames,
             enqueuedFrames: enqueuedFrames,
             microphoneChannels: microphoneChannels,
-            microphoneSignalChannel: microphoneSignalChannel
+            microphoneSignalChannel: microphoneSignalChannel,
+            declaredSystemRate: declaredSystemRate,
+            liveCapacityFrames: liveCapacityFrames,
+            microphoneNonInterleaved: microphoneNonInterleaved
         )
         sessionDirectory = directory
         self.systemURL = systemURL
@@ -1147,8 +1514,20 @@ extension SystemAudioCapture {
     /// Test-only: one IOProc cycle for the adopted session
     /// (`SystemAudioTapRecorder.deliverCycleForTesting`).
     @discardableResult
-    func deliverCycleForTesting(frames: [UInt32], microphone: Float = 0.1) -> OSStatus {
-        tapRecorder?.deliverCycleForTesting(frames: frames, microphone: microphone) ?? kAudioHardwareNotRunningError
+    func deliverCycleForTesting(
+        frames: [UInt32],
+        microphone: Float = 0.1,
+        systemSamples: [Float]? = nil,
+        microphoneSamples: [Float]? = nil,
+        failingWrite: Bool = false
+    ) -> OSStatus {
+        tapRecorder?.deliverCycleForTesting(
+            frames: frames,
+            microphone: microphone,
+            systemSamples: systemSamples,
+            microphoneSamples: microphoneSamples,
+            failingWrite: failingWrite
+        ) ?? kAudioHardwareNotRunningError
     }
 }
 #endif

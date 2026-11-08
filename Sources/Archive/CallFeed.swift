@@ -39,6 +39,12 @@ enum CallFeed {
         /// own tile; a page that reads by caption only (web Zoom) never sets
         /// it, so it never satisfies the single-other rule below on its own.
         var selfVisible: Bool?
+        /// Whether the page was read through a window on another desktop,
+        /// or through a listed window that is not currently on screen
+        /// (`MeetingPageReader`, another card). `false` for a line written
+        /// before this field existed: an old feed is read as "on screen",
+        /// the previous (and only) behaviour.
+        var offscreen: Bool
 
         /// One line, no `*`: the same cleaning `MeetingLibrary.speakerName`
         /// gives a typed name, applied here to the own tile and to every
@@ -77,11 +83,12 @@ enum CallFeed {
             people = Event.cleanedNames(line.people)
             speaking = Event.cleanedNames(line.speaking)
             selfVisible = line.selfVisible
+            offscreen = line.offscreen ?? false
         }
 
         init(
             t: TimeInterval, service: String, visible: Bool, ownName: String?, selfSpeaking: Bool,
-            people: [String], speaking: [String], selfVisible: Bool? = nil
+            people: [String], speaking: [String], selfVisible: Bool? = nil, offscreen: Bool = false
         ) {
             self.t = t
             self.service = service
@@ -91,6 +98,7 @@ enum CallFeed {
             self.people = Event.cleanedNames(people)
             self.speaking = Event.cleanedNames(speaking)
             self.selfVisible = selfVisible
+            self.offscreen = offscreen
         }
 
         /// The JSON line the watcher writes, ending with a newline, with a
@@ -99,7 +107,10 @@ enum CallFeed {
         func encodedLine() -> String {
             let line = Line(
                 v: CallFeed.formatVersion, t: t, service: service, visible: visible, selfName: ownName,
-                selfSpeaking: selfSpeaking, people: people, speaking: speaking, selfVisible: selfVisible
+                selfSpeaking: selfSpeaking, people: people, speaking: speaking, selfVisible: selfVisible,
+                // The key is written only when true: an on-screen line stays
+                // byte for byte what it was before this field existed.
+                offscreen: offscreen ? true : nil
             )
             let encoder = JSONEncoder()
             encoder.outputFormatting = .sortedKeys
@@ -123,11 +134,12 @@ enum CallFeed {
         var people: [String]
         var speaking: [String]
         var selfVisible: Bool?
+        var offscreen: Bool?
 
         enum CodingKeys: String, CodingKey {
             case v, t, service, visible
             case selfName = "self"
-            case selfSpeaking, people, speaking, selfVisible
+            case selfSpeaking, people, speaking, selfVisible, offscreen
         }
 
         /// Written by hand so a nil `selfName` encodes as `"self": null`:
@@ -149,6 +161,7 @@ enum CallFeed {
             try container.encode(people, forKey: .people)
             try container.encode(speaking, forKey: .speaking)
             try container.encodeIfPresent(selfVisible, forKey: .selfVisible)
+            try container.encodeIfPresent(offscreen, forKey: .offscreen)
         }
     }
 
@@ -257,12 +270,29 @@ enum CallFeed {
     /// Telemost has no lead in this table.
     static let highlightLeads: [String: TimeInterval] = ["jitsi": 0.5, "zoom": 1.2]
 
+    /// How long a highlight read off screen (`Event.offscreen`) keeps being
+    /// credited after the `speaking` set last changed. A page on another
+    /// desktop may be frozen by the browser, and a frozen highlight would
+    /// otherwise give the last speaker every line for as long as nobody
+    /// returns to that desktop; a live call changes `speaking` constantly
+    /// (pauses alone give an empty set), so this limit never trims a call
+    /// that is actually still being read.
+    static let offscreenHighlightLimit: TimeInterval = 10
+
     /// A clear majority of a system line's length: short of it, the line is
     /// a mix and keeps the track's own label rather than guess.
     static let dominantShare = 0.6
     /// How far ahead of the next-most-credited person the winner must be:
     /// guards a close call between two people from picking either by chance.
     static let dominantMargin = 2.0
+    /// The least a line's remainder after its first sighting of the call
+    /// (`knownFrom`) may be, as a share of the line's own length, for the
+    /// 60 % share and the ×2 margin to be measured against that remainder
+    /// instead of the whole line.
+    static let dominantRemainderShare = 0.4
+    /// The least a line's remainder after `knownFrom` may be, in seconds,
+    /// for the same shift.
+    static let dominantRemainderMinimum: TimeInterval = 2.0
 
     /// One name per line of an attempt's record, in the same order, picked
     /// from the feed; nil where the feed does not say, or says too little
@@ -303,6 +333,13 @@ enum CallFeed {
         // seen anywhere else in the call (a scrolled-off tile, a later or
         // earlier moment) rules it out, never only this one line's own span.
         let allOtherNames = Set(events.filter(\.visible).flatMap { $0.people + $0.speaking })
+        // The first moment the feed actually saw the call with people on
+        // screen (`visible` and a non-empty `people`), or nil when it never
+        // did. Seconds before this point are "not yet known", never "hidden"
+        // (the round-3 rule for a tab closed mid-call, which keeps measuring
+        // the full line, is unaffected: it only applies once this point is
+        // behind the line's own start).
+        let knownFrom = events.first { $0.visible && !$0.people.isEmpty }?.t
 
         return lines.map { line in
             guard line.start.isFinite, line.end.isFinite, line.end > line.start else { return nil }
@@ -313,7 +350,10 @@ enum CallFeed {
                 let index = lastIndex(in: events, strictlyBefore: line.end)
                 return index >= 0 ? ownNameAsOf[index] : nil
             case .system:
-                return systemName(start: line.start, end: line.end, intervals: intervals, allOtherNames: allOtherNames)
+                return systemName(
+                    start: line.start, end: line.end, intervals: intervals, allOtherNames: allOtherNames,
+                    knownFrom: knownFrom
+                )
             }
         }
     }
@@ -390,12 +430,37 @@ enum CallFeed {
         var onset: [String: TimeInterval] = [:]
         var intervals: [Interval] = []
         intervals.reserveCapacity(events.count)
+
+        // The off-screen freeze (K1–K3): `lastChangeTime` is the `t` of the
+        // last event whose raw `speaking` set differed from the one before
+        // it (the very first event always counts as a change). An
+        // off-screen event past `lastChangeTime + offscreenHighlightLimit`
+        // is credited nothing of its own; one still within the limit keeps
+        // its normal credit but registers `pendingCut`, the moment that
+        // credit must stop if nothing changes before then. `pendingCut` is
+        // resolved — inserted as an empty-credit tail of the event that set
+        // it, or dropped — right before the next event's own interval (and
+        // its lead interval, if any) is appended, so it never lands after
+        // an interval already in the array: an on-screen event, or any
+        // change of the `speaking` set, quenches it outright instead.
+        var lastSpeakingSet: Set<String>?
+        var lastChangeTime: TimeInterval = 0
+        var pendingCut: (time: TimeInterval, event: Event)?
+
         for (index, event) in events.enumerated() {
+            let rawSpeaking = Set(event.speaking)
+            let speakingChanged = lastSpeakingSet.map { $0 != rawSpeaking } ?? true
+            let previousPendingCut = pendingCut
+            pendingCut = nil
+            if speakingChanged {
+                lastChangeTime = event.t
+                lastSpeakingSet = rawSpeaking
+            }
+
             var newNames: Set<String> = []
             if event.visible {
-                let speaking = Set(event.speaking)
-                for name in onset.keys where !speaking.contains(name) { onset.removeValue(forKey: name) }
-                for name in speaking where onset[name] == nil {
+                for name in onset.keys where !rawSpeaking.contains(name) { onset.removeValue(forKey: name) }
+                for name in rawSpeaking where onset[name] == nil {
                     onset[name] = event.t
                     newNames.insert(name)
                 }
@@ -407,21 +472,62 @@ enum CallFeed {
                 credited = Set(onset.filter { $0.value == maxOnset }.keys)
             }
 
+            var effectiveCredited = credited
+            if event.offscreen {
+                if event.t >= lastChangeTime + offscreenHighlightLimit {
+                    effectiveCredited = []
+                } else if !credited.isEmpty {
+                    pendingCut = (lastChangeTime + offscreenHighlightLimit, event)
+                }
+            }
+
+            var leadInterval: Interval?
             if index > 0, !newNames.isEmpty, events[index - 1].visible {
                 let previous = events[index - 1]
                 let lead = leads[event.service] ?? 0
                 let start = Swift.max(event.t - lead, previous.t)
                 if start < event.t {
-                    intervals.append(Interval(
+                    leadInterval = Interval(
                         start: start, visible: previous.visible, people: Set(previous.people), credited: newNames,
                         pairConfirmed: pairConfirmed(previous)
-                    ))
+                    )
                 }
             }
+            let nextStart = leadInterval?.start ?? event.t
 
+            // A cut strictly between the last interval already added and
+            // where this event's own interval (or its lead) is about to
+            // start: the freeze really did last into this event, so its
+            // tail is credited to nobody. Anything else (quenched by a
+            // `speaking` change above, or this event arriving before the
+            // cut would have struck) is simply dropped — Zoom's and
+            // Jitsi's own lead can start earlier than a cut that never gets
+            // to fire, and appending it anyway would break the rising
+            // `start` order `lastIndex(in:atMost:)` depends on.
+            if let cut = previousPendingCut, let last = intervals.last, cut.time > last.start, cut.time < nextStart {
+                intervals.append(Interval(
+                    start: cut.time, visible: cut.event.visible, people: Set(cut.event.people), credited: [],
+                    pairConfirmed: pairConfirmed(cut.event)
+                ))
+            }
+
+            if let leadInterval { intervals.append(leadInterval) }
             intervals.append(Interval(
-                start: event.t, visible: event.visible, people: Set(event.people), credited: credited,
+                start: event.t, visible: event.visible, people: Set(event.people), credited: effectiveCredited,
                 pairConfirmed: pairConfirmed(event)
+            ))
+        }
+
+        // K3: a feed that ends on a still-credited off-screen event (the
+        // recording broke off before a closing `visible: false` line could
+        // apply the cut above) never gets another event to resolve
+        // `pendingCut` against — apply it here instead, so a name still
+        // never carries more than `offscreenHighlightLimit` seconds past the
+        // last change of `speaking`.
+        if let cut = pendingCut, let last = intervals.last, cut.time > last.start {
+            intervals.append(Interval(
+                start: cut.time, visible: cut.event.visible, people: Set(cut.event.people), credited: [],
+                pairConfirmed: pairConfirmed(cut.event)
             ))
         }
         return intervals
@@ -455,14 +561,27 @@ enum CallFeed {
     /// still be either of several people, so the line falls through to the
     /// dominant-speaker count instead of guessing. This only ever removes a
     /// name the line would otherwise have gotten; it never adds one.
+    ///
+    /// `knownFrom` is the feed's first sighting of the call with people on
+    /// screen (nil when it never had one). When this line starts before
+    /// that point, the stretch from `start` up to `knownFrom` is "not yet
+    /// known", not "hidden" like the round-3 rule above: if what remains
+    /// after it is at least 2 s and at least 40 % of the line, the 60 %
+    /// share and the ×2 margin are measured against that remainder alone,
+    /// counting only seconds credited at or after `knownFrom` — so the
+    /// share this check reports never exceeds 100 %. Short of either bound,
+    /// or with no `knownFrom` at all, the check keeps measuring the full
+    /// line as before.
     private static func systemName(
-        start: TimeInterval, end: TimeInterval, intervals: [Interval], allOtherNames: Set<String>
+        start: TimeInterval, end: TimeInterval, intervals: [Interval], allOtherNames: Set<String>,
+        knownFrom: TimeInterval?
     ) -> String? {
         let total = end - start
         guard total > 0 else { return nil }
         let epsilon = 1e-9
 
         var seconds: [String: TimeInterval] = [:]
+        var secondsFromKnown: [String: TimeInterval] = [:]
         var singleOtherValid = true
         var singleOtherName: String?
 
@@ -497,6 +616,13 @@ enum CallFeed {
             if !interval.credited.isEmpty {
                 let duration = segmentEnd - cursor
                 for name in interval.credited { seconds[name, default: 0] += duration }
+                if let knownFrom {
+                    let knownStart = Swift.max(cursor, knownFrom)
+                    if segmentEnd > knownStart {
+                        let knownDuration = segmentEnd - knownStart
+                        for name in interval.credited { secondsFromKnown[name, default: 0] += knownDuration }
+                    }
+                }
             }
 
             cursor = segmentEnd
@@ -505,10 +631,17 @@ enum CallFeed {
 
         if singleOtherValid, let name = singleOtherName, allOtherNames == Set([name]) { return name }
 
-        let ranked = seconds.sorted { $0.value > $1.value }
+        let remainder = knownFrom.map { end - Swift.max($0, start) }
+        let usesRemainder = knownFrom.map { $0 - start > epsilon } ?? false
+            && (remainder ?? 0) >= dominantRemainderMinimum - epsilon
+            && (remainder ?? 0) >= dominantRemainderShare * total - epsilon
+        let denominator = usesRemainder ? remainder! : total
+        let tally = usesRemainder ? secondsFromKnown : seconds
+
+        let ranked = tally.sorted { $0.value > $1.value }
         guard let winner = ranked.first else { return nil }
         let second = ranked.count > 1 ? ranked[1].value : 0
-        guard winner.value >= dominantShare * total - epsilon, winner.value >= dominantMargin * second - epsilon
+        guard winner.value >= dominantShare * denominator - epsilon, winner.value >= dominantMargin * second - epsilon
         else { return nil }
         return winner.key
     }

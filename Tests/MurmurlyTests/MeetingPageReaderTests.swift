@@ -538,11 +538,12 @@ final class MeetingPageReaderTests: XCTestCase {
     /// identical to before this card.
     private func readInChrome(
         _ windows: [AccessibilityPageNode], limits: MeetingPageReader.Limits,
-        services: [MeetingPageReader.Service] = MeetingPageReader.services, pin: MeetingPageReader.Pin? = nil
+        services: [MeetingPageReader.Service] = MeetingPageReader.services, pin: MeetingPageReader.Pin? = nil,
+        hiddenWindows: MeetingPageReader.HiddenWindows = .unavailable
     ) -> MeetingPageSnapshot {
         MeetingPageReader.snapshot(
             windows: ["com.google.Chrome": windows], holders: ["com.google.Chrome.helper"],
-            pin: pin, limits: limits, services: services
+            pin: pin, limits: limits, services: services, hiddenWindows: hiddenWindows
         )
     }
 
@@ -3629,5 +3630,364 @@ final class MeetingPageReaderTests: XCTestCase {
         )
         let descendingSnapshot = readZoom([window], limits: limits(), service: descendingService)
         XCTAssertEqual(descendingSnapshot.people, ["Гость Три"])
+    }
+
+    // MARK: - A call window on another desktop (#59 tail)
+
+    /// A plain call counter safe to capture in a `@Sendable` closure — a
+    /// `@Sendable` closure may never capture a mutable local `var` directly,
+    /// even one this test only ever touches from one thread.
+    private final class LockedCounter: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value = 0
+
+        func increment() {
+            lock.lock()
+            value += 1
+            lock.unlock()
+        }
+
+        var count: Int {
+            lock.lock()
+            defer { lock.unlock() }
+            return value
+        }
+    }
+
+    /// Counts `enumerate`/`reopen` calls under a lock, and answers `reopen`
+    /// only for the element number it currently considers "live" — so a
+    /// test can move the live window to a new element number, as if the
+    /// page reloaded into a new window, and prove a working `reopen` is
+    /// never followed by a new scan.
+    private final class HiddenWindowScanCounter: @unchecked Sendable {
+        private let lock = NSLock()
+        private var enumerateCalls = 0
+        private var reopenCalls = 0
+        private var liveElement: UInt64
+        private let pid: pid_t
+        private let node: AccessibilityPageNode
+
+        init(pid: pid_t, node: AccessibilityPageNode, liveElement: UInt64 = 17) {
+            self.pid = pid
+            self.node = node
+            self.liveElement = liveElement
+        }
+
+        var enumerateCount: Int { lock.lock(); defer { lock.unlock() }; return enumerateCalls }
+        var reopenCount: Int { lock.lock(); defer { lock.unlock() }; return reopenCalls }
+
+        func moveLiveWindow(to element: UInt64) {
+            lock.lock()
+            liveElement = element
+            lock.unlock()
+        }
+
+        func hiddenWindows() -> MeetingPageReader.HiddenWindows {
+            MeetingPageReader.HiddenWindows(
+                enumerate: { [self] _, _ in
+                    self.lock.lock()
+                    self.enumerateCalls += 1
+                    let element = self.liveElement
+                    self.lock.unlock()
+                    return .found([MeetingPageReader.HiddenWindow(
+                        window: MeetingPageReader.RemoteWindow(pid: self.pid, element: element), node: self.node
+                    )], complete: true)
+                },
+                reopen: { [self] window in
+                    self.lock.lock()
+                    self.reopenCalls += 1
+                    let element = self.liveElement
+                    self.lock.unlock()
+                    return window.element == element ? self.node : nil
+                },
+                isOnScreen: { _ in true }
+            )
+        }
+    }
+
+    /// A call window whose program keeps no window of it on the current
+    /// desktop at all: the public `AXWindows` list `readInChrome` passes
+    /// (`Telemost.window([])`, no meeting area) never finds it, only the
+    /// hidden-window scan does.
+    func testCallWindowOnAnotherDesktopIsFoundThroughRemoteTokens() throws {
+        let grid = Telemost.grid(tiles: [
+            Telemost.tile(name: "Я Сам", isSelf: true),
+            Telemost.tile(name: "Арина Веткина", speaking: true),
+        ])
+        let hiddenNode = Telemost.window([Telemost.meetingArea(grid: grid)])
+        let token = MeetingPageReader.RemoteWindow(pid: 4242, element: 17)
+        let hiddenWindows = MeetingPageReader.HiddenWindows(
+            enumerate: { _, _ in .found([MeetingPageReader.HiddenWindow(window: token, node: hiddenNode)], complete: true) },
+            reopen: { _ in nil }, isOnScreen: { _ in true }
+        )
+
+        let snapshot = readInChrome([Telemost.window([])], limits: limits(), hiddenWindows: hiddenWindows)
+        XCTAssertTrue(snapshot.found)
+        XCTAssertTrue(snapshot.visible)
+        XCTAssertEqual(snapshot.speaking, ["Арина Веткина"])
+        XCTAssertTrue(snapshot.offscreen)
+        XCTAssertEqual(snapshot.remoteWindow, token)
+
+        let read = CallFeedWatcher.read(from: snapshot)
+        guard case let .found(event, pin) = read else { return XCTFail("expected .found, got \(read)") }
+        XCTAssertTrue(event.offscreen)
+        XCTAssertEqual(pin.remoteWindow, token)
+        XCTAssertTrue(event.encodedLine().contains("\"offscreen\":true"))
+
+        // The base behaviour (no hidden-window seam at all): the same tree
+        // is never found.
+        let baseSnapshot = readInChrome([Telemost.window([])], limits: limits())
+        XCTAssertFalse(baseSnapshot.found)
+    }
+
+    /// The private symbol missing (`dlsym` finds nothing) must read exactly
+    /// as it did before this card: no crash, `.notFound` whether or not a
+    /// pin names the meeting, and the public-list case never even calls
+    /// `enumerate` at all.
+    func testMissingRemoteTokenSymbolReadsAsBefore() throws {
+        let calls = LockedCounter()
+        let unavailable = MeetingPageReader.HiddenWindows(
+            enumerate: { _, _ in calls.increment(); return .unavailable }, reopen: { _ in nil },
+            isOnScreen: { _ in true }
+        )
+
+        let withoutPin = readInChrome([Telemost.window([])], limits: limits(), hiddenWindows: unavailable)
+        XCTAssertFalse(withoutPin.found)
+
+        let pin = MeetingPageReader.Pin(
+            service: "telemost", app: "com.google.Chrome",
+            meeting: .page(address: "https://telemost.yandex.ru/private-join/abc123")
+        )
+        let withPin = readInChrome([Telemost.window([])], limits: limits(), pin: pin, hiddenWindows: unavailable)
+        XCTAssertFalse(withPin.found)
+
+        let publicMeetingCalls = LockedCounter()
+        let unavailableForPublicMeeting = MeetingPageReader.HiddenWindows(
+            enumerate: { _, _ in publicMeetingCalls.increment(); return .unavailable }, reopen: { _ in nil },
+            isOnScreen: { _ in true }
+        )
+        let grid = Telemost.grid(tiles: [Telemost.tile(name: "Гость Один")])
+        let windows = [Telemost.window([Telemost.meetingArea(grid: grid)])]
+        let withPublicMeeting = readInChrome(windows, limits: limits(), hiddenWindows: unavailableForPublicMeeting)
+        let baseline = readInChrome(windows, limits: limits())
+        XCTAssertEqual(withPublicMeeting, baseline)
+        XCTAssertEqual(
+            publicMeetingCalls.count, 0, "a meeting already found on the public list never scans at all"
+        )
+    }
+
+    /// Once a hidden window has been found and pinned, later reads reopen
+    /// it directly (one token, no scan) for as long as it stays reachable;
+    /// a scan runs again only once that reopen actually fails — never once
+    /// per poll regardless.
+    func testRemoteTokenScanRunsOnceWhilePinnedWindowLives() async throws {
+        let grid = Telemost.grid(tiles: [Telemost.tile(name: "Арина Веткина", speaking: true)])
+        let node = Telemost.window([Telemost.meetingArea(grid: grid)])
+        let counter = HiddenWindowScanCounter(pid: 4242, node: node)
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("call-feed-hidden-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let clock = Clock()
+        let watcher = CallFeedWatcher(
+            directory: directory,
+            snapshotSource: { pin in
+                let freshLimits = MeetingPageReader.Limits(
+                    maxNodes: 5000, maxDepth: 40, deadline: Date().addingTimeInterval(5)
+                )
+                let snapshot = MeetingPageReader.snapshot(
+                    windows: ["com.google.Chrome": [Telemost.window([])]], holders: ["com.google.Chrome.helper"],
+                    pin: pin, limits: freshLimits, hiddenWindows: counter.hiddenWindows()
+                )
+                return CallFeedWatcher.read(from: snapshot)
+            },
+            writtenSeconds: { clock.next() }, isEnabled: { true }, interval: .milliseconds(10)
+        )
+        await watcher.start()
+
+        try await waitForCondition { await watcher.snapshotCount >= 6 }
+        XCTAssertEqual(counter.enumerateCount, 1)
+        XCTAssertGreaterThanOrEqual(counter.reopenCount, 4)
+
+        counter.moveLiveWindow(to: 18)
+        try await waitForCondition { await watcher.snapshotCount >= 20 }
+        XCTAssertEqual(counter.enumerateCount, 2, "the first reopen failure after a live window scans again at once")
+
+        try await waitForCondition { await watcher.snapshotCount >= 30 }
+        XCTAssertEqual(counter.enumerateCount, 2, "a working reopen of the new window must never scan again")
+
+        await watcher.finish()
+        let lines = try CallFeed.read(in: directory) ?? []
+        XCTAssertFalse(lines.isEmpty)
+        XCTAssertTrue(lines.dropLast().allSatisfy(\.offscreen))
+    }
+
+    /// A window still on the public list, but not on screen
+    /// (`HiddenWindows.isOnScreen`), is marked `offscreen` too, with no
+    /// remote token at all — the other way a page can be unreachable to a
+    /// sighted user even though `kAXWindowsAttribute` still lists it (a
+    /// window minimized to the Dock, say).
+    func testListedWindowOffScreenIsMarkedOffscreen() throws {
+        let grid = Telemost.grid(tiles: [Telemost.tile(name: "Гость Один")])
+        let windows = [Telemost.window([Telemost.meetingArea(grid: grid)])]
+
+        let offScreen = MeetingPageReader.HiddenWindows(
+            enumerate: { _, _ in .unavailable }, reopen: { _ in nil }, isOnScreen: { _ in false }
+        )
+        let offScreenSnapshot = readInChrome(windows, limits: limits(), hiddenWindows: offScreen)
+        XCTAssertTrue(offScreenSnapshot.found)
+        XCTAssertTrue(offScreenSnapshot.offscreen)
+        XCTAssertNil(offScreenSnapshot.remoteWindow)
+
+        let onScreen = MeetingPageReader.HiddenWindows(
+            enumerate: { _, _ in .unavailable }, reopen: { _ in nil }, isOnScreen: { _ in true }
+        )
+        let onScreenSnapshot = readInChrome(windows, limits: limits(), hiddenWindows: onScreen)
+        XCTAssertFalse(onScreenSnapshot.offscreen)
+    }
+
+    /// A hidden-window scan deliberately not run this time (the per-app
+    /// scan interval, `.deferred`) must never be read as "the page is
+    /// gone": `CallFeedWatcher.read(from:)` turns it into `.skipped`, the
+    /// same "say nothing at all" read an unreadable holder list gets, never
+    /// `.notFound`.
+    func testDeferredHiddenWindowScanIsSkippedNotNotFound() throws {
+        let pin = MeetingPageReader.Pin(
+            service: "telemost", app: "com.google.Chrome",
+            meeting: .page(address: "https://telemost.yandex.ru/private-join/abc123")
+        )
+        let deferredWindows = MeetingPageReader.HiddenWindows(
+            enumerate: { _, _ in .deferred }, reopen: { _ in nil }, isOnScreen: { _ in true }
+        )
+
+        let snapshot = readInChrome([Telemost.window([])], limits: limits(), pin: pin, hiddenWindows: deferredWindows)
+        XCTAssertFalse(snapshot.found)
+
+        let read = CallFeedWatcher.read(from: snapshot)
+        guard case .skipped = read else { return XCTFail("expected .skipped, got \(read)") }
+    }
+
+    /// K4 of the other-desktop card: an element scan the read's own deadline
+    /// cut short, with no window found before it ran out, must not be read
+    /// as "the page is gone" — the caller has not actually seen all 1000
+    /// elements yet, so declaring the page missing now would write a "page
+    /// gone" line over a scan that simply has not finished. Only a scan
+    /// that runs all the way through and finds nothing is `.notFound`; both
+    /// the pinned and the unpinned path go through this.
+    func testIncompleteHiddenWindowScanIsSkippedNotNotFound() throws {
+        let cutShort = MeetingPageReader.HiddenWindows(
+            enumerate: { _, _ in .found([], complete: false) }, reopen: { _ in nil }, isOnScreen: { _ in true }
+        )
+
+        let pin = MeetingPageReader.Pin(
+            service: "telemost", app: "com.google.Chrome",
+            meeting: .page(address: "https://telemost.yandex.ru/private-join/abc123")
+        )
+        let pinnedSnapshot = readInChrome([Telemost.window([])], limits: limits(), pin: pin, hiddenWindows: cutShort)
+        XCTAssertFalse(pinnedSnapshot.found)
+        guard case .skipped = CallFeedWatcher.read(from: pinnedSnapshot) else {
+            return XCTFail("expected .skipped for the pinned path, got \(CallFeedWatcher.read(from: pinnedSnapshot))")
+        }
+
+        let unpinnedSnapshot = readInChrome([Telemost.window([])], limits: limits(), hiddenWindows: cutShort)
+        XCTAssertFalse(unpinnedSnapshot.found)
+        guard case .skipped = CallFeedWatcher.read(from: unpinnedSnapshot) else {
+            return XCTFail("expected .skipped for the unpinned path, got \(CallFeedWatcher.read(from: unpinnedSnapshot))")
+        }
+
+        // A scan that ran all the way through and still found nothing
+        // stays `.notFound`, exactly as before this card.
+        let completed = MeetingPageReader.HiddenWindows(
+            enumerate: { _, _ in .found([], complete: true) }, reopen: { _ in nil }, isOnScreen: { _ in true }
+        )
+        let completedSnapshot = readInChrome([Telemost.window([])], limits: limits(), pin: pin, hiddenWindows: completed)
+        guard case .notFound = CallFeedWatcher.read(from: completedSnapshot) else {
+            return XCTFail("expected .notFound once the scan ran to completion, got \(CallFeedWatcher.read(from: completedSnapshot))")
+        }
+    }
+
+    /// K1 (round 2): a hidden-window scan found a real window (`.found`
+    /// with a non-empty list), but the read's own deadline was already past
+    /// by the time that window itself was walked — `collectCandidates`
+    /// returns `nil` for it, not a completed "no match". The public window
+    /// list is empty on purpose: a non-empty one would trip the very first
+    /// `budget.enter` before `hiddenWindows` is ever consulted, which would
+    /// only prove the pre-existing, unrelated budget-cut rule
+    /// (`testTimeLimitExceededBeforeAreaFound_notFound_withoutSleeping`),
+    /// not this one. Both the pinned and the unpinned path must say
+    /// `.skipped`, never "the page is gone" — this must fail on the
+    /// pre-fix code, which answers `.notFound` for both.
+    func testHiddenWindowFoundButDeadlineAlreadyPastIsSkippedNotNotFound() throws {
+        let grid = Telemost.grid(tiles: [Telemost.tile(name: "Арина Веткина", speaking: true)])
+        let hiddenNode = Telemost.window([Telemost.meetingArea(grid: grid)])
+        let token = MeetingPageReader.RemoteWindow(pid: 4242, element: 17)
+        let expiredLimits = MeetingPageReader.Limits(maxNodes: 5000, maxDepth: 40, deadline: Date().addingTimeInterval(-1))
+        let cutShortButFound = MeetingPageReader.HiddenWindows(
+            enumerate: { _, _ in .found([MeetingPageReader.HiddenWindow(window: token, node: hiddenNode)], complete: false) },
+            reopen: { _ in nil }, isOnScreen: { _ in true }
+        )
+
+        let pin = MeetingPageReader.Pin(
+            service: "telemost", app: "com.google.Chrome",
+            meeting: .page(address: "https://telemost.yandex.ru/private-join/abc123")
+        )
+        let pinnedSnapshot = readInChrome([], limits: expiredLimits, pin: pin, hiddenWindows: cutShortButFound)
+        XCTAssertFalse(pinnedSnapshot.found)
+        guard case .skipped = CallFeedWatcher.read(from: pinnedSnapshot) else {
+            return XCTFail("expected .skipped for the pinned path, got \(CallFeedWatcher.read(from: pinnedSnapshot))")
+        }
+
+        let unpinnedSnapshot = readInChrome([], limits: expiredLimits, hiddenWindows: cutShortButFound)
+        XCTAssertFalse(unpinnedSnapshot.found)
+        guard case .skipped = CallFeedWatcher.read(from: unpinnedSnapshot) else {
+            return XCTFail("expected .skipped for the unpinned path, got \(CallFeedWatcher.read(from: unpinnedSnapshot))")
+        }
+    }
+
+    /// Sentry for the fix above: a hidden-window scan that runs all the way
+    /// through (no deadline cut) and finds a real window that simply does
+    /// not carry the pinned meeting must still conclude `.notFound` — the
+    /// fix must not turn every hidden-window miss into `.skipped`.
+    func testHiddenWindowFoundButWrongMeetingStaysNotFoundWhenNotTruncated() throws {
+        let otherGrid = Telemost.grid(tiles: [Telemost.tile(name: "Чужой Гость")])
+        let otherArea = FakeNode(role: "AXWebArea", axURL: "https://telemost.yandex.ru/private-join/zzz999", children: [otherGrid])
+        let hiddenNode = Telemost.window([otherArea])
+        let token = MeetingPageReader.RemoteWindow(pid: 4242, element: 17)
+        let hiddenWindows = MeetingPageReader.HiddenWindows(
+            enumerate: { _, _ in .found([MeetingPageReader.HiddenWindow(window: token, node: hiddenNode)], complete: true) },
+            reopen: { _ in nil }, isOnScreen: { _ in true }
+        )
+        let pin = MeetingPageReader.Pin(
+            service: "telemost", app: "com.google.Chrome",
+            meeting: .page(address: "https://telemost.yandex.ru/private-join/abc123")
+        )
+
+        let snapshot = readInChrome([], limits: limits(), pin: pin, hiddenWindows: hiddenWindows)
+        guard case .notFound = CallFeedWatcher.read(from: snapshot) else {
+            return XCTFail("expected .notFound for a completed scan with no matching meeting, got \(CallFeedWatcher.read(from: snapshot))")
+        }
+    }
+
+    /// A small counter standing in for the capture's own clock: strictly
+    /// increasing, so `writtenSeconds` never answers the same `t` twice.
+    private final class Clock: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value: TimeInterval = 0
+
+        func next() -> TimeInterval {
+            lock.lock()
+            defer { lock.unlock() }
+            value += 1
+            return value
+        }
+    }
+
+    private func waitForCondition(timeout: Int = 1000, _ condition: @escaping () async -> Bool) async throws {
+        for _ in 0..<timeout {
+            if await condition() { return }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTFail("condition never became true")
     }
 }

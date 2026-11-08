@@ -1383,6 +1383,13 @@ final class DictationCoordinator: ObservableObject {
             }
             try owned()
 
+            // Same hold as a fresh dictation's warm-up: a live transcript of
+            // a recording under way keeps its engine until the meeting stops.
+            while let held = meetingPeer?.liveTranscriptEngine, held != snapshot.dictationDescriptor {
+                try await Task.sleep(for: .milliseconds(250))
+                try owned()
+            }
+
             let decoded = try await transcribe(
                 url: url, snapshot: snapshot, dictionary: dictionary, followsModelProgress: false
             )
@@ -2036,6 +2043,12 @@ final class DictationCoordinator: ObservableObject {
         )
         warmTask = Task { [weak self] in
             do {
+                // A live transcript holds its own engine for the whole
+                // meeting; loading another now would make each of its
+                // chunks load its model back.
+                while let held = self?.meetingPeer?.liveTranscriptEngine, held != descriptor {
+                    try await Task.sleep(for: .milliseconds(250))
+                }
                 await cache.updateDesired(descriptor, generation: generation)
                 try await cache.prepareDesired(progress: progress)
                 guard self?.modelGeneration == generation,

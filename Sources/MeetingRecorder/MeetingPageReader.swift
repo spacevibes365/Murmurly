@@ -1,5 +1,6 @@
 import AppKit
 import ApplicationServices
+import CoreGraphics
 import Darwin
 import Foundation
 
@@ -80,6 +81,20 @@ struct MeetingPageSnapshot: Equatable {
     /// leaves it `false`, which keeps the single-other naming rule from
     /// firing for it — there is no own tile here to confirm the pair.
     var selfVisible = false
+    /// Whether the page was read through a window on another desktop
+    /// (`MeetingPageReader.HiddenWindows`), or a listed window
+    /// `CGWindowListCopyWindowInfo(.optionOnScreenOnly)` does not show.
+    /// `CallFeed.Event.offscreen`.
+    var offscreen = false
+    /// The remote token a window on another desktop was read through, kept
+    /// so the next read can reopen the very same window without scanning
+    /// again. `nil` for a window read off the public window list.
+    var remoteWindow: MeetingPageReader.RemoteWindow?
+    /// Set instead of `found` when a hidden-window scan was deliberately
+    /// skipped (the per-app scan interval) rather than actually run: this is
+    /// neither "found" nor "not found", and `CallFeedWatcher` must not treat
+    /// it as proof the page is gone.
+    var deferred = false
 
     static let notFound = MeetingPageSnapshot()
 }
@@ -958,6 +973,187 @@ enum MeetingPageReader {
         var service: String
         var app: String
         var meeting: Meeting?
+        /// The window a call on another desktop was last found through, so
+        /// the next read can reopen it directly instead of scanning again.
+        /// `nil` means the meeting is read off the public window list, or a
+        /// hidden window was never found. Last, with a default, so every
+        /// existing member-wise `Pin(…)` call keeps working.
+        var remoteWindow: RemoteWindow? = nil
+    }
+
+    /// An AX element reached by its remote token (pid + element number), not
+    /// through the app's public window list: how a window on another
+    /// desktop is read (`HiddenWindows`).
+    struct RemoteWindow: Equatable, Sendable {
+        var pid: pid_t
+        var element: UInt64
+    }
+
+    /// One window found only by scanning remote tokens, paired with the page
+    /// node built from it.
+    struct HiddenWindow: Sendable {
+        var window: RemoteWindow
+        var node: AccessibilityPageNode
+    }
+
+    /// What a hidden-window scan answered: the private symbol missing
+    /// (`.unavailable`, as before — no error), deliberately not run this
+    /// time (`.deferred`, e.g. the per-app scan interval — never to be read
+    /// as "no windows"), or actually run (`.found`, possibly empty).
+    /// `complete` is false when the read's own deadline cut the element
+    /// scan short before it reached 1000: an empty, incomplete `.found` must
+    /// never be read as "the page is gone" either, exactly like `.deferred`
+    /// — only a scan that ran to its end and found nothing is "not found".
+    enum EnumerationResult: Sendable {
+        case unavailable
+        case deferred
+        case found([HiddenWindow], complete: Bool)
+    }
+
+    /// The seam for windows the public list does not give (another desktop)
+    /// and for whether a listed window is on screen. Three separate
+    /// closures, not one: `enumerate` (the expensive token scan), `reopen`
+    /// (the remembered window again, one token, no scan) and `isOnScreen`
+    /// are different calls with very different costs, and a test needs to
+    /// count the scan apart from a reopen. `.unavailable` is exactly the old
+    /// reader, so every existing call with no `hiddenWindows:` argument
+    /// behaves as before.
+    struct HiddenWindows: Sendable {
+        /// Every window of `app` (a bundle id) reachable only by remote
+        /// token, within `deadline`.
+        var enumerate: @Sendable (_ app: String, _ deadline: Date) -> EnumerationResult
+        /// The remembered window again, one token, no scan; nil when it is
+        /// gone.
+        var reopen: @Sendable (_ window: RemoteWindow) -> AccessibilityPageNode?
+        /// Whether a window from the public list is on screen.
+        var isOnScreen: @Sendable (_ window: AccessibilityPageNode) -> Bool
+
+        static let unavailable = HiddenWindows(
+            enumerate: { _, _ in .unavailable }, reopen: { _ in nil }, isOnScreen: { _ in true }
+        )
+
+        /// The real reader: `kAXWindowsAttribute` only lists the current
+        /// desktop's windows, so a call page on another desktop (screen
+        /// sharing, Spaces) is reached the way AltTab reaches it, through
+        /// the private `_AXUIElementCreateWithRemoteToken`. Only live code —
+        /// `TestIsolation.isTestProcess` keeps `readLive` from ever calling
+        /// this in a test process, so it never runs in a test.
+        static let live = HiddenWindows(
+            enumerate: { app, deadline in
+                guard let create = remoteTokenCreate else { return .unavailable }
+                guard shouldScanHiddenWindows(of: app) else { return .deferred }
+                var hidden: [HiddenWindow] = []
+                for running in NSWorkspace.shared.runningApplications where running.bundleIdentifier == app {
+                    let pid = running.processIdentifier
+                    let publicWindows = publicWindowElements(of: pid)
+                    for element in UInt64(0)..<1000 {
+                        guard Date() < deadline else { return .found(hidden, complete: false) }
+                        guard let window = create(remoteTokenData(pid: pid, element: element))?.takeRetainedValue()
+                        else { continue }
+                        guard isWindowElement(window), !publicWindows.contains(where: { CFEqual($0, window) })
+                        else { continue }
+                        hidden.append(HiddenWindow(
+                            window: RemoteWindow(pid: pid, element: element), node: AXPageNode(element: window)
+                        ))
+                    }
+                }
+                return .found(hidden, complete: true)
+            },
+            reopen: { window in
+                guard let create = remoteTokenCreate,
+                      let element = create(remoteTokenData(pid: window.pid, element: window.element))?.takeRetainedValue(),
+                      isWindowElement(element)
+                else { return nil }
+                return AXPageNode(element: element)
+            },
+            isOnScreen: { window in
+                guard let axWindow = window as? AXPageNode, let getWindow = remoteTokenGetWindow else { return true }
+                var windowID = CGWindowID(0)
+                guard getWindow(axWindow.element, &windowID) == .success else { return true }
+                guard let onScreen = CGWindowListCopyWindowInfo(.optionOnScreenOnly, kCGNullWindowID)
+                    as? [[String: AnyObject]]
+                else { return true }
+                return onScreen.contains { ($0[kCGWindowNumber as String] as? NSNumber)?.uint32Value == windowID }
+            }
+        )
+    }
+
+    /// 20 bytes, machine byte order: pid, 0, `0x636f636f` ("coco", the token
+    /// kind AltTab uses), the element number.
+    private static func remoteTokenData(pid: pid_t, element: UInt64) -> CFData {
+        var data = Data()
+        withUnsafeBytes(of: Int32(pid)) { data.append(contentsOf: $0) }
+        withUnsafeBytes(of: Int32(0)) { data.append(contentsOf: $0) }
+        withUnsafeBytes(of: Int32(0x636f_636f)) { data.append(contentsOf: $0) }
+        withUnsafeBytes(of: element) { data.append(contentsOf: $0) }
+        return data as CFData
+    }
+
+    /// A hung remote app must not hold the one reader queue past the AX
+    /// header's own call budget: the timeout is set on this element — a
+    /// header's timeout on one element never reaches another — before the
+    /// very first question asked of it, exactly as `AXPageNode.init` does
+    /// for every element reached the public way.
+    private static func isWindowElement(_ element: AXUIElement) -> Bool {
+        AXUIElementSetMessagingTimeout(element, 0.25)
+        var role: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &role) == .success else {
+            return false
+        }
+        return (role as? String) == (kAXWindowRole as String)
+    }
+
+    /// `kAXWindowsAttribute` of one process's AX application element, as
+    /// plain `AXUIElement`s (not wrapped): the scan's own exclusion list, so
+    /// a window already reachable publicly is never counted twice.
+    private static func publicWindowElements(of pid: pid_t) -> [AXUIElement] {
+        let axApp = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(axApp, 0.25)
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(axApp, kAXWindowsAttribute as CFString, &value) == .success,
+              let value, CFGetTypeID(value) == CFArrayGetTypeID(), let array = value as? [AnyObject]
+        else { return [] }
+        return array.compactMap { item in
+            CFGetTypeID(item) == AXUIElementGetTypeID() ? unsafeDowncast(item, to: AXUIElement.self) : nil
+        }
+    }
+
+    /// The private symbols, loaded once with `dlsym`; `nil` when missing —
+    /// exactly as before, no error. A `@convention(c)` function pointer
+    /// closes over nothing, so the compiler already treats it as
+    /// `Sendable` on its own — no `nonisolated(unsafe)` needed.
+    private static let remoteTokenCreate: (@convention(c) (CFData) -> Unmanaged<AXUIElement>?)? = {
+        guard let symbol = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "_AXUIElementCreateWithRemoteToken")
+        else { return nil }
+        return unsafeBitCast(symbol, to: (@convention(c) (CFData) -> Unmanaged<AXUIElement>?).self)
+    }()
+
+    private static let remoteTokenGetWindow: (
+        @convention(c) (AXUIElement, UnsafeMutablePointer<CGWindowID>) -> AXError
+    )? = {
+        guard let symbol = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "_AXUIElementGetWindow") else { return nil }
+        return unsafeBitCast(
+            symbol, to: (@convention(c) (AXUIElement, UnsafeMutablePointer<CGWindowID>) -> AXError).self
+        )
+    }()
+
+    /// At most once every 5 s per app: the scan is 1000 IPC round trips to
+    /// the target process, and most polls (the window stays put) never need
+    /// it at all — `snapshot` only calls `enumerate` once `reopen` of a
+    /// remembered window has already failed. Guards only the scan itself;
+    /// a deferred scan answers `.deferred`, never `.found([])`, so it is
+    /// never mistaken for "scanned and found nothing" (`EnumerationResult`).
+    private static let hiddenWindowScanInterval: Duration = .seconds(5)
+    private static let hiddenWindowScanLock = NSLock()
+    nonisolated(unsafe) private static var hiddenWindowScanTimes: [String: ContinuousClock.Instant] = [:]
+
+    private static func shouldScanHiddenWindows(of app: String) -> Bool {
+        hiddenWindowScanLock.lock()
+        defer { hiddenWindowScanLock.unlock() }
+        let now = ContinuousClock.now
+        if let last = hiddenWindowScanTimes[app], now - last < hiddenWindowScanInterval { return false }
+        hiddenWindowScanTimes[app] = now
+        return true
     }
 
     /// `axURL`, normalized to scheme, lower-cased host and path, plus —
@@ -1022,7 +1218,8 @@ enum MeetingPageReader {
         return await onReadQueue {
             snapshot(
                 windows: collectWindows(of: apps), holders: holders, pin: pin, limits: limits,
-                services: servicesForRead(holders: holders, pin: pin) { zoomCaptionedServices }
+                services: servicesForRead(holders: holders, pin: pin) { zoomCaptionedServices },
+                hiddenWindows: .live
             )
         }
     }
@@ -1139,6 +1336,15 @@ enum MeetingPageReader {
         var target: Int
         var area: AccessibilityPageNode
         var meeting: Meeting?
+        /// The top-level window this candidate's area was found in, tagged
+        /// right after the walk that found it: the one thing `isOnScreen`
+        /// needs. `nil` for a candidate found inside a hidden window (see
+        /// `remote`) — such a candidate is offscreen by construction, and
+        /// `isOnScreen` is never asked about it.
+        var window: AccessibilityPageNode?
+        /// The remote token the window carrying this candidate was found
+        /// through, when it was found that way at all.
+        var remote: RemoteWindow?
     }
 
     /// One walk over the chosen programs' windows collects every area any
@@ -1157,7 +1363,7 @@ enum MeetingPageReader {
     /// which only a complete read can rule out.
     static func snapshot(
         windows: [String: [AccessibilityPageNode]], holders: Set<String>, pin: Pin?, limits: Limits,
-        services: [Service] = MeetingPageReader.services
+        services: [Service] = MeetingPageReader.services, hiddenWindows: HiddenWindows = .unavailable
     ) -> MeetingPageSnapshot {
         let budget = Budget(limits: limits)
         let targetList = targets(holders: holders, pin: pin, services: services)
@@ -1172,21 +1378,136 @@ enum MeetingPageReader {
             // then equal each other, exactly the hole 1b closes.
             guard let pinnedMeeting = pin.meeting else { return .notFound }
             let matching = candidates.filter { $0.meeting.map { $0 == pinnedMeeting } ?? false }
-            guard matching.count == 1 else { return .notFound }
-            let candidate = matching[0]
-            let (service, app) = targetList[candidate.target]
-            return read(candidate, service: service, app: app, budget: budget)
+            if matching.count == 1 {
+                let candidate = matching[0]
+                let (service, app) = targetList[candidate.target]
+                var result = read(candidate, service: service, app: app, budget: budget)
+                if result.found {
+                    result.offscreen = candidate.window.map { !hiddenWindows.isOnScreen($0) } ?? false
+                }
+                return result
+            }
+            guard matching.isEmpty else { return .notFound }
+            guard !budget.truncated else { return .notFound }
+
+            // The public list held no match: try the remembered window
+            // again first (cheap, one token, no scan) before falling back
+            // to a full scan.
+            if let remembered = pin.remoteWindow, let node = hiddenWindows.reopen(remembered) {
+                if let result = readHidden(
+                    node: node, token: remembered, app: pin.app, pinnedMeeting: pinnedMeeting,
+                    targetList: targetList, budget: budget
+                ) {
+                    return result
+                }
+                guard !budget.truncated else { return .notFound }
+                // Reopened, but it no longer shows this meeting (the call
+                // ended, or moved to a new window): fall through to a full
+                // scan rather than give up on the strength of one stale
+                // token.
+            }
+
+            switch hiddenWindows.enumerate(pin.app, limits.deadline) {
+            case .unavailable: return .notFound   // the symbol is missing: as before, no error.
+            case .deferred:
+                // Deliberately not scanned this time (the per-app scan
+                // interval): neither found nor not found, so the watcher
+                // must not write a "page gone" line over this.
+                return MeetingPageSnapshot(deferred: true)
+            case .found(let hidden, let complete):
+                for window in hidden {
+                    if let result = readHidden(
+                        node: window.node, token: window.window, app: pin.app, pinnedMeeting: pinnedMeeting,
+                        targetList: targetList, budget: budget
+                    ) {
+                        return result
+                    }
+                }
+                // A scan the deadline cut short, with no match found so
+                // far, says nothing at all — never "the page is gone"; only
+                // a scan that ran to its end may conclude that.
+                return complete ? .notFound : MeetingPageSnapshot(deferred: true)
+            }
         }
 
         var confirmed: [(Candidate, MeetingPageSnapshot)] = []
         for candidate in candidates {
             let (service, app) = targetList[candidate.target]
-            let result = read(candidate, service: service, app: app, budget: budget)
+            var result = read(candidate, service: service, app: app, budget: budget)
             guard !budget.truncated else { return .notFound }
-            if result.visible { confirmed.append((candidate, result)) }
+            if result.visible {
+                result.offscreen = candidate.window.map { !hiddenWindows.isOnScreen($0) } ?? false
+                confirmed.append((candidate, result))
+            }
         }
-        guard confirmed.count == 1, confirmed[0].0.meeting != nil else { return .notFound }
+
+        // The public list held nothing confirmed: try every target app's
+        // hidden windows (a call on another desktop) before giving up.
+        var scansIncomplete = false
+        if confirmed.isEmpty, !budget.truncated {
+            var scannedApps: Set<String> = []
+            for (_, app) in targetList where !scannedApps.contains(app) {
+                scannedApps.insert(app)
+                guard case .found(let hidden, let complete) = hiddenWindows.enumerate(app, limits.deadline)
+                else { continue }
+                if !complete { scansIncomplete = true }
+                for window in hidden {
+                    // The deadline cut this window's own walk short: say
+                    // nothing at all, never "the page is gone" — the walk
+                    // simply has not finished, not even for this one window
+                    // (K1, round 2).
+                    guard let found = collectCandidates(
+                        windows: [app: [window.node]], targets: targetList, budget: budget, remote: window.window
+                    ) else { return MeetingPageSnapshot(deferred: true) }
+                    for candidate in found {
+                        let (service, candidateApp) = targetList[candidate.target]
+                        var result = read(candidate, service: service, app: candidateApp, budget: budget)
+                        guard !budget.truncated else { return MeetingPageSnapshot(deferred: true) }
+                        if result.visible {
+                            result.offscreen = true
+                            result.remoteWindow = window.window
+                            confirmed.append((candidate, result))
+                        }
+                    }
+                }
+            }
+        }
+        guard confirmed.count == 1, confirmed[0].0.meeting != nil else {
+            // No app's scan ran to completion and none found a match: the
+            // deadline cut every one of them short, so this says nothing,
+            // never "the page is gone" (K4).
+            if confirmed.isEmpty, scansIncomplete { return MeetingPageSnapshot(deferred: true) }
+            return .notFound
+        }
         return confirmed[0].1
+    }
+
+    /// Reads one hidden window. `nil` means this particular window did not
+    /// match `pinnedMeeting`, so a caller trying several hidden windows in
+    /// turn can move on to the next one instead of giving up; a `deferred`
+    /// snapshot means the deadline cut this window's own walk short, before
+    /// it could be read at all, and the caller must stop trying further
+    /// windows and say nothing, never "the page is gone" (K1, round 2) —
+    /// only an ambiguous match (more than one candidate, a walk that did
+    /// finish) is a real `.notFound` here, as the public-list case treats
+    /// it.
+    private static func readHidden(
+        node: AccessibilityPageNode, token: RemoteWindow, app: String, pinnedMeeting: Meeting,
+        targetList: [(Service, String)], budget: Budget
+    ) -> MeetingPageSnapshot? {
+        guard let found = collectCandidates(windows: [app: [node]], targets: targetList, budget: budget, remote: token)
+        else { return MeetingPageSnapshot(deferred: true) }   // the deadline cut the walk short, not a conclusion.
+        let matching = found.filter { $0.meeting.map { $0 == pinnedMeeting } ?? false }
+        guard !matching.isEmpty else { return nil }   // no match here: the caller tries the next window.
+        guard matching.count == 1 else { return .notFound }   // ambiguous: stop, as the public-list case does.
+        let candidate = matching[0]
+        let (service, candidateApp) = targetList[candidate.target]
+        var result = read(candidate, service: service, app: candidateApp, budget: budget)
+        if result.found {
+            result.offscreen = true
+            result.remoteWindow = token
+        }
+        return result
     }
 
     /// Reads one candidate's tiles with what is left of `budget`. `found:
@@ -1216,7 +1537,8 @@ enum MeetingPageReader {
     /// second area of the same meeting, which only a complete walk can rule
     /// out.
     private static func collectCandidates(
-        windows: [String: [AccessibilityPageNode]], targets: [(Service, String)], budget: Budget
+        windows: [String: [AccessibilityPageNode]], targets: [(Service, String)], budget: Budget,
+        remote: RemoteWindow? = nil
     ) -> [Candidate]? {
         var appOrder: [String] = []
         var targetsByApp: [String: [(index: Int, service: Service)]] = [:]
@@ -1237,11 +1559,21 @@ enum MeetingPageReader {
                 }
             }
             for window in windows[app] ?? [] {
+                let before = candidates.count
                 guard walk(
                     window, appTargets: appTargets, hasAppTargets: hasAppTargets, hasWebTargets: hasWebTargets,
                     depth: 0, budget: budget, candidates: &candidates
                 ) else {
                     return nil
+                }
+                // Every candidate this window's walk just added is tagged
+                // with the window itself (for a public-list `isOnScreen`
+                // check) and with `remote` (set only when this very call is
+                // reading a window found by remote token, never the public
+                // list).
+                for i in before..<candidates.count {
+                    candidates[i].window = window
+                    candidates[i].remote = remote
                 }
             }
         }

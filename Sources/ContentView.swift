@@ -109,6 +109,8 @@ final class FilesModel: ObservableObject {
     ) -> FilesModel {
         var transcriber = transcriber ?? .live(settings: settings, models: models)
         transcriber.heldByDictation = { await dictation.heldEngine() }
+        // The recorder is `meetingPeer`, set by `MeetingRecorder.activate`.
+        transcriber.heldByLiveTranscript = { await dictation.meetingPeer?.liveTranscriptEngine }
         return FilesModel(transcription: { choice in
             #if DEBUG
             if let probe = FileProbe.transcription(choice: choice) { return probe }

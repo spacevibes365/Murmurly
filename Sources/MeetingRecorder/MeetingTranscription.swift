@@ -46,8 +46,9 @@ struct MeetingTranscriber: Sendable {
         /// The cache is loading the model for the next chunk.
         case preparingModel
         /// The cache is busy with another request; it may be a dictation, or
-        /// the model being prepared for one. Or the dictation holds its own
-        /// engine, and this chunk needs another (`heldByDictation`).
+        /// the model being prepared for one. Or the dictation or a live
+        /// transcript holds its own engine, and this chunk needs another
+        /// (`heldByDictation`, `heldByLiveTranscript`).
         case waitingForEngine
         /// Sent once the engine is ready, while chunk `done` is recognized.
         case recognizing(track: String, done: Int, total: Int)
@@ -174,6 +175,11 @@ struct MeetingTranscriber: Sendable {
     /// The engine the dictation holds now (`DictationCoordinator.heldEngine`);
     /// a chunk in another engine waits for it. None by default.
     var heldByDictation: @Sendable () async -> EngineDescriptor? = { nil }
+    /// The engine a live transcript of the recording under way holds now
+    /// (`MeetingRecorder.liveTranscriptEngine`); a chunk in another engine
+    /// waits for it, the same way it waits for the dictation's. None by
+    /// default.
+    var heldByLiveTranscript: @Sendable () async -> EngineDescriptor? = { nil }
     /// Subtracts the system track's echo from the microphone before the VAD
     /// (WebRTC AEC3). Off by default: tests' tracks are constant levels, which
     /// the canceller would bend; the app turns it on in `live`.
@@ -511,19 +517,24 @@ struct MeetingTranscriber: Sendable {
         }
     }
 
-    /// The engine for the next chunk, once the dictation lets the cache have
-    /// it: a chunk in an engine other than the dictation's waits while the
-    /// dictation records or is recognized and a while after, so a dictation
-    /// does not wait for its model to load back. Checked right before the
+    /// The engine for the next chunk, once the dictation and a live
+    /// transcript of a recording under way both let the cache have it: a
+    /// chunk in an engine other than either one's waits while it holds, so
+    /// neither waits for its own model to load back. Checked right before the
     /// request; read again after a wait, as the settings may have changed.
     /// The wait is a part of the job: quit and updates see it running.
     private func engine(
         for choice: SettingsSnapshot.Choice?,
         progress: @Sendable (Step) async -> Void
     ) async throws -> Engine {
+        func heldElsewhere(_ descriptor: EngineDescriptor) async -> Bool {
+            if let held = await heldByDictation(), held != descriptor { return true }
+            if let held = await heldByLiveTranscript(), held != descriptor { return true }
+            return false
+        }
         var engine = try await currentEngine(choice)
         var waiting = false
-        while let held = await heldByDictation(), held != engine.descriptor {
+        while await heldElsewhere(engine.descriptor) {
             if !waiting {
                 waiting = true
                 await progress(.waitingForEngine)
@@ -588,7 +599,9 @@ struct MeetingTranscriber: Sendable {
         return note
     }
 
-    private static func writeChunk(from source: any AudioSampleSource, range: Range<Int>, to url: URL) throws {
+    /// Not `private`: `LiveTranscript`'s recognition pipeline writes its own
+    /// chunks the same way, from `Sources/MeetingRecorder/LiveTranscript.swift`.
+    static func writeChunk(from source: any AudioSampleSource, range: Range<Int>, to url: URL) throws {
         guard let format = AVAudioFormat(
             commonFormat: .pcmFormatFloat32,
             sampleRate: Double(sampleRate),
@@ -708,7 +721,7 @@ extension MeetingTranscriber {
     /// Loaded by hand rather than through `VadManager(modelDirectory:)`: that
     /// path goes through ModelHub, which downloads when offline mode is off and
     /// deletes the model folder after a failed load.
-    static func sileroDetector(modelPath: String) async throws -> SpeechDetector {
+    static func sileroVAD(modelPath: String) throws -> VadManager {
         var isDirectory: ObjCBool = false
         guard FileManager.default.fileExists(atPath: modelPath, isDirectory: &isDirectory),
               isDirectory.boolValue else {
@@ -720,7 +733,11 @@ extension MeetingTranscriber {
             contentsOf: URL(fileURLWithPath: modelPath, isDirectory: true),
             configuration: configuration
         )
-        let vad = VadManager(config: .default, vadModel: model)
+        return VadManager(config: .default, vadModel: model)
+    }
+
+    static func sileroDetector(modelPath: String) async throws -> SpeechDetector {
+        let vad = try sileroVAD(modelPath: modelPath)
         return { source in try await speechRanges(in: source, vad: vad) }
     }
 
@@ -1243,6 +1260,10 @@ final class MeetingTranscriptionQueue: ObservableObject {
     /// Set by the recorder: the engine the dictation holds now
     /// (`DictationCoordinator.heldEngine`), for the job to leave alone.
     var heldByDictation: @MainActor () -> EngineDescriptor? = { nil }
+    /// Set by the recorder: the engine a live transcript of the recording
+    /// under way holds now (`MeetingRecorder.liveTranscriptEngine`), for the
+    /// job to leave alone the same way.
+    var heldByLiveTranscript: @MainActor () -> EngineDescriptor? = { nil }
     /// Set by the recorder: the dictation's own warm-up
     /// (`DictationCoordinator.prepareAfterOtherEngineJob`).
     var prepareDictationEngine: @MainActor () -> Void = {}
@@ -1613,6 +1634,8 @@ final class MeetingTranscriptionQueue: ObservableObject {
         var transcriber = self.transcriber
         let held = heldByDictation
         transcriber.heldByDictation = { await MainActor.run { held() } }
+        let heldLive = heldByLiveTranscript
+        transcriber.heldByLiveTranscript = { await MainActor.run { heldLive() } }
         let choice = next.choice
         // The record is made and finished inside this task, before
         // `isTranscribing` goes back: quit and updates see the whole attempt.

@@ -114,4 +114,66 @@ final class OverlayPlacementTests: XCTestCase {
             CGPoint(x: 300, y: 192)
         )
     }
+
+    // MARK: - fittedFrame (LiveTranscriptPanel: a saved frame on a monitor
+    // that is no longer attached)
+
+    func testFittedFrameOfARemoteScreenFallsBackInsideTheOnlyRemainingScreen() throws {
+        let main = IndicatorScreenGeometry(
+            displayID: 1,
+            visibleFrame: CGRect(x: 0, y: 0, width: 1_440, height: 900)
+        )
+        // The frame was saved on a monitor to the right that is now gone.
+        let storedOnUnpluggedMonitor = CGRect(x: 2_000, y: 100, width: 380, height: 240)
+
+        let fitted = try XCTUnwrap(OverlayGeometry.fittedFrame(
+            storedOnUnpluggedMonitor,
+            minSize: CGSize(width: 320, height: 160),
+            screens: [main]
+        ))
+
+        XCTAssertTrue(main.visibleFrame.contains(fitted))
+        XCTAssertEqual(fitted.size, storedOnUnpluggedMonitor.size)
+    }
+
+    func testFittedFrameGrowsASmallerThanMinimumStoredSize() throws {
+        let main = IndicatorScreenGeometry(
+            displayID: 1,
+            visibleFrame: CGRect(x: 0, y: 0, width: 1_440, height: 900)
+        )
+        let tooSmall = CGRect(x: 10, y: 10, width: 200, height: 90)
+
+        let fitted = try XCTUnwrap(OverlayGeometry.fittedFrame(
+            tooSmall,
+            minSize: CGSize(width: 320, height: 160),
+            screens: [main]
+        ))
+
+        XCTAssertEqual(fitted.size, CGSize(width: 320, height: 160))
+        XCTAssertTrue(main.visibleFrame.contains(fitted))
+    }
+
+    func testFittedFrameShrinksALargerThanScreenStoredSize() throws {
+        let small = IndicatorScreenGeometry(
+            displayID: 1,
+            visibleFrame: CGRect(x: 0, y: 0, width: 800, height: 600)
+        )
+        let tooBig = CGRect(x: -50, y: -50, width: 2_000, height: 1_200)
+
+        let fitted = try XCTUnwrap(OverlayGeometry.fittedFrame(
+            tooBig,
+            minSize: CGSize(width: 320, height: 160),
+            screens: [small]
+        ))
+
+        XCTAssertEqual(fitted, small.visibleFrame)
+    }
+
+    func testFittedFrameWithNoScreensReturnsNil() {
+        XCTAssertNil(OverlayGeometry.fittedFrame(
+            CGRect(x: 0, y: 0, width: 320, height: 160),
+            minSize: CGSize(width: 320, height: 160),
+            screens: []
+        ))
+    }
 }

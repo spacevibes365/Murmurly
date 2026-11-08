@@ -55,6 +55,26 @@ enum OverlayGeometry {
         return clamped(frame: frame, inside: visible)
     }
 
+    /// A stored frame, fitted into the screen it mostly falls on (or the
+    /// first, with none): too small is grown to `minSize`, too big is
+    /// shrunk to the screen, and the origin is pulled back on-screen. Used
+    /// by `LiveTranscriptPanel` for a frame remembered on a monitor that was
+    /// since unplugged.
+    static func fittedFrame(
+        _ frame: CGRect,
+        minSize: CGSize,
+        screens: [IndicatorScreenGeometry]
+    ) -> CGRect? {
+        guard let onScreen = screen(containing: frame, screens: screens) ?? screens.first else { return nil }
+        let visible = onScreen.visibleFrame
+        let width = min(max(frame.width, minSize.width), visible.width)
+        let height = min(max(frame.height, minSize.height), visible.height)
+        return clamped(
+            frame: CGRect(origin: frame.origin, size: CGSize(width: width, height: height)),
+            inside: visible
+        )
+    }
+
     static func defaultFrame(panelSize: CGSize, visibleFrame: CGRect) -> CGRect {
         clamped(
             frame: CGRect(

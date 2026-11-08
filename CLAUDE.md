@@ -825,6 +825,68 @@ there (`text.reading` names the meeting, `text.released` follows the hold's
 removal); in a test process the card's Add to Dictionary says the selection
 the card holds, `start+length`, so a test waits for the very selection it made.
 
+**Speakers' names from the call window** (`meeting.namesFromCallWindow`, on
+by default). While a meeting is recorded, `CallFeedWatcher` reads the call
+window of the app holding the microphone through Accessibility
+(`MeetingPageReader`, a table of call services) every 300 ms and appends each
+change to `.call.murmurly.jsonl` in the meeting's folder, timed in seconds of
+the recording (`writtenSeconds`), keeping the same events in memory for the
+live transcript even when the file cannot be written. `CallFeed.pickedNames`
+names a system line after the person highlighted as speaking for at least
+60 % of it and twice anyone else, a microphone line after the user's own tile.
+Before the feed has ever seen the call with people in it, the opening of a
+line is unknown rather than hidden: the share is then measured on the rest of
+the line when that is at least 2 s and 40 % of it. A window on another Space
+is not in the app's `kAXWindowsAttribute`, so the reader also walks the
+process's windows through the private `_AXUIElementCreateWithRemoteToken`
+(found with `dlsym`; without it, as before), each element with a 0.25 s
+messaging timeout and within the read's budget, and keeps the window with the
+meeting's pin. Such a read marks its event `offscreen`, and a highlight read
+off screen counts for at most 10 s after the speaking set last changed, as a
+page on another Space may stop updating; the stop logs how many reads were off
+screen and how many highlight changes they saw. A read cut short by its
+deadline is skipped, never taken for the page being gone.
+
+**Live transcript** (`meeting.liveTranscript`, on by default). While a meeting
+is recorded, what is said appears in a floating panel. The IOProc copies every
+cycle it wrote to the tracks into a preallocated single-writer ring
+(`SystemAudioCapture`, about 30 s at the aggregate's clock rate, the microphone
+as its file gets it): only copies and release/acquire atomics, nothing
+allocated or locked; a full ring loses the cycle for the live text only, never
+for the files, and the next read starts with a jump in the frame number.
+`LiveTranscript` (an actor) reads it through `MeetingCaptureBackend.liveAudio()`
+every 250 ms, never waiting for the engine, converts both tracks to 16 kHz mono
+with the batch path's own converter, cancels the echo with AEC3 as the batch
+path does, and cuts each track with the streaming Silero VAD: a chunk opens at
+a probability of 0.85, ends after two blocks under 0.70, is cut at 15 s,
+padded by 0.1 s and dropped under 0.3 s. These are the settings measured
+against the transcription after the stop on synthetic meetings (3.16 % against
+3.27 % word errors; text about 0.7 s after a phrase ends). A jump in the frame
+number resets the converters, AEC and VAD. Chunks wait in a queue of 8, the
+oldest dropped and counted; one request at a time goes to `WhisperKitCache`
+with the engine and language taken when the recording started, and while the
+queue is empty the growing chunk is recognized again about once a second for
+the unfinished line. Lines keep their raw text, and the last two minutes are
+worked out again on every change: `removingEcho` (a microphone line once hidden
+as echo stays hidden), the dictionary for meetings and `CallFeed.pickedNames`
+over the watcher's events in memory. `LiveTranscriptModel`, one per recording
+(`MeetingRecorder.liveTranscriptModel`, made as `.recording` begins), holds the
+last 200 visible lines and a state; nothing of it goes into the meeting's
+folder, and `transcript.md` is made after the stop as before. `beginStop`
+finishes it before `capture.stop()`, waiting neither for recognition nor for a
+model load; a failure of the live text stops only the live text. While it
+runs, work in another engine waits for it as it does for the dictation's held
+engine: the meeting queue, Files, the dictation's warm-up and Recognize Again.
+`LiveTranscriptPanel` (`Sources/Overlay`) is a non-activating `NSPanel` above
+other windows, on every Space and over full-screen apps, dragged by its
+background, its frame kept in `liveTranscript.panelFrame` and fitted to the
+screens attached when it shows; like the recording indicator it is no real
+window for `AppWindowController`. It shows itself as a recording with live text
+begins, its ✕ hides it for that recording only (in memory), "Show Live
+Transcript" in the menu brings it back, and the stop or the setting turned off
+hides it. A DEBUG UI test's `-LiveTranscriptProbe` fills a model with made-up
+lines.
+
 **Engines.** Parakeet TDT v3 through FluidAudio (the default) and Whisper
 through WhisperKit. `WhisperKitCache` (an actor, despite its name it serves both
 engines) keeps exactly one loaded engine per `EngineDescriptor` and serializes

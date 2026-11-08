@@ -3935,6 +3935,189 @@ final class MeetingTranscriptionTests: XCTestCase {
         }
         return await condition()
     }
+
+    // MARK: - Live transcript holds its own engine
+
+    /// A recorder with its own `LiveTranscription`, sharing the cache (and,
+    /// for `testDictationWarmUpWaitsForTheLiveTranscriptInAnotherEngine`, the
+    /// dictation instance itself — `meetingPeer` is set only by `activate`)
+    /// that the test's queue or Files already use. No audio is ever
+    /// delivered (`SavingMeetingCapture.liveAudio()` is nil by default), so
+    /// only the engine hold is ever visible, never a line.
+    private func liveRecorder(
+        settings: SettingsStore,
+        cache: WhisperKitCache,
+        models: ModelDownloader,
+        dictation: DictationCoordinator,
+        queue: MeetingTranscriptionQueue? = nil
+    ) -> MeetingRecorder {
+        let recorder = MeetingRecorder(
+            capture: SavingMeetingCapture(root: root.appendingPathComponent("LiveRecordings", isDirectory: true)),
+            indicator: RecordingIndicator(renderingEnabled: false),
+            hasMicrophoneAccess: { true },
+            permissionPromptDelay: .zero,
+            watchdogSnapshotSource: { [] },
+            beepPlayer: {},
+            liveTranscription: .init(
+                models: models,
+                cache: cache,
+                detector: { _ in LiveTranscript.Detector { _, state in (0, state) } },
+                makeEchoCanceller: { LivePassthroughCanceller() },
+                pollInterval: .milliseconds(10)
+            )
+        )
+        if let queue { recorder.transcripts = queue }
+        recorder.activate(settings: settings, permissions: PermissionManager(runningTests: true), dictation: dictation)
+        return recorder
+    }
+
+    /// `recorder.liveTranscriptEngine` is set asynchronously, right after
+    /// `startLiveTranscript`'s own preparation; waited for everywhere a test
+    /// needs the hold to already be in place.
+    private func waitForLiveEngine(_ recorder: MeetingRecorder) async throws {
+        let held = await eventually(within: .seconds(10)) { recorder.liveTranscriptEngine != nil }
+        XCTAssertTrue(held, "the live transcript never held its engine")
+    }
+
+    /// A queue job in another engine than the live transcript's waits for it
+    /// (`.waitingForEngine`) for as long as the recording goes, and runs once
+    /// it stops.
+    func testJobInAnotherEngineWaitsForTheLiveTranscript() async throws {
+        let settings = try isolatedSettings()
+        settings.dictationEngine = .parakeet
+        settings.dictationLanguage = "ru"
+        let log = EngineLog()
+        let factory = LevelEngineFactory(replies: [0.1: "кусок"], log: log)
+        let models = try installedModels()
+        let cache = WhisperKitCache(factory: factory, parakeetFactory: factory)
+        let dictation = try activatedDictation(settings, cache: cache, models: models)
+        let queue = try liveQueue(settings, models: models, cache: cache)
+        let recorder = liveRecorder(settings: settings, cache: cache, models: models, dictation: dictation, queue: queue)
+
+        recorder.toggle()
+        try await waitForDictation { recorder.state == .recording }
+        try await waitForLiveEngine(recorder)
+
+        let folder = try makeFolder(microphone: [Region(start: 1, end: 2.5, level: 0.1)], system: [])
+        queue.enqueue(folder, choice: .init(engine: .whisper, language: "en"))
+        let waiting = await eventually(within: .seconds(10)) { queue.step == .waitingForEngine }
+        XCTAssertTrue(waiting)
+
+        try await Task.sleep(for: .seconds(1))
+        XCTAssertEqual(queue.step, .waitingForEngine)
+        XCTAssertTrue(queue.isTranscribing)
+        XCTAssertEqual(Self.engineCalls(log), [])
+
+        recorder.toggle()
+        try await waitForDictation { recorder.state == .idle }
+        let done = await eventually(within: .seconds(10)) { queue.lastOutcome != nil }
+        XCTAssertTrue(done)
+        XCTAssertEqual(Self.engineCalls(log), ["whisper:en"])
+    }
+
+    /// A queue job in the live transcript's own engine never waits.
+    func testJobInTheLiveTranscriptsEngineNeverWaits() async throws {
+        let settings = try isolatedSettings()
+        settings.dictationEngine = .parakeet
+        settings.dictationLanguage = "ru"
+        let log = EngineLog()
+        let factory = LevelEngineFactory(replies: [0.1: "кусок"], log: log)
+        let models = try installedModels()
+        let cache = WhisperKitCache(factory: factory, parakeetFactory: factory)
+        let dictation = try activatedDictation(settings, cache: cache, models: models)
+        let queue = try liveQueue(settings, models: models, cache: cache)
+        let recorder = liveRecorder(settings: settings, cache: cache, models: models, dictation: dictation, queue: queue)
+
+        recorder.toggle()
+        try await waitForDictation { recorder.state == .recording }
+        try await waitForLiveEngine(recorder)
+
+        let steps = Locked<[MeetingTranscriber.Step?]>([])
+        let watched = queue.$step.sink { step in steps.set(steps.get() + [step]) }
+        defer { watched.cancel() }
+
+        let folder = try makeFolder(microphone: [Region(start: 1, end: 2.5, level: 0.1)], system: [])
+        queue.enqueue(folder, choice: .init(engine: .parakeet, language: "en"))
+        let done = await eventually(within: .seconds(10)) { queue.lastOutcome != nil }
+
+        XCTAssertTrue(done)
+        XCTAssertEqual(recorder.state, .recording)
+        XCTAssertEqual(Self.engineCalls(log), ["parakeet:en"])
+        XCTAssertFalse(steps.get().contains(.waitingForEngine), "\(steps.get())")
+
+        recorder.toggle()
+        try await waitForDictation { recorder.state == .idle }
+    }
+
+    /// A Files run in another engine than the live transcript's waits for it
+    /// the same way a meeting job does.
+    func testFilesRunInAnotherEngineWaitsForTheLiveTranscript() async throws {
+        let settings = try isolatedSettings()
+        settings.dictationEngine = .parakeet
+        settings.dictationLanguage = "ru"
+        let log = EngineLog()
+        let factory = LevelEngineFactory(replies: [0.1: "кусок"], log: log)
+        let models = try installedModels()
+        let cache = WhisperKitCache(factory: factory, parakeetFactory: factory)
+        let joint = try liveFiles(settings, cache: cache, models: models)
+        let recorder = liveRecorder(settings: settings, cache: cache, models: models, dictation: joint.dictation)
+
+        recorder.toggle()
+        try await waitForDictation { recorder.state == .recording }
+        try await waitForLiveEngine(recorder)
+
+        joint.files.select(try speechFile(levels: [0.1]))
+        joint.files.choice = .init(engine: .whisper, language: "en")
+        joint.files.start()
+        let waiting = await eventually(within: .seconds(10)) { joint.files.status == "Waiting for the engine…" }
+        XCTAssertTrue(waiting)
+        try await Task.sleep(for: .seconds(1))
+        XCTAssertEqual(joint.files.status, "Waiting for the engine…")
+        XCTAssertTrue(joint.files.isTranscribing)
+
+        recorder.toggle()
+        try await waitForDictation { recorder.state == .idle }
+        let done = await eventually(within: .seconds(10)) { !joint.files.isTranscribing }
+        XCTAssertTrue(done)
+        XCTAssertEqual(joint.files.segments.map(\.text), ["кусок"])
+    }
+
+    /// The dictation's own warm-up (after a settings change) waits for the
+    /// live transcript's engine the same way a job does.
+    func testDictationWarmUpWaitsForTheLiveTranscriptInAnotherEngine() async throws {
+        let settings = try isolatedSettings()
+        settings.dictationEngine = .parakeet
+        settings.dictationLanguage = "ru"
+        let log = EngineLog()
+        let factory = LevelEngineFactory(replies: [:], log: log)
+        let models = try installedModels()
+        let cache = WhisperKitCache(factory: factory, parakeetFactory: factory)
+        let dictation = try activatedDictation(settings, cache: cache, models: models, warmsUp: true)
+        try await warmedUp(cache, to: settings)
+        let recorder = liveRecorder(settings: settings, cache: cache, models: models, dictation: dictation)
+
+        recorder.toggle()
+        try await waitForDictation { recorder.state == .recording }
+        try await waitForLiveEngine(recorder)
+
+        settings.dictationEngine = .whisper
+        try await Task.sleep(for: .seconds(1))
+        let stillParakeet = await cache.residentDescriptorForTesting()
+        XCTAssertEqual(stillParakeet?.engine, .parakeet)
+        let whisperLoads = await factory.loadCount(SettingsStore.defaultWhisperModel)
+        XCTAssertEqual(whisperLoads, 0)
+
+        recorder.toggle()
+        try await waitForDictation { recorder.state == .idle }
+        try await warmedUp(cache, to: settings)
+    }
+}
+
+/// The seam a fake AEC crosses in the live-transcript holding tests: never
+/// asked for anything, since no audio is ever delivered.
+private final class LivePassthroughCanceller: LiveTranscript.EchoCancelling {
+    func process(microphone: [Float], reference: [Float]) throws -> [Float] { microphone }
+    func finish() throws -> [Float] { [] }
 }
 
 extension MeetingTranscriptionQueue.Job {

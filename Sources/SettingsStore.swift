@@ -94,6 +94,22 @@ final class SettingsStore: ObservableObject {
     @Published var namesFromCallWindow: Bool {
         didSet { d.set(namesFromCallWindow, forKey: K.namesFromCallWindow) }
     }
+    /// Whether a meeting recording runs `LiveTranscript` alongside the
+    /// tracks. The recorder reads this once as a recording starts, manual
+    /// and automatic alike, to decide whether to build a model at all, so
+    /// turning it off applies to the next meeting, not the one under way.
+    /// `LiveTranscriptPanel` itself follows the setting live
+    /// (`$liveTranscript`), so turning it off hides an already-shown panel
+    /// at once, and turning it back on shows it again without a new
+    /// recording.
+    @Published var liveTranscript: Bool {
+        didSet { d.set(liveTranscript, forKey: K.liveTranscript) }
+    }
+    /// The live-transcript panel's own frame, in screen points; nil until
+    /// moved or resized once, when it takes the default frame.
+    @Published var liveTranscriptPanelFrame: LiveTranscriptPanelFrame? {
+        didSet { Self.store(liveTranscriptPanelFrame, in: d, forKey: K.liveTranscriptPanelFrame) }
+    }
     @Published var systemAudioCheck: SystemAudioCheck? {
         didSet { Self.store(systemAudioCheck, in: d, forKey: K.systemAudioCheck) }
     }
@@ -179,6 +195,8 @@ final class SettingsStore: ObservableObject {
         static let meetingExcludedBundleIDs = "meeting.excludedBundleIDs"
         static let meetingAfterStop = "meeting.afterStop"
         static let namesFromCallWindow = "meeting.namesFromCallWindow"
+        static let liveTranscript = "meeting.liveTranscript"
+        static let liveTranscriptPanelFrame = "liveTranscript.panelFrame"
         static let systemAudioCheck = "permissions.systemAudioCheck"
         static let meetingsFolder = "meeting.storageFolder"
         static let meetingAudioRetention = "meeting.audioRetentionDays"
@@ -242,6 +260,8 @@ final class SettingsStore: ObservableObject {
         meetingAfterStop = d.string(forKey: K.meetingAfterStop)
             .flatMap(MeetingAfterStop.init(rawValue:)) ?? .transcribe
         namesFromCallWindow = d.object(forKey: K.namesFromCallWindow) as? Bool ?? true
+        liveTranscript = d.object(forKey: K.liveTranscript) as? Bool ?? true
+        liveTranscriptPanelFrame = Self.load(LiveTranscriptPanelFrame.self, from: d, forKey: K.liveTranscriptPanelFrame)
         systemAudioCheck = Self.load(SystemAudioCheck.self, from: d, forKey: K.systemAudioCheck)
         meetingsFolderPath = d.string(forKey: K.meetingsFolder)
         meetingAudioRetention = MeetingAudioRetention(rawValue: d.integer(forKey: K.meetingAudioRetention)) ?? .keep

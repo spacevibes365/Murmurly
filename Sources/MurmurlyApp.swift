@@ -5,6 +5,7 @@ struct MurmurlyApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var settings: SettingsStore
     @StateObject private var indicator: RecordingIndicator
+    @StateObject private var liveTranscript: LiveTranscriptPanel
     @StateObject private var dictation: DictationCoordinator
     @StateObject private var meeting: MeetingRecorder
     @StateObject private var meetingTranscripts: MeetingTranscriptionQueue
@@ -38,6 +39,8 @@ struct MurmurlyApp: App {
             transcripts: transcripts,
             models: models
         )
+        let liveTranscript = LiveTranscriptPanel(settings: settings, meeting: recorders.meeting)
+        _liveTranscript = StateObject(wrappedValue: liveTranscript)
         _models = StateObject(wrappedValue: models)
         // Here rather than in the window, so a Files run and its unsaved text
         // outlive the window.
@@ -91,8 +94,15 @@ struct MurmurlyApp: App {
             return (probe.dictation, probe.meeting)
         }
         #endif
-        let meeting = MeetingRecorder(capture: SystemAudioCapture(), indicator: indicator)
+        let meeting = MeetingRecorder(
+            capture: SystemAudioCapture(),
+            indicator: indicator,
+            liveTranscription: .init(models: models)
+        )
         meeting.transcripts = transcripts
+        #if DEBUG
+        LiveTranscriptProbe.applyIfRequested(to: meeting)
+        #endif
         return (
             DictationCoordinator(mic: MicCapture(levelMeter: levelMeter), indicator: indicator, models: models),
             meeting
@@ -112,7 +122,8 @@ struct MurmurlyApp: App {
                 settings: settings,
                 models: models,
                 updater: updater,
-                library: library
+                library: library,
+                liveTranscript: liveTranscript
             )
         } label: {
             MenuBarLabel(

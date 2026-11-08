@@ -2,6 +2,7 @@ import AppKit
 import AVFoundation
 import Combine
 import Foundation
+import WebRTCAEC3
 
 protocol MeetingCaptureBackend: Sendable {
     /// Records into `directory`, which the recorder has just made for this
@@ -13,10 +14,16 @@ protocol MeetingCaptureBackend: Sendable {
     /// (below) answers nil, so the test doubles that stand in for this
     /// protocol elsewhere keep building without knowing about this card.
     func writtenSeconds() async -> TimeInterval?
+    /// A snapshot of the live audio ring, read by the meeting's
+    /// `LiveTranscript`; nil when nothing new is there or the backend does
+    /// not keep one. The default (below) answers nil, so existing test
+    /// doubles keep building without knowing about this card.
+    func liveAudio() async -> LiveAudio?
 }
 
 extension MeetingCaptureBackend {
     func writtenSeconds() async -> TimeInterval? { nil }
+    func liveAudio() async -> LiveAudio? { nil }
 }
 
 /// Owns the production meeting flow: menu/hotkey -> system audio + microphone
@@ -99,6 +106,45 @@ final class MeetingRecorder: ObservableObject {
     }
 
     @Published private(set) var recordingWarning: RecordingWarning?
+
+    /// What the recording's own `LiveTranscript` pipeline needs; nil leaves
+    /// the feature off entirely (the quit probe's recorder, and every
+    /// existing test that does not pass one).
+    struct LiveTranscription {
+        let models: ModelDownloader
+        var cache: WhisperKitCache = .shared
+        /// Loads the VAD; called off the main actor, in a detached task.
+        var detector: @Sendable (_ vadModelPath: String) async throws -> LiveTranscript.Detector = {
+            try LiveTranscript.Detector.silero(modelPath: $0)
+        }
+        var makeEchoCanceller: @Sendable () throws -> any LiveTranscript.EchoCancelling = {
+            try EchoCanceller(sampleRate: MeetingTranscriber.sampleRate)
+        }
+        var pollInterval: Duration = .milliseconds(250)
+        var temporaryRoot: URL = FileManager.default.temporaryDirectory
+    }
+
+    /// One per recording, created right after `state` becomes `.recording`
+    /// when `settings.liveTranscript` is on, so the floating panel
+    /// (`LiveTranscriptPanel`) reads its lines from this property; nil when the
+    /// setting is off. `beginStop`
+    /// drops it before `capture.stop()`, never waiting for recognition.
+    @Published private(set) var liveTranscriptModel: LiveTranscriptModel?
+    private let liveTranscription: LiveTranscription?
+    private var liveTranscript: LiveTranscript?
+    /// The live transcript's own engine, held from before its first request
+    /// until the recording stops, so a meeting job, a Files run, the
+    /// dictation's warm-up and Recognize Again in another engine wait for
+    /// it instead of loading their model over it.
+    private(set) var liveTranscriptEngine: EngineDescriptor?
+    #if DEBUG
+    /// Fires once, at the very end of every start task — after its
+    /// (conditional) `operationTask = nil` — whatever path the task took.
+    /// The only visible sign a test has that this particular line was
+    /// reached, needed to place `beginTermination()` exactly on the race the
+    /// K1 fix (see `beginStart`) closes.
+    var startTaskFinishedForTesting: (() -> Void)?
+    #endif
     private let capture: any MeetingCaptureBackend
     private let hasMicrophoneAccess: @MainActor @Sendable () -> Bool
     private let permissionPromptDelay: Duration
@@ -123,6 +169,7 @@ final class MeetingRecorder: ObservableObject {
             // The dictation as `activate` hands it over, whichever comes first.
             transcripts?.heldByDictation = { [weak self] in self?.dictation?.heldEngine() }
             transcripts?.prepareDictationEngine = { [weak self] in self?.dictation?.prepareAfterOtherEngineJob() }
+            transcripts?.heldByLiveTranscript = { [weak self] in self?.liveTranscriptEngine }
         }
     }
     private var activated = false
@@ -157,7 +204,8 @@ final class MeetingRecorder: ObservableObject {
         ) async -> MeetingPageSnapshot = { holders, pin in
             await MeetingPageReader.readLive(holders: holders, pin: pin)
         },
-        callFeedInterval: Duration = .milliseconds(300)
+        callFeedInterval: Duration = .milliseconds(300),
+        liveTranscription: LiveTranscription? = nil
     ) {
         self.capture = capture
         self.indicator = indicator
@@ -170,6 +218,7 @@ final class MeetingRecorder: ObservableObject {
         self.holderSource = holderSource
         self.pageSnapshotSource = pageSnapshotSource
         self.callFeedInterval = callFeedInterval
+        self.liveTranscription = liveTranscription
     }
 
     var isBusy: Bool { state.isBusy }
@@ -319,6 +368,12 @@ final class MeetingRecorder: ObservableObject {
                     return
                 }
                 self.state = .recording
+                // Right after `state` becomes `.recording`: a new instance
+                // per recording, so a late result from a stopped meeting's
+                // pipeline can never land in the next one's lines (nothing
+                // outlives the recorder's own reference to it).
+                self.liveTranscriptModel = self.settings?.liveTranscript == true
+                    ? LiveTranscriptModel() : nil
                 self.currentSession?.startedAt = startedAt
                 self.playBeepIfEnabled()
                 self.indicator.setBase(.recordingMeeting(
@@ -354,6 +409,9 @@ final class MeetingRecorder: ObservableObject {
                     self.callFeedWatcher = watcher
                     await watcher.start()
                 }
+                if let model = self.liveTranscriptModel {
+                    await self.startLiveTranscript(model: model, in: directory)
+                }
             } catch is CancellationError {
                 _ = try? await self.capture.stop()
                 self.state = .idle
@@ -375,8 +433,15 @@ final class MeetingRecorder: ObservableObject {
                 self.indicator.finish(with: .meetingFailure(message: error.localizedDescription))
                 AppLog.error("meeting", "start failed: \(error.localizedDescription)")
             }
-            self.operationTask = nil
+            // A cancelled task here has already been replaced by `beginStop`
+            // (or quit): nilling the property would throw away that running
+            // stop, and `finishForTermination`'s own local copy of it would
+            // then be the only thing left waiting for the save (K1).
+            if !Task.isCancelled { self.operationTask = nil }
             if trigger == nil { AppWindowController.windowDidClose() }
+            #if DEBUG
+            self.startTaskFinishedForTesting?()
+            #endif
         }
         return true
     }
@@ -387,6 +452,11 @@ final class MeetingRecorder: ObservableObject {
     private func beginStop(atLimit: Bool = false) {
         guard state == .recording else { return }
         state = .stopping
+        liveTranscriptModel = nil
+        // Synchronous, before the task: whoever reaches here owns ending the
+        // pipeline, and `finish()` never waits for a request or a model load
+        // — a hung engine must never hold up the stop.
+        let live = takeLiveTranscript()
         // Before the save is awaited, so a call that starts meanwhile is not
         // banned together with the one being stopped.
         watchdog?.recordingWillStop()
@@ -406,6 +476,7 @@ final class MeetingRecorder: ObservableObject {
                 self.watchdog?.recordingDidEnd()
                 self.operationTask = nil
             }
+            await live?.finish()
             // Before `capture.stop()` writes `metadata.json`: a watcher
             // still appending while the folder is read or moved would make
             // the copy disagree with the original.
@@ -468,6 +539,11 @@ final class MeetingRecorder: ObservableObject {
 
     private func stopCancelledStart() async {
         // Required here too even though the start sequence never reaches
+        // this path with a live transcript already running (it is created
+        // only after a start that was not cancelled): a later change to that
+        // order must not silently leave one going.
+        await takeLiveTranscript()?.finish()
+        // Required here too even though the start sequence never reaches
         // this path with a watcher already running (it is started only
         // after a start that was not cancelled): a later change to that
         // order must not silently reopen the feed.
@@ -483,6 +559,87 @@ final class MeetingRecorder: ObservableObject {
                 directory: (error as? SystemAudioCaptureError)?.savedDirectory,
                 reason: error.localizedDescription
             )
+        }
+    }
+
+    // MARK: - Live transcript
+
+    /// Takes the recording's `LiveTranscript`, clearing the hold in the same
+    /// synchronous step: whoever calls this now owns ending it.
+    private func takeLiveTranscript() -> LiveTranscript? {
+        defer {
+            liveTranscript = nil
+            liveTranscriptEngine = nil
+        }
+        return liveTranscript
+    }
+
+    /// Builds the recording's `LiveTranscript` pipeline, reading
+    /// `capture.liveAudio()` as its source, beside `CallFeedWatcher`. The
+    /// VAD and the personal dictionary are prepared off the main actor; a
+    /// stop (or a cancelled start) may finish the recording while that is
+    /// still going, through `beginStop`/`stopCancelledStart` cancelling this
+    /// very task via `operationTask` — checked again here, on the main
+    /// actor, with no `await` in between, right before the pipeline and the
+    /// engine hold are kept. A failure here never changes the recording's
+    /// own state or folder, and nothing of it reaches disk: chunks are
+    /// written to `temporaryRoot` and removed as they are recognized.
+    private func startLiveTranscript(model: LiveTranscriptModel, in directory: URL) async {
+        guard let config = liveTranscription, let settings else { return }
+        let snapshot = settings.snapshot
+        guard config.models.missing(snapshot.dictationEngine).isEmpty else {
+            model.reportBeforeRecognition(.noModel)
+            return
+        }
+        guard let engine = try? MeetingTranscriber.Engine.forMeeting(snapshot) else { return }
+        let dictionary: DictionarySnapshot = {
+            var dictionarySnapshot = settings.dictionarySnapshot
+            dictionarySnapshot.matchesWordForms = DictionarySnapshot.matchesWordForms(
+                engine: snapshot.dictationEngine, language: snapshot.dictationLanguage
+            )
+            return dictionarySnapshot
+        }()
+        let vadPath = config.models.root.appendingPathComponent(ModelSource.vad.destination).path
+        let makeDetector = config.detector
+        let prepared: Result<(LiveTranscript.Detector, DictionaryReplacer?), any Error> =
+            await Task.detached(priority: .userInitiated) {
+                do {
+                    let detector = try await makeDetector(vadPath)
+                    return .success((detector, dictionary.replacer(for: .meetings)))
+                } catch {
+                    return .failure(error)
+                }
+            }.value
+
+        guard !Task.isCancelled, state == .recording, currentSession?.directory == directory,
+              liveTranscript == nil else { return }
+
+        switch prepared {
+        case let .failure(error):
+            AppLog.error("live-transcript", "not started: \(error.localizedDescription)")
+            model.reportBeforeRecognition(.stopped(error.localizedDescription))
+        case let .success((detector, replacer)):
+            let capture = self.capture
+            let watcher = callFeedWatcher
+            let live = LiveTranscript(
+                source: { await capture.liveAudio() },
+                detector: detector,
+                makeEchoCanceller: config.makeEchoCanceller,
+                pollInterval: config.pollInterval,
+                recognition: .init(
+                    cache: config.cache,
+                    engine: engine,
+                    modelMissing: { false },
+                    dictionaryReplacer: replacer,
+                    callFeedEvents: { [weak watcher] in await watcher?.events() ?? [] },
+                    model: model,
+                    temporaryRoot: config.temporaryRoot
+                )
+            )
+            liveTranscript = live
+            liveTranscriptEngine = engine.descriptor
+            AppLog.info("live-transcript", "started engine=\(engine.descriptor.engine.rawValue)")
+            await live.start()
         }
     }
 
@@ -632,5 +789,14 @@ final class MeetingRecorder: ObservableObject {
 
     #if DEBUG
     func tickWatchdogForTesting(now: Date) { watchdog?.tick(now: now) }
+
+    /// `LiveTranscriptProbe` (`-UITesting -LiveTranscriptProbe`): fakes
+    /// `.recording` with a model already carrying made-up lines, without a
+    /// capture or an engine, so `LiveTranscriptPanelUITests` has something
+    /// to show.
+    func publishLiveTranscriptForTesting(state: State, model: LiveTranscriptModel?) {
+        self.state = state
+        self.liveTranscriptModel = model
+    }
     #endif
 }

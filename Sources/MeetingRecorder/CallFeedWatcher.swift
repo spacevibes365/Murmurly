@@ -8,10 +8,12 @@ import Foundation
 /// `beginStop`, before `capture.stop()` writes `metadata.json`.
 actor CallFeedWatcher {
     /// One read of the call page. `skipped`: the microphone holders could
-    /// not be read, so this read says nothing at all — no line, no state
-    /// change, not even the clock. Only reachable before a pin is set: once
-    /// pinned, an unreadable holder list must not stop the pinned page from
-    /// being read (`MeetingRecorder.feedSource`).
+    /// not be read (only reachable before a pin is set — once pinned, an
+    /// unreadable holder list must not stop the pinned page from being read,
+    /// `MeetingRecorder.feedSource`), or a hidden-window scan was
+    /// deliberately not run this time (`MeetingPageSnapshot.deferred`,
+    /// reachable with a pin too). Either way this read says nothing at all —
+    /// no line, no state change, not even the clock.
     enum Read: Sendable {
         case skipped
         case notFound
@@ -47,6 +49,25 @@ actor CallFeedWatcher {
     private(set) var snapshotCount = 0
     private(set) var changeCount = 0
     private(set) var skippedCount = 0
+    /// Every line this watcher has written, in memory, in file order — for
+    /// `LiveTranscript`'s names, which must never reopen the feed file or
+    /// poll the page a second time while the meeting records.
+    private var writtenEvents: [CallFeed.Event] = []
+    /// How many found reads were off screen: answers whether the service
+    /// still updates a page on another desktop at all.
+    private(set) var offscreenReadCount = 0
+    /// How many times the highlight (`speaking`) changed between two
+    /// consecutive off-screen reads: if the service froze the page, this
+    /// stays 0 even while `offscreenReadCount` grows. A change that happens
+    /// while the page is on screen, between two off-screen reads, is never
+    /// counted here (K3) — that would wrongly suggest the service keeps
+    /// updating a page it cannot see.
+    private(set) var offscreenHighlightChanges = 0
+    /// The `speaking` set of the last *found* read, on screen or not, and
+    /// whether that read was off screen — kept so the comparison above
+    /// always uses two reads that were actually both off screen.
+    private var lastFoundSpeaking: Set<String>?
+    private var lastFoundWasOffscreen = false
 
     init(
         directory: URL,
@@ -69,16 +90,19 @@ actor CallFeedWatcher {
     /// `nonisolated`: touches no actor state, so the recorder's closure can
     /// call it before this actor is ever involved.
     nonisolated static func read(from snapshot: MeetingPageSnapshot) -> Read {
-        guard snapshot.found else { return .notFound }
+        guard snapshot.found else { return snapshot.deferred ? .skipped : .notFound }
         let event = CallFeed.Event(
             t: 0, service: snapshot.service, visible: snapshot.visible,
             ownName: snapshot.selfName.isEmpty ? nil : snapshot.selfName,
             selfSpeaking: snapshot.selfSpeaking, people: snapshot.people, speaking: snapshot.speaking,
-            selfVisible: snapshot.selfVisible
+            selfVisible: snapshot.selfVisible, offscreen: snapshot.offscreen
         )
         return .found(
             event,
-            MeetingPageReader.Pin(service: snapshot.service, app: snapshot.app, meeting: snapshot.meeting)
+            MeetingPageReader.Pin(
+                service: snapshot.service, app: snapshot.app, meeting: snapshot.meeting,
+                remoteWindow: snapshot.remoteWindow
+            )
         )
     }
 
@@ -100,12 +124,14 @@ actor CallFeedWatcher {
             let read = await snapshotSource(pin)
             switch read {
             case .skipped:
-                // The microphone holders could not be read: this read says
-                // nothing at all, not even the clock. Only possible before a
-                // pin is set — once pinned, `snapshotSource` never answers
-                // `.skipped` (see `MeetingRecorder.feedSource`), so an
-                // unreadable holder list never stops the pinned page being
-                // read.
+                // This read says nothing at all, not even the clock: either
+                // the microphone holders could not be read (only possible
+                // before a pin is set — once pinned, an unreadable holder
+                // list never stops the pinned page being read, see
+                // `MeetingRecorder.feedSource`), or a hidden-window scan was
+                // deliberately skipped or cut short by its own deadline
+                // (`MeetingPageSnapshot.deferred`), which happens with or
+                // without a pin.
                 skippedCount += 1
             case .notFound:
                 // Right after the snapshot answers, not before it: a slow
@@ -116,13 +142,28 @@ actor CallFeedWatcher {
             case let .found(event, foundPin):
                 let seconds = await writtenSeconds()
                 handle(event, writtenSeconds: seconds)
+                let speaking = Set(event.speaking)
+                if event.offscreen {
+                    offscreenReadCount += 1
+                    if lastFoundWasOffscreen, lastFoundSpeaking != speaking { offscreenHighlightChanges += 1 }
+                }
+                lastFoundSpeaking = speaking
+                lastFoundWasOffscreen = event.offscreen
                 // After `handle`, not before: the pin's effect on what is
                 // read starts with the next poll either way. Only a
                 // confirmed find (a tile actually seen) sets the pin: the
                 // reader itself already refuses to pin an empty or
                 // ambiguous area (2), and this is the watcher's own second
-                // guard against pinning one anyway.
-                if pin == nil, event.visible { pin = foundPin }
+                // guard against pinning one anyway. Once pinned, a later
+                // found read under the same pin still carries the reader's
+                // own remembered window forward — nil once the meeting is
+                // back on the public list — so the next read can reopen it
+                // without scanning again.
+                if pin == nil, event.visible {
+                    pin = foundPin
+                } else if pin != nil {
+                    pin?.remoteWindow = foundPin.remoteWindow
+                }
             }
             guard !closed else { return }
             try? await Task.sleep(for: interval)
@@ -162,9 +203,20 @@ actor CallFeedWatcher {
         write(event)
     }
 
+    /// The events accepted so far, in order, `finish()`'s own closing line
+    /// included once it has run. Matches the file on disk only while every
+    /// write has succeeded; once the file fails to open or a write fails,
+    /// this keeps growing on its own (K2) — it is the one list `LiveTranscript`
+    /// reads, never the file.
+    func events() -> [CallFeed.Event] { writtenEvents }
+
     private func write(_ event: CallFeed.Event) {
         guard !isUnchanged(from: event) else { return }
         lastEvent = event
+        // Kept in memory even when the file never opens or a write fails:
+        // `LiveTranscript`'s names must live as long as this watcher sees
+        // the page, whatever the disk is doing.
+        writtenEvents.append(event)
         guard !openFailed else { return }
         if fileHandle == nil {
             guard let handle = Self.openForAppending(directory.appendingPathComponent(CallFeed.fileName)) else {
@@ -226,7 +278,8 @@ actor CallFeedWatcher {
         AppLog.info(
             "meeting",
             "call feed watcher finished; snapshots: \(snapshotCount), changes: \(changeCount), "
-                + "skipped: \(skippedCount), page found: \(everFound ? "yes" : "no")"
+                + "skipped: \(skippedCount), page found: \(everFound ? "yes" : "no"), "
+                + "offscreen reads: \(offscreenReadCount), highlight changes while offscreen: \(offscreenHighlightChanges)"
         )
     }
 

@@ -311,6 +311,27 @@ private actor PinRecorder {
     }
 }
 
+/// A plain lock-guarded counter whose `increment()` hands back the value
+/// after incrementing, so a caller can both advance and index off it in one
+/// call.
+private final class LockedCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = 0
+
+    func increment() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        value += 1
+        return value
+    }
+
+    var count: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+}
+
 @MainActor
 final class CallFeedWatcherTests: XCTestCase {
     private var root: URL!
@@ -1280,6 +1301,104 @@ final class CallFeedWatcherTests: XCTestCase {
             pins[2], confirmedPin,
             "the pin must be the confirmed meeting, never the empty one read first"
         )
+    }
+
+    /// K3 of the other-desktop card: a highlight change that happens while
+    /// the page IS on screen, sandwiched between two off-screen reads, must
+    /// never count toward `offscreenHighlightChanges` — a service that
+    /// freezes a page it cannot see would otherwise look as if it kept
+    /// updating it.
+    func testOnScreenHighlightChangeBetweenOffscreenReadsIsNotCounted() async throws {
+        let pin = MeetingPageReader.Pin(
+            service: "telemost", app: "com.google.Chrome",
+            meeting: .page(address: "https://telemost.yandex.ru/private-join/abc123")
+        )
+        func event(speaking: [String], offscreen: Bool) -> CallFeed.Event {
+            CallFeed.Event(
+                t: 0, service: "telemost", visible: true, ownName: nil, selfSpeaking: false,
+                people: ["Арина Веткина", "Борис Луков"], speaking: speaking, offscreen: offscreen
+            )
+        }
+        let reads: [CallFeedWatcher.Read] = [
+            .found(event(speaking: ["Арина Веткина"], offscreen: true), pin),
+            .found(event(speaking: ["Борис Луков"], offscreen: false), pin),
+            .found(event(speaking: ["Борис Луков"], offscreen: true), pin),
+        ]
+        // A plain lock-guarded counter, not `PinRecorder`: `isEnabled` is a
+        // synchronous closure and must stop the loop itself, right after the
+        // script's last read, so the watcher never repeats that last
+        // (off-screen) read an unpredictable number of times and inflates
+        // `offscreenReadCount` beyond what this test can name exactly.
+        let served = LockedCounter()
+        let watcher = CallFeedWatcher(
+            directory: root,
+            snapshotSource: { _ in
+                let index = served.increment() - 1
+                return reads[min(index, reads.count - 1)]
+            },
+            writtenSeconds: { 0 },
+            isEnabled: { served.count < reads.count },
+            interval: .milliseconds(10)
+        )
+        await watcher.start()
+        var settled = false
+        for _ in 0..<500 {
+            if served.count >= reads.count { settled = true; break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertTrue(settled, "condition never became true")
+        await watcher.finish()
+
+        let offscreenReadCount = await watcher.offscreenReadCount
+        let offscreenHighlightChanges = await watcher.offscreenHighlightChanges
+        XCTAssertEqual(offscreenReadCount, 2)
+        XCTAssertEqual(
+            offscreenHighlightChanges, 0,
+            "the on-screen read in between must not make this look like a change seen while off screen"
+        )
+    }
+
+    // MARK: - K2 (the live-transcript card): events() outlives a feed file that never opens
+
+    /// The feed's directory has no parent on disk, so every write fails to
+    /// open the file (`O_CREAT` itself fails with `ENOENT`): `events()` must
+    /// still hand back what was found, for `LiveTranscript`'s names — this
+    /// watcher must never stop remembering events in memory just because the
+    /// disk write failed.
+    func testEventsStayInMemoryEvenWhenTheFeedFileCannotBeOpened() async throws {
+        let unopenable = root.appendingPathComponent("missing-parent", isDirectory: true)
+            .appendingPathComponent("nested", isDirectory: true)
+        let event = CallFeed.Event(
+            t: 0, service: "telemost", visible: true, ownName: "Я", selfSpeaking: false,
+            people: ["Гость Один"], speaking: ["Гость Один"]
+        )
+        let pin = MeetingPageReader.Pin(service: "telemost", app: "com.google.Chrome", meeting: nil)
+        let served = LockedCounter()
+        let watcher = CallFeedWatcher(
+            directory: unopenable,
+            snapshotSource: { _ in
+                _ = served.increment()
+                return .found(event, pin)
+            },
+            writtenSeconds: { 0 },
+            isEnabled: { served.count < 3 },
+            interval: .milliseconds(10)
+        )
+        await watcher.start()
+        var settled = false
+        for _ in 0..<500 {
+            if served.count >= 3 { settled = true; break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertTrue(settled, "condition never became true")
+        await watcher.finish()
+
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: unopenable.appendingPathComponent(CallFeed.fileName).path)
+        )
+        let events = await watcher.events()
+        XCTAssertFalse(events.isEmpty, "events must be kept in memory even though the feed file never opened")
+        XCTAssertEqual(events.first?.people, ["Гость Один"])
     }
 }
 
