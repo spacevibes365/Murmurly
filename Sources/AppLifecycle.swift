@@ -28,7 +28,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case fileTranscription
         case unsavedFileText
         /// A meeting's name, star or speakers' names the user set, still
-        /// being written to a folder that is not on this Mac.
+        /// being written to a folder that is not on this Mac; or a
+        /// notepad note that was refused or failed to write
+        /// (`MeetingLibrary.noteFailures`).
         case unsavedMeetingMark
         /// A meeting's transcript being written to the file the user chose.
         case transcriptFile
@@ -322,9 +324,13 @@ private final class SingleAnswer: @unchecked Sendable {
 @MainActor
 enum AppWindowController {
     /// A "real" app window = a normal, becomes-main window. Excludes the indicator
-    /// (`NonKeyPanel`/`NSPanel`, `canBecomeMain == false`) and transient panels.
+    /// (`NonKeyPanel`/`NSPanel`, `canBecomeMain == false`) and transient panels, and
+    /// excludes the notepad (`NotepadNSWindow`, itself an `NSPanel`) by its type too,
+    /// not only by `canBecomeMain == false`: the notepad never brings a Dock icon,
+    /// and excluding it by type keeps that true even if a later change ever let
+    /// it become main.
     static func isRealWindow(_ window: NSWindow) -> Bool {
-        !(window is NSPanel) && window.canBecomeMain
+        !(window is NSPanel) && !(window is NotepadNSWindow) && window.canBecomeMain
     }
 
     static func visibleRealWindowCount(in windows: [NSWindow]) -> Int {

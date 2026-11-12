@@ -125,11 +125,45 @@ final class MeetingRecorder: ObservableObject {
     }
 
     /// One per recording, created right after `state` becomes `.recording`
-    /// when `settings.liveTranscript` is on, so the floating panel
+    /// when `settings.liveTranscript` is on, so the notepad window
     /// (`LiveTranscriptPanel`) reads its lines from this property; nil when the
-    /// setting is off. `beginStop`
-    /// drops it before `capture.stop()`, never waiting for recognition.
+    /// setting is off. `beginStop` first snapshots its lines into
+    /// `stoppedLiveTranscript` (`keepLiveTranscriptForNotepad`), then drops
+    /// this before `capture.stop()`, never waiting for recognition.
     @Published private(set) var liveTranscriptModel: LiveTranscriptModel?
+
+    /// The live transcript as it stood when its recording stopped, for the
+    /// notepad (`LiveTranscriptPanel`), which stays on that meeting until
+    /// closed or a new recording begins. In memory only; replaced by the
+    /// next stop with live text.
+    struct StoppedLiveTranscript: Equatable, Sendable {
+        let lines: [LiveLine]
+        let directory: URL
+        let identity: FolderIdentity?
+        let startedAt: Date?
+        var outcome: Outcome = .saving
+
+        enum Outcome: Equatable, Sendable {
+            case saving
+            case saved(warning: Bool)
+            case failed(String)
+        }
+    }
+
+    @Published private(set) var stoppedLiveTranscript: StoppedLiveTranscript?
+
+    /// The notepad's one way into the app beyond this recorder: the library
+    /// its "Open in Murmurly" and a click on a time go through. Set by the
+    /// menu bar label, which alone holds the library, before `activate`;
+    /// nil until then (tests, the quit probe). Weak: the notepad does not
+    /// need to keep the library alive, and a strong reference here would
+    /// cycle with it.
+    struct NotepadLinks {
+        weak var library: MeetingLibrary?
+    }
+
+    @Published var notepadLinks: NotepadLinks?
+
     private let liveTranscription: LiveTranscription?
     private var liveTranscript: LiveTranscript?
     /// The live transcript's own engine, held from before its first request
@@ -451,6 +485,12 @@ final class MeetingRecorder: ObservableObject {
     /// limit says nothing about them.
     private func beginStop(atLimit: Bool = false) {
         guard state == .recording else { return }
+        // First: before `state` leaves `.recording` and before
+        // `liveTranscriptModel` is dropped below, both of which `@Published`
+        // publish in `willSet` — the notepad's `CombineLatest4` must never
+        // see a stop with the snapshot not yet in place.
+        keepLiveTranscriptForNotepad()
+        let sessionDirectory = currentSession?.directory
         state = .stopping
         liveTranscriptModel = nil
         // Synchronous, before the task: whoever reaches here owns ending the
@@ -502,6 +542,9 @@ final class MeetingRecorder: ObservableObject {
                     self.recordingWarning = RecordingWarning(directory: directory, issues: issues)
                 }
                 self.state = .idle
+                if self.stoppedLiveTranscript?.directory == sessionDirectory {
+                    self.stoppedLiveTranscript?.outcome = .saved(warning: !issues.isEmpty)
+                }
                 if let directory { self.offerToQueue(directory) }
                 self.playBeepIfEnabled()
                 let terminalState: IndicatorState = metadata?.state == "suspect" || atLimit
@@ -510,14 +553,24 @@ final class MeetingRecorder: ObservableObject {
                 self.indicator.finish(with: terminalState)
                 AppLog.info("meeting", "stopped; tracks: \(tracks.map(\.lastPathComponent))")
             } catch is CancellationError {
-                self.stopEvidence = .failed(directory: nil, reason: String(localized: "stop cancelled"))
+                let reason = String(localized: "stop cancelled")
+                self.stopEvidence = .failed(directory: nil, reason: reason)
                 self.state = .idle
+                if self.stoppedLiveTranscript?.directory == sessionDirectory {
+                    self.stoppedLiveTranscript?.outcome = .failed(reason)
+                }
                 self.indicator.clearBase()
             } catch {
                 self.stopEvidence = .failed(
                     directory: (error as? SystemAudioCaptureError)?.savedDirectory,
                     reason: error.localizedDescription
                 )
+                if self.stoppedLiveTranscript?.directory == sessionDirectory {
+                    let savedDirectory = (error as? SystemAudioCaptureError)?.savedDirectory
+                    self.stoppedLiveTranscript?.outcome = savedDirectory != nil
+                        ? .saved(warning: true)
+                        : .failed(error.localizedDescription)
+                }
                 if let captureError = error as? SystemAudioCaptureError,
                    let savedDirectory = captureError.savedDirectory {
                     self.lastRecordingDirectory = savedDirectory
@@ -572,6 +625,21 @@ final class MeetingRecorder: ObservableObject {
             liveTranscriptEngine = nil
         }
         return liveTranscript
+    }
+
+    /// Snapshots the live transcript's lines into `stoppedLiveTranscript`,
+    /// so the notepad (`LiveTranscriptPanel`) stays on this meeting once
+    /// `liveTranscriptModel` is cleared. Called synchronously, before
+    /// `state` leaves `.recording`: a late result from the pipeline after
+    /// this point never reaches the notepad.
+    private func keepLiveTranscriptForNotepad() {
+        guard let model = liveTranscriptModel, let session = currentSession else { return }
+        stoppedLiveTranscript = StoppedLiveTranscript(
+            lines: model.lines,
+            directory: session.directory,
+            identity: session.identity,
+            startedAt: session.startedAt
+        )
     }
 
     /// Builds the recording's `LiveTranscript` pipeline, reading
@@ -787,6 +855,24 @@ final class MeetingRecorder: ObservableObject {
         beepPlayer()
     }
 
+    /// Seconds of the recording under way, by the tracks' own clock (the
+    /// capture's `writtenSeconds`); nil unless recording.
+    func recordingSeconds() async -> Double? {
+        guard state == .recording else { return nil }
+        #if DEBUG
+        if let recordingSecondsForTesting { return recordingSecondsForTesting }
+        #endif
+        let capture = self.capture
+        return await capture.writtenSeconds()
+    }
+
+    #if DEBUG
+    /// `LiveTranscriptProbe`: there is no real capture behind a faked
+    /// `.recording`, so `capture.writtenSeconds()` would hang; this stands in
+    /// for the clock the moment-marking path reads.
+    var recordingSecondsForTesting: Double?
+    #endif
+
     #if DEBUG
     func tickWatchdogForTesting(now: Date) { watchdog?.tick(now: now) }
 
@@ -794,9 +880,23 @@ final class MeetingRecorder: ObservableObject {
     /// `.recording` with a model already carrying made-up lines, without a
     /// capture or an engine, so `LiveTranscriptPanelUITests` has something
     /// to show.
-    func publishLiveTranscriptForTesting(state: State, model: LiveTranscriptModel?) {
+    func publishLiveTranscriptForTesting(state: State, model: LiveTranscriptModel?, directory: URL? = nil) {
         self.state = state
         self.liveTranscriptModel = model
+        if let directory {
+            currentSession = Session(directory: directory, startedAt: Date(), trigger: nil)
+        }
+    }
+
+    /// For `NotepadWindowTests`/`NotepadProbe`: snapshots the current model
+    /// as `beginStop` would, then clears the recording as `stopFromWatchdog`
+    /// would — without a capture or an engine.
+    func stopLiveTranscriptForTesting(outcome: StoppedLiveTranscript.Outcome = .saved(warning: false)) {
+        keepLiveTranscriptForNotepad()
+        stoppedLiveTranscript?.outcome = outcome
+        state = .idle
+        liveTranscriptModel = nil
+        currentSession = nil
     }
     #endif
 }

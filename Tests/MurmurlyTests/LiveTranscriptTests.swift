@@ -239,7 +239,7 @@ private struct LiveGatedEngineFactory: WhisperEngineFactory {
 
 /// Replies in a fixed script, one entry per call, and records the language
 /// each request actually asked for — so a test can tell whether a chunk with
-/// no recognizable words fixed Whisper's "auto" language (it must not, K2).
+/// no recognizable words fixed Whisper's "auto" language (it must not).
 private actor LiveScriptedLanguageEngine: WhisperEngine {
     struct Reply { let text: String; let language: String }
     private let replies: [Reply]
@@ -331,7 +331,7 @@ private final class LinesObserver {
 
 /// Always throws the same, fixed error — never recognized text — so a test
 /// can check that error's own `localizedDescription` reaches `.stopped`
-/// unchanged, after three requests in a row fail (K1).
+/// unchanged, after three requests in a row fail.
 private struct LiveChunkFailure: LocalizedError {
     var errorDescription: String? { "live chunk request failed on purpose" }
 }
@@ -1127,7 +1127,8 @@ final class LiveTranscriptTests: XCTestCase {
         language: String? = "en",
         windowSeconds: Double = 120,
         temporaryRoot: URL = FileManager.default.temporaryDirectory,
-        interimSeconds: Double? = nil
+        interimSeconds: Double? = nil,
+        lineLimit: Int = LiveTranscriptModel.maximumLines
     ) async -> (recognition: LiveTranscript.Recognition, model: LiveTranscriptModel) {
         let model = await MainActor.run { LiveTranscriptModel() }
         let cache = WhisperKitCache(factory: factory)
@@ -1139,7 +1140,8 @@ final class LiveTranscriptTests: XCTestCase {
         let recognition = LiveTranscript.Recognition(
             cache: cache, engine: engine, modelMissing: modelMissing,
             dictionaryReplacer: dictionaryReplacer, callFeedEvents: feed, model: model,
-            temporaryRoot: temporaryRoot, windowSeconds: windowSeconds, interimSeconds: interimSeconds
+            temporaryRoot: temporaryRoot, windowSeconds: windowSeconds, interimSeconds: interimSeconds,
+            lineLimit: lineLimit
         )
         return (recognition, model)
     }
@@ -1456,7 +1458,7 @@ final class LiveTranscriptTests: XCTestCase {
         await transcript.finish()
     }
 
-    // MARK: - K1. A hidden echo line stays hidden after it leaves the window
+    // MARK: - A hidden echo line stays hidden after it leaves the window
 
     func testHiddenEchoLineStaysHiddenAfterItLeavesTheWindow() async throws {
         let (mic, system) = padded(
@@ -1504,7 +1506,7 @@ final class LiveTranscriptTests: XCTestCase {
         )
     }
 
-    // MARK: - K2. Whisper's auto language is not fixed by an empty chunk
+    // MARK: - Whisper's auto language is not fixed by an empty chunk
 
     func testWhisperAutoLanguageIsNotFixedByEmptyChunk() async throws {
         var pattern: [(speech: Bool, blocks: Int, amplitude: Float)] = []
@@ -1541,7 +1543,7 @@ final class LiveTranscriptTests: XCTestCase {
         XCTAssertEqual(seen[2], "de", "the first chunk that actually produced a line must fix it")
     }
 
-    // MARK: - K1 (review round 2). Three failures in a row stop with the last error's own text
+    // MARK: - Three failures in a row stop with the last error's own text
 
     func testThreeFailuresInARowStopWithTheLastErrorsOwnText() async throws {
         var pattern: [(speech: Bool, blocks: Int, amplitude: Float)] = []
@@ -1578,7 +1580,7 @@ final class LiveTranscriptTests: XCTestCase {
         XCTAssertTrue(linesAfterStop.isEmpty, "a never-recognized chunk must never produce a line")
     }
 
-    // MARK: - K3 (review round 2). Nothing publishes into the model after finish(), including mid-load
+    // MARK: - Nothing publishes into the model after finish(), including mid-load
 
     func testFinishDuringModelLoadPublishesNothingAfterwardOnceTheLoadCompletes() async throws {
         let gate = LiveGate()
@@ -1624,7 +1626,7 @@ final class LiveTranscriptTests: XCTestCase {
         }
     }
 
-    // MARK: - K4 (review round 2). The chunk's temporary file is removed after a request and after a cancelled one
+    // MARK: - The chunk's temporary file is removed after a request and after a cancelled one
 
     func testTempChunkDirectoryIsRemovedAfterARequest() async throws {
         let workRoot = FileManager.default.temporaryDirectory
@@ -1702,7 +1704,7 @@ final class LiveTranscriptTests: XCTestCase {
         XCTAssertTrue(cleaned, "the chunk's temporary directory must be removed even for a request cancelled mid-flight")
     }
 
-    // MARK: - K4 (review round 2). Names through the real CallFeedWatcher, not a fake array
+    // MARK: - Names through the real CallFeedWatcher, not a fake array
 
     func testRealCallFeedWatcherNamesASystemLine() async throws {
         let feedDirectory = FileManager.default.temporaryDirectory
@@ -1755,7 +1757,7 @@ final class LiveTranscriptTests: XCTestCase {
         XCTAssertEqual(line.name, "Аня", "the name must come from the real watcher's own events(), not a fake array")
     }
 
-    // MARK: - K4 (review round 2). A trailing closing line never un-names an earlier, already-ended line
+    // MARK: - A trailing closing line never un-names an earlier, already-ended line
 
     func testClosingFeedLineDoesNotUnnameAnEarlierSystemLine() async throws {
         let feed = FeedBox([
@@ -1814,7 +1816,7 @@ final class LiveTranscriptTests: XCTestCase {
         )
     }
 
-    // MARK: - K1 (review round 3). A visible line past the window and echo margin stays under the line cap
+    // MARK: - A visible line past the window and echo margin stays under the line cap
 
     func testEarlyVisibleLineStaysUntilTheLineCapIsReached() async throws {
         let earlySystem = amplitudeSignal(pattern: [(true, 6, 0.3), (false, 2, 0)], seed: 271)
@@ -1842,8 +1844,8 @@ final class LiveTranscriptTests: XCTestCase {
 
         // Nine unrelated filler chunks of about 2 s each push the window more
         // than `windowSeconds + maximumChunkSeconds` (17 s) past the early
-        // line's own end — well under the model's 200-line cap, so K1 must
-        // keep the early line rather than dropping it for being out of the
+        // line's own end — well under the model's own line cap, so the early
+        // line must be kept rather than dropped for being out of the
         // recompute window alone.
         var frame = Int64(paddedEarlySystem.count)
         for (index, seed) in Array(280..<289).enumerated() {
@@ -1870,13 +1872,18 @@ final class LiveTranscriptTests: XCTestCase {
         XCTAssertEqual(lines.count, 10, "the early line plus the nine fillers, none dropped")
     }
 
-    // MARK: - K1 (review round 3). Five hundred chunks keep exactly the model's own cap of lines
+    // MARK: - Five hundred chunks keep exactly the pipeline's own line cap
 
+    /// A `lineLimit` override of 200, not the model's real 5000: 500 chunks
+    /// at the real cap would need thousands of chunks and minutes to prove
+    /// anything. The cap itself, and the cut-start flag it sets, are the
+    /// recompute pipeline's own behaviour — this is the seam that exercises
+    /// it, not a test of the production constant.
     func testFiveHundredChunksKeepExactlyTheLineCap() async throws {
         let chunkPattern: [(speech: Bool, blocks: Int, amplitude: Float)] = [(true, 2, 0.6), (false, 2, 0)]
         let source = QueueSource()
         let (recognition, model) = await makeRecognition(
-            factory: LiveLevelEngineFactory(replies: [0.3: "кусок"]), windowSeconds: 2.0
+            factory: LiveLevelEngineFactory(replies: [0.3: "кусок"]), windowSeconds: 2.0, lineLimit: 200
         )
         let transcript = LiveTranscript(
             source: { await source.pop() }, detector: levelDetector(),
@@ -1902,16 +1909,25 @@ final class LiveTranscriptTests: XCTestCase {
         }
 
         let gotAll = await eventually(timeout: .seconds(60)) {
-            await model.lines.count == LiveTranscriptModel.maximumLines
+            await model.lines.count == 200
         }
-        XCTAssertTrue(gotAll, "the model must settle at exactly its own cap once enough chunks have been recognized")
+        XCTAssertTrue(gotAll, "the model must settle at exactly its own line-limit cap once enough chunks have been recognized")
         await transcript.finish()
 
         let lines = await model.lines
-        XCTAssertEqual(lines.count, LiveTranscriptModel.maximumLines)
+        XCTAssertEqual(lines.count, 200)
+        // Each chunk advances the recording clock by about 1 s (two speech
+        // blocks plus two silent ones); with 500 pushed and only 200 kept,
+        // the earliest surviving line can only be one recognized well after
+        // the start — proof the trim kept the later lines, not whichever 200
+        // happened to still be around.
+        let firstStart = try XCTUnwrap(lines.first).start
+        XCTAssertGreaterThan(firstStart, 200, "the surviving lines must be the later ones, not the earliest 200")
+        let hasEarlierLines = await model.hasEarlierLines
+        XCTAssertTrue(hasEarlierLines, "dropping visible lines over the cap must set the cut-start flag")
     }
 
-    // MARK: - K3 (review round 3). A late feed event renames an active line but never a frozen one
+    // MARK: - A late feed event renames an active line but never a frozen one
 
     func testLateFeedEventRenamesAnActiveLineButNeverAFrozenOne() async throws {
         let feed = FeedBox()
@@ -2062,7 +2078,7 @@ final class LiveTranscriptTests: XCTestCase {
         ]
         let system = amplitudeSignal(pattern: systemPattern, seed: 1101)
         // Continuous speech for every one of the system's 16 blocks, no
-        // trailing silence (K2): its chunk stays open the whole time, so it
+        // trailing silence: its chunk stays open the whole time, so it
         // is only ever an interim candidate, never a final one here.
         let microphone = amplitudeSignal(pattern: [(true, 16, 0.3)], seed: 1102)
         XCTAssertEqual(system.count, microphone.count)
@@ -2198,7 +2214,7 @@ final class LiveTranscriptTests: XCTestCase {
         }
     }
 
-    // MARK: - 21 (K4). An interim line gets the dictionary and a feed name, and is hidden as echo, exactly like a final one
+    // MARK: - An interim line gets the dictionary and a feed name, and is hidden as echo, exactly like a final one
 
     func testInterimLineAppliesDictionaryNameAndEchoHiding() async throws {
         let feed: [CallFeed.Event] = [
@@ -2324,5 +2340,125 @@ final class LiveTranscriptTests: XCTestCase {
 
         await transcript.finish()
         await assertBounds()
+    }
+
+    // MARK: - The model's own 5000-line cap, and the cut-start flag it never sets by itself
+
+    /// `publishForTesting` bypasses the recognition pipeline entirely — it
+    /// calls `setLines` directly, the same as a late interim result pushing
+    /// the published count momentarily over the cap. Trimming to the real
+    /// 5000-line cap must still happen, but `hasEarlierLines` must stay
+    /// false: only `recompute`'s own count of lines it actually dropped sets
+    /// it (`testFiveHundredChunksKeepExactlyTheLineCap`, above, exercises
+    /// that through the real pipeline with a small `lineLimit` override).
+    @MainActor
+    func testModelKeepsFiveThousandLinesAndMarksTheCutStart() throws {
+        let model = LiveTranscriptModel()
+        let lines = (0..<5_001).map { index in
+            LiveLine(
+                id: UUID(), track: .system, start: Double(index), end: Double(index) + 1,
+                rawText: "строка \(index)", displayText: "строка \(index)", name: nil, isFinal: true
+            )
+        }
+        model.publishForTesting(lines: lines, state: .running)
+
+        XCTAssertEqual(model.lines.count, 5_000)
+        // A `suffix` truncation keeps the latest lines, never the earliest.
+        XCTAssertEqual(model.lines.first?.displayText, "строка 1")
+        XCTAssertEqual(model.lines.last?.displayText, "строка 5000")
+        XCTAssertFalse(
+            model.hasEarlierLines,
+            "setLines' own truncation of an over-the-cap publish must never set the cut-start flag by itself"
+        )
+    }
+
+    // MARK: - Seam: a line's start matches where its speech really sits in the recorded file
+
+    /// Runs the real `SystemAudioCapture` (the recorder's actual source of
+    /// `LiveAudio`, not a synthetic queue) through its DEBUG test seams
+    /// (`adoptSessionForTesting`/`deliverCycleForTesting`), so the ground
+    /// truth is the bytes `system.caf` actually holds, not this test's own
+    /// arithmetic repeated on both sides. The pre-roll `adoptSessionForTesting`
+    /// writes ahead of the ring is a constant 0.1, never exact silence, so the
+    /// search below for "real speech" uses a threshold above it.
+    func testLiveLineStartMatchesSpeechPositionInTheRecordedFile() async throws {
+        let rate = Self.rate16
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("live-seam-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let capture = SystemAudioCapture()
+        let preRollFrames: UInt32 = 4_800
+        try await capture.adoptSessionForTesting(
+            directory: directory, sampleRate: rate, systemFrames: preRollFrames, microphoneFrames: preRollFrames,
+            enqueuedFrames: Int64(preRollFrames), startedAt: Date()
+        )
+
+        // A block-aligned, non-random signal (unlike `amplitudeSignal`
+        // elsewhere): the exact sample the real speech starts on must be
+        // found by scanning the written file, not guessed from noise.
+        let block = Self.block16
+        var system: [Float] = []
+        system.append(contentsOf: [Float](repeating: 0, count: 8 * block))
+        system.append(contentsOf: [Float](repeating: 0.6, count: 6 * block))
+        system.append(contentsOf: [Float](repeating: 0, count: 4 * block))
+        let microphone = [Float](repeating: 0, count: system.count)
+
+        var offset = 0
+        let cycleFrames = 4_000
+        while offset < system.count {
+            let count = min(cycleFrames, system.count - offset)
+            await capture.deliverCycleForTesting(
+                frames: [UInt32(count), UInt32(count)],
+                systemSamples: Array(system[offset..<(offset + count)]),
+                microphoneSamples: Array(microphone[offset..<(offset + count)])
+            )
+            offset += count
+        }
+
+        let (recognition, model) = await makeRecognition(
+            factory: LiveLevelEngineFactory(replies: [0.6: "речь в файле"])
+        )
+        let transcript = LiveTranscript(
+            source: { await capture.liveAudio() }, detector: levelDetector(),
+            makeEchoCanceller: { PassthroughCanceller() }, pollInterval: .milliseconds(5),
+            recognition: recognition
+        )
+        await transcript.start()
+
+        var found = false
+        for _ in 0..<500 {
+            if await model.lines.contains(where: { $0.displayText == "речь в файле" }) { found = true; break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertTrue(found, "the real ring must recognize the chunk written to the real file")
+        await transcript.finish()
+        _ = try await capture.stop()
+
+        let recognizedLine = await model.lines.first { $0.displayText == "речь в файле" }
+        let line = try XCTUnwrap(recognizedLine)
+
+        let file = try AVAudioFile(forReading: directory.appendingPathComponent("system.caf"))
+        let buffer = try XCTUnwrap(
+            AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: AVAudioFrameCount(file.length))
+        )
+        try file.read(into: buffer)
+        let channel = try XCTUnwrap(buffer.floatChannelData)[0]
+        let samples = UnsafeBufferPointer(start: channel, count: Int(buffer.frameLength))
+        // Above the pre-roll filler's own 0.1, so the onset found here is the
+        // real speech, never the constant the filler itself carries.
+        let onsetFrame = try XCTUnwrap(samples.firstIndex { abs($0) > 0.2 })
+        let expectedStart = Double(onsetFrame) / rate
+
+        let blockSeconds = Double(block) / rate
+        XCTAssertGreaterThanOrEqual(
+            line.start, expectedStart - (0.1 + blockSeconds),
+            "a line must not claim speech started earlier than the pre-roll pad plus one VAD block before it really did"
+        )
+        XCTAssertLessThanOrEqual(
+            line.start, expectedStart + blockSeconds,
+            "a line must not claim speech started later than one VAD block after it really did"
+        )
     }
 }

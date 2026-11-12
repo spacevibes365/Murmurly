@@ -1094,6 +1094,25 @@ extension MeetingAttempt {
 // MARK: - The user's marks, written here; read in `Sources/Archive/MeetingFiles.swift`
 
 extension MeetingMarks {
+    /// One change to the notes array, applied by `id`. `add` replaces an
+    /// existing `id` in place rather than duplicate it: `finishMarks`
+    /// (`MeetingLibrary.swift`) leaves the whole `Change` in place and
+    /// writes it again when a write did not take every edit, so an `add`
+    /// already on disk must give the same result sent a second time.
+    enum NoteOperation: Sendable, Equatable {
+        case add(MeetingNote)
+        case edit(id: UUID, text: String)
+        case delete(id: UUID)
+
+        var noteID: UUID {
+            switch self {
+            case .add(let note): note.id
+            case .edit(let id, _): id
+            case .delete(let id): id
+            }
+        }
+    }
+
     /// What the user changed. A field set replaces the file's; a field left
     /// nil stays as the file has it. `title` set to `.some(nil)` takes the
     /// user's name out: the date shows again. A speaker's name set to nil
@@ -1109,8 +1128,12 @@ extension MeetingMarks {
         /// for a track. An empty dictionary changes nothing on disk — the
         /// loop below runs only over the keys actually given.
         var callNames: [String: String?] = [:]
+        /// Note operations, in the order they were made.
+        var notes: [NoteOperation] = []
 
-        var isEmpty: Bool { title == nil && starred == nil && speakers.isEmpty && callNames.isEmpty }
+        var isEmpty: Bool {
+            title == nil && starred == nil && speakers.isEmpty && callNames.isEmpty && notes.isEmpty
+        }
 
         func applied(to marks: MeetingMarks) -> MeetingMarks {
             var marks = marks
@@ -1118,6 +1141,7 @@ extension MeetingMarks {
             if let starred { marks.starred = starred }
             for (source, name) in speakers { marks.speakers[source] = name }
             for (found, name) in callNames { marks.callNames[found] = name }
+            for operation in notes { MeetingMarks.applying(operation, to: &marks.notes) }
             return marks
         }
 
@@ -1127,6 +1151,40 @@ extension MeetingMarks {
             if let starred = later.starred { self.starred = starred }
             for (source, name) in later.speakers { speakers.updateValue(name, forKey: source) }
             for (found, name) in later.callNames { callNames.updateValue(name, forKey: found) }
+            notes += later.notes
+        }
+
+        /// The name, star and names part, with no notes: a write of this
+        /// part never fails on a crooked `notes` field.
+        var withoutNotes: Change {
+            var change = self
+            change.notes = []
+            return change
+        }
+
+        /// The notes part alone.
+        var onlyNotes: Change {
+            var change = Change()
+            change.notes = notes
+            return change
+        }
+    }
+
+    /// Applies one operation to a notes array by `id`, in place: `add`
+    /// replaces an existing `id`'s time, kind and text rather than skip it,
+    /// so an edit resent as an add lands and a repeat gives the same result.
+    static func applying(_ operation: NoteOperation, to notes: inout [MeetingNote]) {
+        switch operation {
+        case .add(let note):
+            if let index = notes.firstIndex(where: { $0.id == note.id }) {
+                notes[index] = note
+            } else {
+                notes.append(note)
+            }
+        case .edit(let id, let text):
+            for index in notes.indices where notes[index].id == id { notes[index].text = text }
+        case .delete(let id):
+            notes.removeAll { $0.id == id }
         }
     }
 
@@ -1178,6 +1236,45 @@ extension MeetingMarks {
                 if let name { renames[found] = name } else { renames.removeValue(forKey: found) }
             }
             if renames.isEmpty { object.removeValue(forKey: "callNames") } else { object["callNames"] = renames }
+        }
+        // `MeetingLibrary.writeMarks` sends the notes in a write of their
+        // own, so this throw never takes a star or a name down with it.
+        if !change.notes.isEmpty {
+            guard object["notes"] == nil || object["notes"] is [Any] else {
+                throw Refusal.unreadable(String(localized: "a mark of another kind"))
+            }
+            var items = object["notes"] as? [Any] ?? []
+            for operation in change.notes {
+                switch operation {
+                case .add(let note):
+                    var replaced = false
+                    items = items.map { item in
+                        guard var object = item as? [String: Any],
+                              let idString = object["id"] as? String, idString.uppercased() == note.id.uuidString.uppercased()
+                        else { return item }
+                        replaced = true
+                        object["text"] = note.text
+                        object["kind"] = note.kind.rawValue
+                        if let t = note.t { object["t"] = t } else { object.removeValue(forKey: "t") }
+                        return object
+                    }
+                    if !replaced { items.append(note.jsonObject) }
+                case .edit(let id, let text):
+                    items = items.map { item in
+                        guard var object = item as? [String: Any],
+                              let idString = object["id"] as? String, idString.uppercased() == id.uuidString.uppercased()
+                        else { return item }
+                        object["text"] = text
+                        return object
+                    }
+                case .delete(let id):
+                    items.removeAll { item in
+                        guard let object = item as? [String: Any], let idString = object["id"] as? String else { return false }
+                        return idString.uppercased() == id.uuidString.uppercased()
+                    }
+                }
+            }
+            if items.isEmpty { object.removeValue(forKey: "notes") } else { object["notes"] = items }
         }
         guard case .success(let marks) = parse(object) else { throw Refusal.unreadable(String(localized: "a mark of another kind")) }
         let written = try JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys])

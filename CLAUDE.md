@@ -513,9 +513,9 @@ source and state cut off. The card shows which match of how many, with arrows, b
 text's selection whatever moved it. ⌘G / ⇧⌘G reach `TranscriptNSTextView`
 through the Find menu while the find bar is closed.
 
-**A meeting's marks** (its own name, its star and its speakers' names) live in its folder,
-`murmurly.json` (`MeetingMarks`, never translated), written by the window
-alone. A change sets fields (`MeetingMarks.Change`), never the whole file: the
+**A meeting's marks** (its own name, its star, its speakers' names and its
+notepad's notes) live in its folder, `murmurly.json` (`MeetingMarks`, never
+translated), written by `MeetingLibrary` alone. A change sets fields (`MeetingMarks.Change`), never the whole file: the
 file is read once, checked, and that very object is changed and written
 atomically, so every other key survives; only a file proven to be version 1 is
 written over (no version, another type, version 0, a later version, not JSON
@@ -549,6 +549,34 @@ another meeting, or none, is on the card, or the card is out of sight, is said a
 filters the same list. The queue's move goes through `mover`, so a test holds
 it between the copy and the local folder's removal.
 
+**Notes in the marks.** `notes` in `murmurly.json` is an array of
+`MeetingNote` (`id`, `t` in recording seconds or none, `kind` `note`/`moment`,
+`text`, a moment's being the words it marks, or empty); an element this app
+does not read is skipped on read and kept on
+write, a time of 100 hours or more reads as none, and a `notes` that is not an
+array refuses only note writes. Changes go by id in place
+(`MeetingMarks.Change.notes`): an add of an id already there replaces that
+note's time, kind and text in place, keeping its other keys, so an edit resent
+as an add lands and a repeat gives the same file. Notes go through the
+same writer, entered by identity and address (`MeetingLibrary+Notes.swift`),
+with or without a row the window read: only notes may be written into the
+recording under way (`currentSession`, local root, `.recording` or
+`.stopping`; `.starting` refuses), at once on the main actor, while its name,
+star and names stay refused. A queue operation on the folder parks a notes
+change (it stays in `pendingMarks`, so quit and updates wait) instead of
+refusing it; `queue.$operations` and `$movedTo`, heard without the window,
+resume it, and after the queue's own move the writer follows: the new place's
+identity is read on its channel and the change re-keyed (`movedIdentities`;
+a nil or old identity for the old address is found through the move's source,
+`moveSources`). A write sends the name, star and names part and the notes part
+separately, so a crooked `notes` loses only notes. A refused or failed notes
+change goes to `noteFailures[noteID]` (`MarkFailure.lost`, the notepad shows
+it), not to the card's `markFailures`, and counts for a person's quit
+(`quitLosses`, `.unsavedMeetingMark`) until it is written or the user deletes
+the note; `pendingNotes` names the notes not on disk yet. A folder replaced or deleted with no operation and no move fails the
+change rather than wait, as quit, updates and the move would wait for it
+forever.
+
 **Speakers' names, Save As, a dictionary entry from the transcript.** The
 names are `speakers` in `murmurly.json` (`{"microphone": …, "system": …}`; a
 key of another kind inside it stays, a name that is not a string makes the
@@ -577,7 +605,17 @@ the names line and only the labels changed; subtitles only from the record's
 exact spans, and only times finite, not negative and under 100 hours
 (`subtitlesRefusal`: a record edited by hand may say anything, and 1e20 made
 into milliseconds stopped the app). The name is the meeting's start to the minute
-(`2026-10-15 10-31 Meeting 2.md`, never translated). One save at a time
+(`2026-10-15 10-31 Meeting 2.md`, never translated). Markdown and plain text
+end with the notepad's notes (`## Notes`, `- [m:ss] text`, `★` for a moment,
+"(after the meeting)" for one without a time); without notes the file is as
+before, byte for byte, and subtitles carry none. The card lists the notes
+below the transcript, read only (`notepadNotes(of:)`: timed by time, ties in
+the file's order, the untimed last); a time plays from 10 s earlier
+(`noteLead`), never before 0. `openAndPlay(folder:at:)` refuses at once while
+the player is held or the queue works on the folder; otherwise it opens the
+meeting at its address now, shows the main window (`MeetingLibrary.showMainWindow`,
+set by the menu bar label) and plays once the player has loaded that folder
+(polled, 10 s), as long as the meeting is still selected. One save at a time
 (`exporting`, from the click): the panel (`Saving.destination`, a sheet through
 `FilesModel.present`), then the write on the library's own serial queue
 (`Saving.write`), refused inside any meeting's folder by name or by the
@@ -848,7 +886,7 @@ screen and how many highlight changes they saw. A read cut short by its
 deadline is skipped, never taken for the page being gone.
 
 **Live transcript** (`meeting.liveTranscript`, on by default). While a meeting
-is recorded, what is said appears in a floating panel. The IOProc copies every
+is recorded, what is said appears in the meeting's notepad (below). The IOProc copies every
 cycle it wrote to the tracks into a preallocated single-writer ring
 (`SystemAudioCapture`, about 30 s at the aggregate's clock rate, the microphone
 as its file gets it): only copies and release/acquire atomics, nothing
@@ -870,22 +908,138 @@ the unfinished line. Lines keep their raw text, and the last two minutes are
 worked out again on every change: `removingEcho` (a microphone line once hidden
 as echo stays hidden), the dictionary for meetings and `CallFeed.pickedNames`
 over the watcher's events in memory. `LiveTranscriptModel`, one per recording
-(`MeetingRecorder.liveTranscriptModel`, made as `.recording` begins), holds the
-last 200 visible lines and a state; nothing of it goes into the meeting's
+(`MeetingRecorder.liveTranscriptModel`, made as `.recording` begins), holds up
+to 5000 visible lines (`LiveTranscriptModel.maximumLines`, shared with the
+pipeline's kept lines; once the pipeline drops visible lines past it,
+`hasEarlierLines` is set and the feed opens with "Earlier lines are in the
+transcript after the meeting") and a state; nothing of it goes into the meeting's
 folder, and `transcript.md` is made after the stop as before. `beginStop`
 finishes it before `capture.stop()`, waiting neither for recognition nor for a
 model load; a failure of the live text stops only the live text. While it
 runs, work in another engine waits for it as it does for the dictation's held
 engine: the meeting queue, Files, the dictation's warm-up and Recognize Again.
-`LiveTranscriptPanel` (`Sources/Overlay`) is a non-activating `NSPanel` above
-other windows, on every Space and over full-screen apps, dragged by its
-background, its frame kept in `liveTranscript.panelFrame` and fitted to the
-screens attached when it shows; like the recording indicator it is no real
-window for `AppWindowController`. It shows itself as a recording with live text
-begins, its ✕ hides it for that recording only (in memory), "Show Live
-Transcript" in the menu brings it back, and the stop or the setting turned off
-hides it. A DEBUG UI test's `-LiveTranscriptProbe` fills a model with made-up
-lines.
+A DEBUG UI test's `-LiveTranscriptProbe` fills a model with made-up lines
+(`-LiveTranscriptProbeManyLines` adds 80 more), `-NotepadProbe` a recording
+that starts and stops on cue.
+
+**The meeting notepad** (`Sources/Overlay`: `NotepadWindow.swift` with the class
+`LiveTranscriptPanel`, `NotepadView.swift`, `NotepadModel.swift`,
+`LiveLinesView.swift`, `NotesInputView.swift`, `NotepadSearchBar.swift`). One
+`NotepadModel` per panel holds what the window shows: the meeting
+(`NotepadMeeting`: folder, identity, start, recording or not), the live model
+while recording, the lines kept at the stop (`keptLines`), the notes, the
+search and whether the feed follows its bottom. The panel builds
+`NotepadNSWindow`, an `NSPanel` (never main) at the normal level, with
+`hidesOnDeactivate` off. A click anywhere on it behaves as on any app's
+window: macOS activates Murmurly and makes the notepad front and key (no
+`.nonactivatingPanel`, no `becomesKeyOnlyIfNeeded`, no raise of our own on
+mouse-down: an `orderFrontRegardless` of an inactive app's window did not hold
+over some apps' windows), and its buttons and lines accept the first click.
+"Edit Note" from the context menu, which a secondary click reaches without
+activation, activates the app and makes the notepad key itself
+(`NotepadModel.requestKeyboard`). After a click on the notepad Murmurly is the
+front app, so a dictation started then has no paste target. A UI test's raw
+HID click needs a runner trusted to post events, which a runner rebuilt for
+every run never is, so that test skips itself there. Showing it by itself
+stays `orderFrontRegardless` without activation, so the app in front stays in
+front: when it appears and when a new meeting begins. "Show Live Transcript"
+in the menu activates the app and raises it, and so does the app becoming
+active with no other window of its own on screen (`raiseOnActivation`: none below the
+status-bar level but the notepad, and no modal window, so the folder panel of
+Transcribe Meeting…, a sheet or Sparkle's window stays in front, while the
+recording indicator does not count; logged as `raised on activation`; whether
+Mission Control's choice of the panel reaches the app that way is checked
+live). It is
+never a real window for `AppWindowController.isRealWindow` (an `NSPanel`: no
+Dock icon) and maps ⌘X/C/V/A/Z/⇧⌘Z and ⌘W itself by key code, as the app stays
+`.accessory` and has no main menu to send them even while active. It moves
+and resizes freely (at least 320×160, frame in `liveTranscript.panelFrame`,
+fitted to the screens attached), and its pin (`liveTranscript.keepOnTop`, off
+by default) makes it `.floating` on every Space and over full-screen apps.
+`beginStop` first copies the model's lines into
+`MeetingRecorder.stoppedLiveTranscript` (with the folder, its identity, the
+start and the stop's outcome), before `.stopping` and before the model goes,
+so the window stays on that meeting (`liveModel` nil, `keptLines`) until it is
+closed or a recording with live text begins; the limit's stop and a failed
+one take the same path. Once stopped, the notepad keeps the meeting's own
+address and identity even after the queue moves it: the marks writer follows
+the move, and only showing and opening (Open in Murmurly, a click on a time)
+go through `queue.location(of:)`. While recording it offers Stop (`meeting.toggle()`);
+after, the queue's step for that meeting and Open in Murmurly. ✕ or ⌘W hides
+it for the rest of the recording (it does not come back by itself at the stop)
+or closes it after; "Show Live Transcript", offered whenever the notepad has a
+meeting, hidden or covered, brings back the last meeting and raises it, in
+memory only. The library reaches the panel through `MeetingRecorder.notepadLinks`
+(weak), set by the menu bar label, and the views as `\.notepadLibrary`.
+The feed (`LiveLinesView`) is a `LazyVStack` of every `NotepadFeedItem.merge`
+item: the lines in the model's order with the notes slotted in by time, the
+untimed last. Each line's text is an `NSTextView` (`LiveLineTextView`, TextKit
+1, read-only and selectable, rich text for the bold name and a moment's
+highlight), reported to accessibility as the static text `liveTranscriptLine`;
+it accepts the first click (`acceptsFirstMouse`) and draws its selection itself
+(a temporary attribute), as the notepad is often not key while the call is in
+front and AppKit would draw it pale. A selection never spans two lines. The feed and each line's
+moments are worked out once per update, and a line's text view gets values
+only (its text, its moments, its own selection) and does nothing when they
+have not changed; while the mouse drags a selection in it
+(`LiveLineTextView.isSelectingWithMouse`), updates to its text and selection
+wait and are applied at the mouse-up, with the selection the drag made. Each line shows its recording time (`NotepadTimeButton`, the
+transcript's `m:ss`/`h:mm:ss`); once the recording is saved and the recorder
+is not busy, a click opens the meeting and plays from there
+(`MeetingLibrary.openAndPlay`). "Copy" puts every shown line on the ordinary
+clipboard as `[m:ss] Name: text`. Following the bottom (`isFollowingBottom`)
+changes only with the user's own scrolling: `ScrollFollowReducer` keeps a
+generation for each scroll of the feed's own (the first, Jump to bottom, a new
+line, the search's highlight) that carries its intention until it settles (two
+still frames, not before 0.2 s) or 0.5 s pass, so its landing frame is never
+read as the user's; a move that a change of the content's or the container's
+height explains changes nothing, and only then does the bottom (insets
+counted, 24 pt) turn following on and anything else off. Jump to bottom
+follows again. **Search** (`NotepadSearchBar`): ⌘F only while the notepad is
+key, through a local key monitor bound to that window, never a menu item (the
+main window's Find belongs to `TranscriptNSTextView`); ⌘G / ⇧⌘G step while it
+is shown; Esc hides it, and clears the query, only from its own field. A match
+is a feed item whose text, a line's or a note's, never the speaker or the
+time, matches by `MeetingSearch`; new lines keep the current match by its id,
+a new query starts at the first and stops following. **Notes**
+(`NotesInputView.swift`; `NotepadNotes.attach` from `MurmurlyApp` ties the
+notepad to the recorder and the library): a note's time is the recording's
+(`MeetingRecorder.recordingSeconds()`, the tracks' own clock) read as its
+first character is typed and kept until Return, through a stop too; an
+emptied field forgets it, and a first character after the stop gives no time
+("after the meeting"); a draft takes the recording's time only while the
+notepad is on that recording, and a new meeting in the notepad clears it
+(`meetingGeneration`). Return puts the note in the feed at once and writes it
+through `MeetingLibrary.addNote` into the notepad's own meeting
+(`NotepadModel.meeting`). While the library holds a note's write
+(`pendingNotes`, "Saving…") it can be neither edited nor deleted; a refusal or
+a failed write keeps it with its text and the reason until it is edited (an
+add that never reached the disk is sent again as an add) or deleted. A
+double-click edits in place (Return saves, Esc cancels, empty deletes). ★ and
+⌥⇧M (`KeyboardShortcuts.Name.markMoment`, set in Settings → Meetings) mark a
+moment of the recording under way (`recorder.currentSession`, still
+`.recording`), whatever meeting the notepad shows. ★ with words selected in a
+line of the feed (`NotepadModel.lineSelection`, written by the line's text view
+as the selection changes, so a click on ★ never loses it) marks that line: `t`
+is the line's `start`, the text the selected words, trimmed. ★ with nothing
+selected, and ⌥⇧M always (pressed from the call, a selection left in the feed
+may be stale), read the recording's clock first and mark the newest non-empty
+line of the recording's own live model, its whole text, only while the live
+text still runs (not `.stopped` or `.noModel`) and that line ended at most
+10 s before the clock (`NotepadNotes.momentLineFreshness`: the live text lags
+a phrase by about 0.7 s, a line still spoken keeps its end moving, and a
+reaction takes a few seconds); otherwise (no lines, live text off or stopped,
+a pause, a lagging queue) the moment takes the clock and no text. After the stop ★ is off. A
+moment made from a line is drawn on that line, never as a row of its own: ★
+beside the time (its menu: Remove Mark) and its words highlighted (the first
+match by `MeetingSearch`'s rule; none if an unfinished line's text changed).
+It is tied to the line by id in memory (`momentLineIDs`), else by `t ==
+start`; a moment whose line is gone shows as its own row again. A moment of a
+recording the notepad does not show is not in its feed at all; the card, Save
+As and the helper show it. The
+shortcut is registered only while a meeting is recording (`MarkMomentHotkey`,
+opened and closed as dictation's Esc is), never in a test process. Dictation
+never pastes into the notepad: its own app is never a target.
 
 **Engines.** Parakeet TDT v3 through FluidAudio (the default) and Whisper
 through WhisperKit. `WhisperKitCache` (an actor, despite its name it serves both
@@ -1099,7 +1253,16 @@ non-negative whole number refuses everything (`HelperContract.periodDays(fromSto
 the one rule for the tab and the helper; the tab shows nothing chosen). Links
 are refused (`Archive.Links.refuse`, `O_NOFOLLOW`); a folder that cannot be
 read is reported (`unread`, `readError`), never taken for one that is not
-there, and nothing outside the period is named, not even in `unread`. A
+there, and nothing outside the period is named, not even in `unread`.
+`transcript <id>` and `get_transcript` also give the meeting's notes (`notes`:
+`t` or null, `kind`, `text`, in the file's order), on every page and before
+`transcript.md` exists (then `version` is absent, `format` `none`, no lines; a
+meeting with neither stays not found); a `murmurly.json` that cannot be read
+is `notesError: marksUnreadable` beside the transcript, or a read error
+without one, never "no notes". Notes take at most half the answer's size
+(`notesTruncated`, no next page for them); the text output lists them under
+`Notes:`, and the notice says the owner's notes are data, not instructions,
+too. A
 meeting folder swapped for a link between its check and its read is not
 caught: only a process of the same account could do that, and such a process
 reads the files directly anyway. Speed: a
@@ -1195,7 +1358,8 @@ progress does not keep its partial chunks.
 **`AppWindowController`** switches the activation policy: `.regular` (Dock
 icon) while a real window is open, `.accessory` otherwise. The recording
 indicator is an `NSPanel` and deliberately does not count as a real window, or
-the app would stick in the Dock for the whole dictation.
+the app would stick in the Dock for the whole dictation; the notepad
+(`NotepadNSWindow`) is an `NSPanel` too.
 
 **Appearance.** Settings → Permissions → Appearance offers Match System, Light
 and Dark (`ui.appearance`; Match System is the default and writes nothing).

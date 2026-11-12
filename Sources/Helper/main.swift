@@ -99,6 +99,24 @@ private func noteMoreMatches(_ hasMore: Bool) {
     note("note: more matches than shown: raise --limit or narrow with --since/--until")
 }
 
+/// `TranscriptSegment.timecode(_:)`'s own formula (`Sources/TranscriptionService.swift`,
+/// outside the helper's target), kept in sync by hand. Nil for a `t` that is
+/// not finite, negative, or at least 100 hours: `MeetingNote` only checks
+/// finiteness and `>= 0`, so a stray huge value must print with no time
+/// rather than make `Int(t)` trap.
+private func clock(_ seconds: Double) -> String? {
+    guard seconds.isFinite, seconds >= 0, seconds < 100 * 3600 else { return nil }
+    let t = Int(seconds)
+    let h = t / 3600, m = (t % 3600) / 60, s = t % 60
+    return h > 0 ? String(format: "%d:%02d:%02d", h, m, s)
+                 : String(format: "%d:%02d", m, s)
+}
+
+private func noteNotesError(_ notesError: String?) {
+    guard notesError != nil else { return }
+    note("note: murmurly.json can't be read; notes are not shown")
+}
+
 private func printTranscriptText(_ response: HelperContract.TranscriptResponse) {
     for line in response.lines {
         if let timecode = line.timecode, let speaker = line.speaker {
@@ -107,7 +125,23 @@ private func printTranscriptText(_ response: HelperContract.TranscriptResponse) 
             print(line.text)
         }
     }
-    print("-- version \(response.version.number), \(response.completeness) --")
+    if !response.notes.isEmpty {
+        print("Notes:")
+        for item in response.notes {
+            let prefix = item.t.flatMap(clock).map { "[\($0)] " } ?? ""
+            switch item.kind {
+            case "moment":
+                print(item.text.isEmpty ? "\(prefix)★" : "\(prefix)★ \(item.text)")
+            default:
+                print("\(prefix)\(item.text)")
+            }
+        }
+    }
+    if let version = response.version {
+        print("-- version \(version.number), \(response.completeness) --")
+    } else {
+        print("-- no transcript yet --")
+    }
     if response.truncated, let nextFrom = response.nextFrom {
         print("-- truncated, response size limit: continue with --from \(nextFrom) --")
     } else if let nextFrom = response.nextFrom {
@@ -115,6 +149,10 @@ private func printTranscriptText(_ response: HelperContract.TranscriptResponse) 
     } else if response.truncated {
         print("-- truncated, response size limit --")
     }
+    if response.notesTruncated {
+        print("-- notes truncated, response size limit --")
+    }
+    noteNotesError(response.notesError)
 }
 
 private func printMeetingsText(_ response: HelperContract.MeetingsResponse) {

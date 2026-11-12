@@ -765,6 +765,10 @@ extension LiveTranscript {
         /// second of real speech, since the owner wants "instant" without a
         /// flood of requests. `nil` turns interim requests off entirely.
         var interimSeconds: Double? = 1.0
+        /// How many visible lines `recompute` keeps before dropping the
+        /// oldest; a test override of `LiveTranscriptModel.maximumLines` so a
+        /// pipeline test can see the cut without running thousands of chunks.
+        var lineLimit: Int = LiveTranscriptModel.maximumLines
     }
 
     /// One line as the recognition pipeline keeps it internally, before it is
@@ -816,13 +820,20 @@ extension LiveTranscript {
     /// `maximumChunkSeconds` long can start well before the microphone line
     /// it overlaps leaves the window, and that microphone line, once hidden,
     /// must stay hidden whatever its echo partner does later (K1).
+    /// Returns how many visible lines were actually dropped for being over
+    /// `lineLimit` — never the remaining `overflow` count, which can stay
+    /// positive when fewer frozen-and-past-the-margin lines exist to remove
+    /// than the overflow itself; the caller uses this, not `rawLines.count`,
+    /// to decide whether to mark the model's own cut-start flag.
+    @discardableResult
     private static func recompute(
         _ rawLines: inout [RawLine],
         dictionary: DictionaryReplacer?,
         feed: [CallFeed.Event],
-        windowSeconds: Double
-    ) {
-        guard let windowEnd = rawLines.map(\.end).max() else { return }
+        windowSeconds: Double,
+        lineLimit: Int = LiveTranscriptModel.maximumLines
+    ) -> Int {
+        guard let windowEnd = rawLines.map(\.end).max() else { return 0 }
         let windowStart = windowEnd - windowSeconds
 
         let allSystem = rawLines.filter { $0.track == .system }.map {
@@ -881,14 +892,17 @@ extension LiveTranscript {
         // alone (K1).
         let retainFrom = windowStart - maximumChunkSeconds
         let visibleCount = rawLines.lazy.filter { !$0.hiddenAsEcho }.count
-        var overflow = max(0, visibleCount - LiveTranscriptModel.maximumLines)
+        var overflow = max(0, visibleCount - lineLimit)
+        var droppedVisible = 0
         rawLines.removeAll { line in
             guard line.frozen, line.end < retainFrom else { return false }
             if line.hiddenAsEcho { return true }
             guard overflow > 0 else { return false }
             overflow -= 1
+            droppedVisible += 1
             return true
         }
+        return droppedVisible
     }
 
     /// The echo, dictionary and name steps `recompute` runs for a final
@@ -1017,9 +1031,9 @@ extension LiveTranscript {
             guard !(await live.isFinished) else { return }
             await config.model.setState(state)
         }
-        func publishLines(_ lines: [LiveLine]) async {
+        func publishLines(_ lines: [LiveLine], droppedEarlier: Bool = false) async {
             guard !(await live.isFinished) else { return }
-            await config.model.setLines(lines)
+            await config.model.setLines(lines, droppedEarlier: droppedEarlier)
         }
 
         if await config.modelMissing() {
@@ -1141,10 +1155,14 @@ extension LiveTranscript {
                 }
                 if changed {
                     let feed = await config.callFeedEvents()
-                    Self.recompute(&rawLines, dictionary: config.dictionaryReplacer, feed: feed, windowSeconds: config.windowSeconds)
+                    let dropped = Self.recompute(
+                        &rawLines, dictionary: config.dictionaryReplacer, feed: feed,
+                        windowSeconds: config.windowSeconds, lineLimit: config.lineLimit
+                    )
                     await publishLines(
                         Self.visibleLines(rawLines)
-                            + Self.pendingInterimLines(interims, finals: rawLines, dictionary: config.dictionaryReplacer, feed: feed)
+                            + Self.pendingInterimLines(interims, finals: rawLines, dictionary: config.dictionaryReplacer, feed: feed),
+                        droppedEarlier: dropped > 0
                     )
                 }
 
@@ -1268,17 +1286,25 @@ final class LiveTranscriptModel: ObservableObject {
     /// track, always after every final line.
     @Published private(set) var lines: [LiveLine] = []
     @Published private(set) var state: State = .waitingForSpeech
+    /// Whether the pipeline has ever had to drop a visible line from the
+    /// front for being over the cap — set only by `recompute`'s own count of
+    /// lines it actually removed, never by `setLines`' own truncation of an
+    /// interim line pushing the published count momentarily over the cap,
+    /// and never reversed once true: the notepad's feed shows a gap marker
+    /// at the top while this is set.
+    @Published private(set) var hasEarlierLines = false
 
     /// `nonisolated`: a plain constant, read by `LiveTranscript.recompute`
     /// (not on the main actor) to decide how many frozen lines to keep.
-    nonisolated static let maximumLines = 200
+    nonisolated static let maximumLines = 5000
 
     fileprivate func setState(_ newState: State) {
         state = newState
     }
 
-    fileprivate func setLines(_ newLines: [LiveLine]) {
+    fileprivate func setLines(_ newLines: [LiveLine], droppedEarlier: Bool = false) {
         lines = Array(newLines.suffix(Self.maximumLines))
+        if droppedEarlier { hasEarlierLines = true }
     }
 
     /// Set directly by the recorder, before any pipeline exists: the

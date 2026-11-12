@@ -467,7 +467,7 @@ final class HelperPerformanceTests: XCTestCase {
                 let response = try self.decode(HelperContract.TranscriptResponse.self, from: result.stdout)
                 XCTAssertEqual(response.lines.count, 200)
                 XCTAssertEqual(response.totalLines, 400)
-                XCTAssertEqual(response.version.number, 2)
+                XCTAssertEqual(response.version?.number, 2)
                 XCTAssertTrue(response.hasMore)
             },
             Scenario(label: "search zephyrquill --meetings", arguments: ["search", "zephyrquill", "--meetings", "--json"], targetSeconds: 10) { result in

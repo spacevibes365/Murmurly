@@ -110,7 +110,18 @@ struct MeetingsSettingsView: View {
                     .labelsHidden()
                     .accessibilityIdentifier("liveTranscriptToggle")
             }
-            Text("Show what is said in a floating panel while a meeting is recorded.")
+            Text("Show what is said in the meeting notepad, next to the notes, while a meeting is recorded.")
+                .font(.caption).foregroundStyle(.secondary)
+                .padding(.horizontal, SettingsChrome.rowHorizontalPadding)
+                .padding(.vertical, SettingsChrome.rowVerticalPadding)
+            Divider().padding(.leading, SettingsChrome.dividerLeadingPadding)
+            SettingsRow("Mark a moment") {
+                KeyboardShortcuts.Recorder(for: .markMoment) { _ in
+                    settings.objectWillChange.send()
+                }
+                .accessibilityIdentifier("markMomentShortcut")
+            }
+            Text("Works only while a meeting is being recorded.")
                 .font(.caption).foregroundStyle(.secondary)
                 .padding(.horizontal, SettingsChrome.rowHorizontalPadding)
                 .padding(.vertical, SettingsChrome.rowVerticalPadding)

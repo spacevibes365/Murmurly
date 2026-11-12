@@ -2620,6 +2620,20 @@ final class MeetingTranscriptionTests: XCTestCase {
     /// choice made there, which is what the engine is asked for. The panel
     /// is the test's: a test process never opens AppKit's.
     func testTranscribeMeetingOffersTheEngineAndLanguage() async throws {
+        // Disclosing the accessory view opens AppKit's own accessory window
+        // for it, independent of whether the panel itself is ever shown
+        // (`begin` is replaced here by `show`): left open, it can fool
+        // another test's check for a visible window of this app
+        // (NotepadWindowTests' activation tests). Only windows this test
+        // itself added are closed, by identity, so a window another test in
+        // the same process already had open is left alone.
+        let windowsBefore = Set(NSApp.windows.map(ObjectIdentifier.init))
+        defer {
+            for window in NSApp.windows where !windowsBefore.contains(ObjectIdentifier(window)) {
+                window.orderOut(nil)
+                window.close()
+            }
+        }
         let defaults = try XCTUnwrap(UserDefaults(suiteName: root.appendingPathComponent("settings").path))
         let settings = SettingsStore(defaults: defaults)
         settings.dictationEngine = .whisper

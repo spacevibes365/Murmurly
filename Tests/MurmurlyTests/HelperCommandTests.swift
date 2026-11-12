@@ -60,6 +60,18 @@ final class HelperCommandTests: XCTestCase {
         return folder
     }
 
+    /// A meeting that is still recording, or was cut off before its stop:
+    /// no `metadata.json` at all, known as a meeting only by its track
+    /// (`MeetingStorage.classify`). `startedAt` then comes from the folder's
+    /// own name, not from a file.
+    @discardableResult
+    private func makeInProgressMeeting(_ name: String, in parent: URL) throws -> URL {
+        let folder = parent.appendingPathComponent(name, isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        try Data().write(to: folder.appendingPathComponent("system.caf"))
+        return folder
+    }
+
     /// `yyyy-MM-dd HH-mm-ss Meeting`, in the same `Europe/Berlin` zone the
     /// helper process runs in (`helperEnvironment`'s `TZ`): what
     /// `MeetingStorage.date(fromFolderName:)` parses back there, so a test
@@ -77,6 +89,15 @@ final class HelperCommandTests: XCTestCase {
         var object: [String: Any] = ["version": 1, "starred": starred]
         if let title { object["title"] = title }
         try JSONSerialization.data(withJSONObject: object).write(to: folder.appendingPathComponent("murmurly.json"))
+    }
+
+    /// Raw dictionaries, as `MeetingNote(jsonObject:)` would read them, so a
+    /// test can plant a crooked element (a bad `id`, a non-numeric `t`)
+    /// alongside good ones. `version` and `fileName` as `MeetingMarks`
+    /// itself writes them.
+    private func writeNotes(_ notes: [[String: Any]], version: Int = 1, in folder: URL) throws {
+        let object: [String: Any] = ["version": version, "notes": notes]
+        try JSONSerialization.data(withJSONObject: object).write(to: folder.appendingPathComponent(MeetingMarks.fileName))
     }
 
     private func writeCallNames(_ callNames: [String: String], in folder: URL) throws {
@@ -1043,6 +1064,261 @@ final class HelperCommandTests: XCTestCase {
         let given = try XCTUnwrap(response.lines.last)
         XCTAssertEqual(response.nextFrom, given.n + 1)
         XCTAssertLessThan(response.lines.count, 20)
+    }
+
+    // MARK: - Notepad notes
+
+    func testTranscriptCarriesNotesInJSONAndText() throws {
+        try writeSettings(periodDays: 0)
+        let folder = try makeMeeting("2026-10-20 10-31-05 Meeting", in: meetingsRoot, startedAt: Date(timeIntervalSince1970: 1_792_000_000))
+        let text = try makeTranscript(in: folder, lines: [
+            ("0:01", "Me", "Shall we start with the fence?"),
+            ("0:05", "Others", "Yes, the budget first."),
+        ])
+        try writeAttempt(number: 1, result: .complete, transcript: "transcript.md", fingerprint: fingerprint(of: text), in: folder)
+        try writeNotes([
+            ["id": UUID().uuidString, "kind": "note", "text": "Ask about the fence paint", "t": 42.5],
+            ["id": UUID().uuidString, "kind": "moment", "text": "", "t": 65],
+            ["id": "not-a-uuid", "kind": "note", "text": "x"],
+            ["id": UUID().uuidString, "kind": "note", "text": "x", "t": true],
+            ["id": UUID().uuidString, "kind": "note", "text": "Plum jam for Friday"],
+        ], in: folder)
+
+        let jsonResult = try run(["transcript", "local:2026-10-20_10-31-05", "--json"])
+        XCTAssertEqual(jsonResult.exitCode, 0)
+        let response = try decode(HelperContract.TranscriptResponse.self, from: jsonResult.stdout)
+        XCTAssertEqual(response.notes.count, 3)
+        XCTAssertEqual(response.notes.map(\.kind), ["note", "moment", "note"])
+        XCTAssertEqual(response.notes.map(\.t), [42.5, 65, nil])
+        XCTAssertFalse(response.notesTruncated)
+        XCTAssertNil(response.notesError)
+        XCTAssertFalse(response.lines.isEmpty)
+
+        // Notes are given on every page, not only the first.
+        let secondPageResult = try run(["transcript", "local:2026-10-20_10-31-05", "--from", "2", "--count", "1", "--json"])
+        let secondPageResponse = try decode(HelperContract.TranscriptResponse.self, from: secondPageResult.stdout)
+        XCTAssertEqual(secondPageResponse.notes.count, 3)
+
+        let rawObject = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(jsonResult.stdout.utf8)) as? [String: Any])
+        let rawNotes = try XCTUnwrap(rawObject["notes"] as? [[String: Any]])
+        XCTAssertTrue(rawNotes[2]["t"] is NSNull, "a note with no time must encode an explicit null, not an omitted key")
+
+        let textResult = try run(["transcript", "local:2026-10-20_10-31-05"])
+        let lastLineRange = try XCTUnwrap(textResult.stdout.range(of: "Yes, the budget first."))
+        let notesRange = try XCTUnwrap(textResult.stdout.range(of: "Notes:"))
+        XCTAssertTrue(lastLineRange.upperBound <= notesRange.lowerBound, "Notes: must come after the transcript's lines")
+        XCTAssertTrue(textResult.stdout.contains("[0:42] Ask about the fence paint"))
+        XCTAssertTrue(textResult.stdout.contains("[1:05] ★"))
+        XCTAssertTrue(textResult.stdout.contains("Plum jam for Friday"))
+    }
+
+    /// A moment made from a line's own selection carries its words
+    /// (`text`), not just a bare ★: both the JSON and the text output must
+    /// show them.
+    func testTranscriptGivesAMomentsWords() throws {
+        try writeSettings(periodDays: 0)
+        let folder = try makeMeeting("2026-10-20 10-31-05 Meeting", in: meetingsRoot, startedAt: Date(timeIntervalSince1970: 1_792_000_000))
+        let text = try makeTranscript(in: folder, lines: [("1:05", "Me", "Fence paint by Friday, right?")])
+        try writeAttempt(number: 1, result: .complete, transcript: "transcript.md", fingerprint: fingerprint(of: text), in: folder)
+        try writeNotes([["id": UUID().uuidString, "kind": "moment", "text": "Fence paint by Friday", "t": 65]], in: folder)
+
+        let jsonResult = try run(["transcript", "local:2026-10-20_10-31-05", "--json"])
+        XCTAssertEqual(jsonResult.exitCode, 0)
+        let response = try decode(HelperContract.TranscriptResponse.self, from: jsonResult.stdout)
+        XCTAssertEqual(response.notes.map(\.text), ["Fence paint by Friday"])
+
+        let textResult = try run(["transcript", "local:2026-10-20_10-31-05"])
+        XCTAssertTrue(textResult.stdout.contains("[1:05] ★ Fence paint by Friday"))
+    }
+
+    /// A meeting that is still recording (or was cut off) has no
+    /// `transcript.md` yet, but its notes exist regardless: the helper must
+    /// not stop at "no transcript" before even looking at `murmurly.json`.
+    func testTranscriptGivesNotesBeforeTheTranscriptExists() throws {
+        try writeSettings(periodDays: 30)
+        let date = Date().addingTimeInterval(-1 * 86_400)
+        let name = folderName(for: date)
+        let folder = try makeInProgressMeeting(name, in: meetingsRoot)
+        try writeNotes([["id": UUID().uuidString, "kind": "note", "text": "Check the agenda", "t": 3]], in: folder)
+        let id = try XCTUnwrap(HelperContract.meetingID(root: .local, folderName: name))
+
+        let jsonResult = try run(["transcript", id, "--json"])
+        XCTAssertEqual(jsonResult.exitCode, 0)
+        let response = try decode(HelperContract.TranscriptResponse.self, from: jsonResult.stdout)
+        XCTAssertNil(response.version)
+        XCTAssertEqual(response.format, "none")
+        XCTAssertEqual(response.completeness, "none")
+        XCTAssertTrue(response.lines.isEmpty)
+        XCTAssertEqual(response.totalLines, 0)
+        XCTAssertFalse(response.hasMore)
+        XCTAssertEqual(response.notes.count, 1)
+
+        let textResult = try run(["transcript", id])
+        XCTAssertTrue(textResult.stdout.contains("[0:03] Check the agenda"))
+        XCTAssertTrue(textResult.stdout.contains("-- no transcript yet --"))
+
+        let session = try openMCPSession()
+        defer { session.terminateIfRunning() }
+        let mcpResponse = try session.request(
+            id: 2, method: "tools/call", params: ["name": "get_transcript", "arguments": ["id": id]], timeout: 15, testCase: self
+        )
+        let decoded = try decodeContract(HelperContract.TranscriptResponse.self, fromToolCallResult: mcpResponse!)
+        XCTAssertEqual(decoded.notes.count, 1)
+
+        // Neither a transcript nor any notes: the previous "no transcript" refusal stands.
+        let emptyName = folderName(for: date.addingTimeInterval(-60))
+        try makeInProgressMeeting(emptyName, in: meetingsRoot)
+        let emptyID = try XCTUnwrap(HelperContract.meetingID(root: .local, folderName: emptyName))
+        let emptyResult = try run(["transcript", emptyID, "--json"])
+        XCTAssertEqual(emptyResult.exitCode, 4)
+    }
+
+    /// Notes are counted toward the response's size limit, taking at most
+    /// half of it so the transcript's own lines (or, with no transcript,
+    /// `nextFrom`'s progress) can never be starved to nothing.
+    func testLargeNotesStayWithinTheLimit() throws {
+        try writeSettings(periodDays: 0)
+        let folder = try makeMeeting("2026-10-20 10-31-05 Meeting", in: meetingsRoot, startedAt: Date(timeIntervalSince1970: 1_792_000_000))
+        let text = try makeTranscript(in: folder, lines: (1...5).map { ("0:0\($0)", "Me", "Line \($0)") })
+        try writeAttempt(number: 1, result: .complete, transcript: "transcript.md", fingerprint: fingerprint(of: text), in: folder)
+        let manyNotes = (0..<300).map { _ in
+            ["id": UUID().uuidString, "kind": "note", "text": String(repeating: "x", count: 200)] as [String: Any]
+        }
+        try writeNotes(manyNotes, in: folder)
+
+        let cliResult = try run(
+            ["transcript", "local:2026-10-20_10-31-05", "--json"], extraEnvironment: ["MURMURLY_HELPER_MAX_BYTES": "4000"]
+        )
+        XCTAssertEqual(cliResult.exitCode, 0)
+        let cliResponse = try decode(HelperContract.TranscriptResponse.self, from: cliResult.stdout)
+        XCTAssertTrue(cliResponse.notesTruncated)
+        XCTAssertTrue(cliResponse.truncated)
+        XCTAssertFalse(cliResponse.notes.isEmpty)
+        XCTAssertLessThan(cliResponse.notes.count, 300)
+        XCTAssertGreaterThanOrEqual(cliResponse.lines.count, 1)
+        let cliBytes = cliResult.stdout.trimmingCharacters(in: .whitespacesAndNewlines).utf8.count
+        XCTAssertLessThanOrEqual(cliBytes, 4000)
+
+        let session = try openMCPSession(extraEnvironment: ["MURMURLY_HELPER_MAX_BYTES": "6000"])
+        defer { session.terminateIfRunning() }
+        let mcpResponse = try session.request(
+            id: 2, method: "tools/call",
+            params: ["name": "get_transcript", "arguments": ["id": "local:2026-10-20_10-31-05"]],
+            timeout: 15, testCase: self
+        )
+        let decoded = try decodeContract(HelperContract.TranscriptResponse.self, fromToolCallResult: mcpResponse!)
+        XCTAssertTrue(decoded.notesTruncated)
+        XCTAssertFalse(decoded.lines.isEmpty)
+        let rawLine = try XCTUnwrap(session.rawLine(id: 2))
+        XCTAssertLessThanOrEqual(rawLine.count, 6000)
+
+        // One note far bigger than the whole budget: shrunk, not dropped.
+        let giantFolder = try makeMeeting(
+            "2026-10-21 10-31-05 Meeting", in: meetingsRoot, startedAt: Date(timeIntervalSince1970: 1_792_100_000)
+        )
+        let giantText = try makeTranscript(in: giantFolder, lines: [("0:01", "Me", "Short line.")])
+        try writeAttempt(number: 1, result: .complete, transcript: "transcript.md", fingerprint: fingerprint(of: giantText), in: giantFolder)
+        try writeNotes([["id": UUID().uuidString, "kind": "note", "text": String(repeating: "x", count: 100_000)]], in: giantFolder)
+
+        let giantResult = try run(
+            ["transcript", "local:2026-10-21_10-31-05", "--json"], extraEnvironment: ["MURMURLY_HELPER_MAX_BYTES": "4000"]
+        )
+        XCTAssertEqual(giantResult.exitCode, 0)
+        let giantResponse = try decode(HelperContract.TranscriptResponse.self, from: giantResult.stdout)
+        XCTAssertEqual(giantResponse.notes.count, 1)
+        XCTAssertLessThan(giantResponse.notes[0].text.count, 100_000)
+        XCTAssertTrue(giantResponse.notesTruncated)
+    }
+
+    func testNotesFollowMeetingsAccessAndPeriod() throws {
+        try writeSettings(meetings: false, periodDays: 0)
+        let recentDate = Date().addingTimeInterval(-1 * 86_400)
+        let recentName = folderName(for: recentDate)
+        let recentFolder = try makeInProgressMeeting(recentName, in: meetingsRoot)
+        try writeNotes([["id": UUID().uuidString, "kind": "note", "text": "Check the agenda"]], in: recentFolder)
+        let recentID = try XCTUnwrap(HelperContract.meetingID(root: .local, folderName: recentName))
+        let deniedResult = try run(["transcript", recentID, "--json"])
+        XCTAssertEqual(deniedResult.exitCode, 3)
+
+        try writeSettings(periodDays: 30)
+        let oldDate = Date().addingTimeInterval(-400 * 86_400)
+        let oldName = folderName(for: oldDate)
+        let oldFolder = try makeInProgressMeeting(oldName, in: meetingsRoot)
+        try writeNotes([["id": UUID().uuidString, "kind": "note", "text": "Old note"]], in: oldFolder)
+        let oldID = try XCTUnwrap(HelperContract.meetingID(root: .local, folderName: oldName))
+        let outOfPeriodResult = try run(["transcript", oldID, "--json"])
+        XCTAssertEqual(outOfPeriodResult.exitCode, 4)
+    }
+
+    func testUnreadableMarksSayNotesAreUnknown() throws {
+        try writeSettings(periodDays: 0)
+        let folder = try makeMeeting("2026-10-20 10-31-05 Meeting", in: meetingsRoot, startedAt: Date(timeIntervalSince1970: 1_792_000_000))
+        let text = try makeTranscript(in: folder, lines: [("0:01", "Me", "Shall we start?")])
+        try writeAttempt(number: 1, result: .complete, transcript: "transcript.md", fingerprint: fingerprint(of: text), in: folder)
+        try writeNotes([["id": UUID().uuidString, "kind": "note", "text": "unreadable"]], version: 99, in: folder)
+
+        let jsonResult = try run(["transcript", "local:2026-10-20_10-31-05", "--json"])
+        XCTAssertEqual(jsonResult.exitCode, 0)
+        let response = try decode(HelperContract.TranscriptResponse.self, from: jsonResult.stdout)
+        XCTAssertTrue(response.notes.isEmpty)
+        XCTAssertEqual(response.notesError, HelperContract.Unread.marksUnreadable)
+
+        let textResult = try run(["transcript", "local:2026-10-20_10-31-05"])
+        XCTAssertTrue(textResult.stderr.contains("murmurly.json can't be read"))
+
+        let noTranscriptDate = Date().addingTimeInterval(-2 * 86_400)
+        let noTranscriptName = folderName(for: noTranscriptDate)
+        let noTranscriptFolder = try makeInProgressMeeting(noTranscriptName, in: meetingsRoot)
+        try writeNotes([["id": UUID().uuidString, "kind": "note", "text": "unreadable"]], version: 99, in: noTranscriptFolder)
+        let noTranscriptID = try XCTUnwrap(HelperContract.meetingID(root: .local, folderName: noTranscriptName))
+        try writeSettings(periodDays: 30)
+        let noTranscriptResult = try run(["transcript", noTranscriptID, "--json"])
+        XCTAssertEqual(noTranscriptResult.exitCode, 5)
+    }
+
+    /// `murmurly.json` reached only through a link reads as unreadable, same
+    /// as `MeetingMarks.read(in:links: .refuse)` already behaves for the
+    /// window's own star and names: a link is never opened, and the notes it
+    /// would have carried are "unknown", never silently "none".
+    func testLinkedMarksAreNotFollowedForNotes() throws {
+        try writeSettings(periodDays: 0)
+        let folder = try makeMeeting("2026-10-20 10-31-05 Meeting", in: meetingsRoot, startedAt: Date(timeIntervalSince1970: 1_792_000_000))
+        let text = try makeTranscript(in: folder, lines: [("0:01", "Me", "Shall we start?")])
+        try writeAttempt(number: 1, result: .complete, transcript: "transcript.md", fingerprint: fingerprint(of: text), in: folder)
+
+        let elsewhere = root.appendingPathComponent("elsewhere-marks", isDirectory: true)
+        try FileManager.default.createDirectory(at: elsewhere, withIntermediateDirectories: true)
+        try writeNotes([["id": UUID().uuidString, "kind": "note", "text": "off to the side"]], in: elsewhere)
+        try FileManager.default.createSymbolicLink(
+            at: folder.appendingPathComponent(MeetingMarks.fileName),
+            withDestinationURL: elsewhere.appendingPathComponent(MeetingMarks.fileName)
+        )
+
+        let result = try run(["transcript", "local:2026-10-20_10-31-05", "--json"])
+        XCTAssertEqual(result.exitCode, 0)
+        let response = try decode(HelperContract.TranscriptResponse.self, from: result.stdout)
+        XCTAssertTrue(response.notes.isEmpty)
+        XCTAssertEqual(response.notesError, HelperContract.Unread.marksUnreadable)
+    }
+
+    /// `MeetingNote.t` only checks finiteness and `>= 0`, so a stray value
+    /// too large to make sense as a recording's own clock (`1e20`) still
+    /// parses. The text printer must show that note with no time, never
+    /// crash on `Int(t)`.
+    func testNoteWithAnUnreasonableTimeIsShownWithoutAClock() throws {
+        try writeSettings(periodDays: 0)
+        let folder = try makeMeeting("2026-10-20 10-31-05 Meeting", in: meetingsRoot, startedAt: Date(timeIntervalSince1970: 1_792_000_000))
+        let text = try makeTranscript(in: folder, lines: [("0:01", "Me", "Shall we start?")])
+        try writeAttempt(number: 1, result: .complete, transcript: "transcript.md", fingerprint: fingerprint(of: text), in: folder)
+        try writeNotes([["id": UUID().uuidString, "kind": "note", "text": "Huge time", "t": 1e20]], in: folder)
+
+        let result = try run(["transcript", "local:2026-10-20_10-31-05"])
+        XCTAssertEqual(result.exitCode, 0)
+        XCTAssertTrue(result.stdout.contains("Notes:"))
+        XCTAssertTrue(result.stdout.contains("Huge time"))
+        for line in result.stdout.components(separatedBy: "\n") where line.contains("Huge time") {
+            XCTAssertFalse(line.hasPrefix("["), "a huge t must not be rendered as a clock")
+        }
     }
 
     func testPrintsExamples() throws {

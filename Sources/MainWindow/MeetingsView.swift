@@ -741,6 +741,7 @@ private struct MeetingCard: View {
             actions(meeting, status: status)
             notes(meeting, status: status)
             transcript(meeting)
+            notepadNotes(meeting)
             if !meeting.otherFiles.isEmpty {
                 Text("Also in this folder: \(ListFormatter.localizedString(byJoining: meeting.otherFiles))")
                     .font(.caption)
@@ -1177,6 +1178,58 @@ private struct MeetingCard: View {
             .foregroundStyle(.secondary)
             .accessibilityIdentifier("meetingCallNamesNotFound")
         }
+    }
+
+    /// The meeting's notepad notes and marked moments, read only: editing
+    /// them is the notepad's own. Only a note's time is clickable, and it
+    /// plays from `MeetingLibrary.noteLead` seconds before it, as a thought
+    /// is written down after it was said. No notes, no section.
+    @ViewBuilder private func notepadNotes(_ meeting: MeetingLibrary.Meeting) -> some View {
+        let notes = library.notepadNotes(of: meeting)
+        if !notes.isEmpty {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Notes")
+                    .font(.headline)
+                NotepadNotesList(player: library.player, notes: notes, play: { library.playNote($0) })
+            }
+            .accessibilityElement(children: .contain)
+            .accessibilityIdentifier("meetingNotepadNotes")
+        }
+    }
+}
+
+/// The notepad's notes on the card: their own view, so a change of the
+/// player (whether its audio is loaded) redraws only this part of the card.
+private struct NotepadNotesList: View {
+    @ObservedObject var player: MeetingPlayer
+    let notes: [MeetingNote]
+    let play: (MeetingNote) -> Void
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 4) {
+                ForEach(notes) { note in
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        if let t = note.t {
+                            Button { play(note) } label: { Text(verbatim: TranscriptSegment.timecode(t)) }
+                                .buttonStyle(.plain)
+                                .foregroundStyle(.tint)
+                                .monospacedDigit()
+                                .disabled(!player.isLoaded)
+                                .help(String(localized: "Play from 10 seconds before this note"))
+                                .accessibilityIdentifier("meetingNoteTime")
+                        } else {
+                            Text("After the meeting")
+                                .foregroundStyle(.secondary)
+                        }
+                        Text(verbatim: note.kind == .moment ? (note.text.isEmpty ? "★" : "★ " + note.text) : note.text)
+                            .textSelection(.enabled)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            }
+        }
+        .frame(maxHeight: 140)
     }
 }
 

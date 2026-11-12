@@ -169,7 +169,7 @@ func perform(_ request: HelperRequest, environment: HelperEnvironment, budget: R
         let response = try runTranscript(environment: environment, settings: settings, flags: flags, budget: budget)
         success = CommandSuccess(
             outcome: .transcript(response),
-            logFields: "id=\(response.id) from=\(response.from) count=\(response.lines.count)"
+            logFields: "id=\(response.id) from=\(response.from) count=\(response.lines.count) notes=\(response.notes.count)"
         )
     case .search(let flags):
         let response = try runSearch(environment: environment, settings: settings, flags: flags, budget: budget)
@@ -702,8 +702,69 @@ func runTranscript(
     guard meeting.readable else {
         throw CommandFailure(code: .readError, message: "can't read the meeting's folder")
     }
+
+    // `murmurly.json`'s notes, read once for every branch below: the
+    // notepad's notes and marked moments are given even before a transcript
+    // exists. `State.marks` is an empty `MeetingMarks()` (not nil) for
+    // `.none` — no file at all means no notes, never "unknown" — and nil
+    // only for `.unreadable`/`.newer`, which must never be shown as an empty
+    // list.
+    let marksState = meeting.folder.marks
+    let allNotes: [HelperContract.Note] = (marksState.marks?.notes ?? []).map {
+        HelperContract.Note(t: $0.t, kind: $0.kind.rawValue, text: $0.text)
+    }
+    let notesUnreadable = marksState.marks == nil
+    let notesError = notesUnreadable ? HelperContract.Unread.marksUnreadable : nil
+
+    /// Fits `allNotes` within half of `budget.maxBytes`, never calling
+    /// `fitItems` on an empty array (which would report a false `truncated`
+    /// for an otherwise-empty response): notes get at most half the budget
+    /// so a long list of them can never starve the transcript's own lines
+    /// down to nothing, or (with no transcript at all) leave `nextFrom`
+    /// stuck pointing at the same page. `responseForPrefix` builds the
+    /// response `fitItems` would measure for a given prefix, so both the
+    /// no-transcript and the with-transcript callers can share this.
+    func fitNotes(
+        responseForPrefix: (_ prefix: [HelperContract.Note]) -> HelperContract.TranscriptResponse
+    ) -> (notes: [HelperContract.Note], truncated: Bool) {
+        guard !allNotes.isEmpty else { return ([], false) }
+        let fitted = HelperContract.fitItems(
+            allNotes, maxBytes: budget.maxBytes / 2,
+            encodedSize: { prefix in budget.encodedSize(responseForPrefix(prefix)) },
+            shrinkText: { note, limit in
+                var copy = note
+                if copy.text.count > limit { copy.text = String(copy.text.prefix(limit)) }
+                return copy
+            }
+        )
+        return (notes: fitted.items, truncated: fitted.truncated)
+    }
+
     guard let latest = meeting.latest else {
-        throw CommandFailure(code: .notFound, message: "no transcript")
+        // Unreadable marks outrank "no notes": the one case the carried-over
+        // `notFound` must not swallow is "notes exist but could not be
+        // proven absent".
+        if notesUnreadable {
+            throw CommandFailure(code: .readError, message: "no transcript, and the meeting's murmurly.json can't be read")
+        }
+        guard !allNotes.isEmpty else {
+            throw CommandFailure(code: .notFound, message: "no transcript")
+        }
+        let (fittedNotes, notesTruncated) = fitNotes { prefix in
+            HelperContract.TranscriptResponse(
+                schema: HelperContract.schemaVersion, command: "transcript", id: flags.id, version: nil,
+                completeness: "none", format: "none", totalLines: 0, from: flags.from,
+                lines: [], hasMore: false, nextFrom: nil, truncated: true,
+                notes: prefix, notesTruncated: true, notesError: nil
+            )
+        }
+        try requireStillAllowed([.meetings], since: settings, environment: environment)
+        return HelperContract.TranscriptResponse(
+            schema: HelperContract.schemaVersion, command: "transcript", id: flags.id, version: nil,
+            completeness: "none", format: "none", totalLines: 0, from: flags.from,
+            lines: [], hasMore: false, nextFrom: nil, truncated: notesTruncated,
+            notes: fittedNotes, notesTruncated: notesTruncated, notesError: nil
+        )
     }
 
     let transcript: MeetingTranscript
@@ -751,13 +812,24 @@ func runTranscript(
 
     let version = HelperContract.Version(number: latest.number, modified: latest.modified)
     let completeness = HelperContract.completeness(meeting, transcript: transcript)
+
+    let (fittedNotes, notesTruncated) = fitNotes { prefix in
+        HelperContract.TranscriptResponse(
+            schema: HelperContract.schemaVersion, command: "transcript", id: flags.id, version: version,
+            completeness: completeness, format: format, totalLines: totalLines, from: flags.from,
+            lines: [], hasMore: true, nextFrom: startIndex + 1, truncated: true,
+            notes: prefix, notesTruncated: true, notesError: notesError
+        )
+    }
+
     let (finalPage, sizeTruncated) = HelperContract.fitItems(
         page, maxBytes: budget.maxBytes,
         encodedSize: { prefix in
             budget.encodedSize(HelperContract.TranscriptResponse(
                 schema: HelperContract.schemaVersion, command: "transcript", id: flags.id, version: version,
                 completeness: completeness, format: format, totalLines: totalLines, from: flags.from,
-                lines: prefix, hasMore: true, nextFrom: startIndex + prefix.count + 1, truncated: true
+                lines: prefix, hasMore: true, nextFrom: startIndex + prefix.count + 1, truncated: true,
+                notes: fittedNotes, notesTruncated: notesTruncated, notesError: notesError
             ))
         },
         shrinkText: { line, limit in
@@ -766,7 +838,7 @@ func runTranscript(
             return copy
         }
     )
-    let truncated = sizeTruncated
+    let truncated = sizeTruncated || notesTruncated
     // Dropping whole lines always leaves more to fetch; shrinking the one
     // surviving line's own text does not, unless the page already had more
     // beyond it (`pageHasMore`).
@@ -779,7 +851,8 @@ func runTranscript(
     return HelperContract.TranscriptResponse(
         schema: HelperContract.schemaVersion, command: "transcript", id: flags.id, version: version,
         completeness: completeness, format: format, totalLines: totalLines,
-        from: flags.from, lines: finalPage, hasMore: hasMore, nextFrom: nextFrom, truncated: truncated
+        from: flags.from, lines: finalPage, hasMore: hasMore, nextFrom: nextFrom, truncated: truncated,
+        notes: fittedNotes, notesTruncated: notesTruncated, notesError: notesError
     )
 }
 

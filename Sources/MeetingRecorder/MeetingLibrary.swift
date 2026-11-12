@@ -253,6 +253,13 @@ final class MeetingLibrary: ObservableObject {
     /// none, was on the card: nothing on screen would say so. Shown above the
     /// list until dismissed; the latest one wins.
     @Published private(set) var markNotice: MarkNotice?
+    /// Why the last change to a note failed, and what it would have
+    /// written; by the note's own id, shown by the notepad until the next
+    /// change to that note. Separate from `markFailures`/`markNotice`: the
+    /// card says nothing about notes.
+    @Published private(set) var noteFailures: [UUID: MarkFailure] = [:]
+    /// Notes not written yet, by their own id: the notepad's own pending state.
+    @Published private(set) var pendingNotes: Set<UUID> = []
 
     /// The save under way, from its click to the end of its write.
     @Published private(set) var exporting: Export?
@@ -330,10 +337,22 @@ final class MeetingLibrary: ObservableObject {
     private var channels: [String: Channel] = [:]
     private var windowSubscriptions: [AnyCancellable] = []
     private var sessionSubscription: AnyCancellable?
+    /// Follows the queue's moves and operations for the marks writer,
+    /// without the window: a notes change may be parked or may need to
+    /// follow a move while the window has never been open.
+    private var marksSubscriptions: [AnyCancellable] = []
     /// Each meeting folder's marks writer, by the folder itself.
     private var marksStates: [FolderIdentity: Marks] = [:]
     /// Counts the marks writes that succeeded; a read knows which came before it.
     private var marksClock = 0
+    /// A `.moving` operation's source folder, by its address path, kept for
+    /// this run only: lets a notes change for a folder the queue already
+    /// moved (and whose old identity nothing else named) find who it was.
+    private var moveSources: [String: FolderIdentity] = [:]
+    /// An old identity the writer has already followed to its new one, this
+    /// run: a later change with the old (or no) identity goes straight there.
+    private var movedIdentities: [FolderIdentity: FolderIdentity] = [:]
+    private var marksResumeScheduled = false
 
     init(
         recorder: MeetingRecorder,
@@ -364,6 +383,17 @@ final class MeetingLibrary: ObservableObject {
         }
         // The queue's move waits for a write of the folder's marks under way.
         queue.marksBeingWritten = { [weak self] identity in self?.marksStates[identity]?.isPending ?? false }
+        // Without the window too: a notes change may be parked on an
+        // operation, or may need to follow a move, whether or not the
+        // window has ever been open. `operations` is sent as it will be,
+        // the move's source address identity included.
+        marksSubscriptions = [
+            queue.$operations.sink { [weak self] operations in
+                self?.noteMoveSources(operations)
+                self?.scheduleMarksResume()
+            },
+            queue.$movedTo.dropFirst().sink { [weak self] _ in self?.scheduleMarksResume() },
+        ]
         listen()
     }
 
@@ -784,11 +814,18 @@ final class MeetingLibrary: ObservableObject {
         var edits = 0
         /// The count of the write under way.
         var writing: Int?
+        /// The part of `change` the write under way was given (the name/star/
+        /// names part, or the notes part: never both at once).
+        var sent: MeetingMarks.Change?
+        /// The new place being read for its identity, because the folder
+        /// this state was made for turned out to be where the queue's own
+        /// move already took it.
+        var following: URL?
         /// What the last write left on disk, and when (`marksClock`): a read
         /// started before it does not take it back.
         var confirmed: (marks: MeetingMarks, at: Int)?
 
-        var isPending: Bool { !change.isEmpty || writing != nil }
+        var isPending: Bool { !change.isEmpty || writing != nil || following != nil }
     }
 
     /// The marks shown: the folder's, with what the user set and is not on disk yet.
@@ -836,8 +873,9 @@ final class MeetingLibrary: ObservableObject {
 
     /// Why a meeting's name and star cannot be changed now, or nil. While the
     /// queue moves the folder nothing is written into it: the copy would
-    /// leave the change behind.
-    func markRefusal(for meeting: Meeting) -> String? {
+    /// leave the change behind. `notes: true` (a notepad's change) skips only
+    /// that refusal: it is a park, not a refusal, for notes.
+    func markRefusal(for meeting: Meeting, notes: Bool = false) -> String? {
         if recorder.currentSession.map({ Self.canonical($0.directory).path }) == meeting.directory.path
             || meeting.identity != nil && recorder.currentSession?.identity == meeting.identity {
             return String(localized: "The meeting is being recorded.")
@@ -845,7 +883,7 @@ final class MeetingLibrary: ObservableObject {
         guard meeting.readable, let identity = meeting.identity else {
             return String(localized: "The meeting folder can’t be read.")
         }
-        if let operation = queue.operation(on: identity) {
+        if !notes, let operation = queue.operation(on: identity) {
             return MeetingTranscriptionQueue.describe(operation.kind)
         }
         if isInBothPlaces(meeting) {
@@ -865,6 +903,10 @@ final class MeetingLibrary: ObservableObject {
 
     func dismissMarkNotice() {
         markNotice = nil
+    }
+
+    func dismissNoteFailure(_ id: UUID) {
+        noteFailures[id] = nil
     }
 
     /// The marks are not on disk yet.
@@ -1019,8 +1061,9 @@ final class MeetingLibrary: ObservableObject {
         return String(localized: "No record of a transcription matches this transcript.")
     }
 
+    /// Not `private`: `MeetingLibrary+Notes.swift` calls it too.
     @discardableResult
-    private func change(_ change: MeetingMarks.Change, of meeting: Meeting) -> String? {
+    func change(_ change: MeetingMarks.Change, of meeting: Meeting) -> String? {
         if let refusal = markRefusal(for: meeting) { return refusal }
         guard let identity = meeting.identity else { return nil }
         var state = marksStates[identity] ?? Marks(folder: meeting.directory)
@@ -1036,40 +1079,231 @@ final class MeetingLibrary: ObservableObject {
         return markFailures[identity]?.reason
     }
 
-    /// Starts the next write of a folder's marks, unless one is under way.
-    /// A folder the queue may move (by its own rule, `isInMeetingsRoot`) is
-    /// written at once, here: the queue marks a move before it copies
+    /// The entry for a notepad's add, edit or delete: by `identity` and
+    /// address, with or without a row the window read, and with or without
+    /// the window ever having been open. `identity` nil (a notepad that has
+    /// not read one yet) finds the meeting by its folder alone. Not
+    /// `private`: `MeetingLibrary+Notes.swift` calls it.
+    func changeNotes(_ change: MeetingMarks.Change, identity: FolderIdentity?, folder: URL) -> String? {
+        let folder = Self.canonical(folder)
+        for op in change.notes { dismissNoteFailure(op.noteID) }
+
+        // (a) The recording under way: only a notes change may write into
+        // it, once it is actually recording. A start still under way may
+        // yet fail and remove the folder; a stop still writes it.
+        if let session = recorder.currentSession,
+           Self.canonical(session.directory).path == folder.path || (identity != nil && identity == session.identity) {
+            guard recorder.state == .recording || recorder.state == .stopping,
+                  queue.isInMeetingsRoot(session.directory),
+                  let key = session.identity ?? FolderIdentity.of(session.directory) else {
+                return refuseNotes(change, String(localized: "The meeting is being recorded."))
+            }
+            return accept(change, key: key, folder: Self.canonical(session.directory))
+        }
+
+        let place = address(of: folder)
+        let moved = place.path != folder.path
+        let old = identity ?? (moved ? oldIdentityForMovedFolder(folder) : nil)
+
+        // (b) A row the window read, at the current address or by the
+        // identity it had before the queue's own move.
+        let row = meeting(at: place) ?? old.flatMap { typed(on: movedIdentities[$0] ?? $0, at: place.path) }
+        if let row {
+            let matches = identity == nil || row.identity == identity || row.identity == identity.flatMap { movedIdentities[$0] }
+                || (moved && row.directory.path == place.path)
+            guard matches else { return refuseNotes(change, String(localized: "The meeting folder isn’t available.")) }
+            if let refusal = markRefusal(for: row, notes: true) { return refuseNotes(change, refusal) }
+            guard let key = row.identity else { return refuseNotes(change, String(localized: "The meeting folder isn’t available.")) }
+            return accept(change, key: key, folder: row.directory)
+        }
+
+        // (c) No row, and the folder is still where it was: a meeting
+        // outside both roots the window never listed, or the local root.
+        if !moved {
+            if let key = identity { return accept(change, key: key, folder: folder) }
+            if queue.isInMeetingsRoot(folder), let key = FolderIdentity.of(folder) {
+                return accept(change, key: key, folder: folder)
+            }
+            return refuseNotes(change, String(localized: "The meeting folder isn’t available."))
+        }
+
+        // (d) No row, and the queue moved the folder this run: write under
+        // the identity the writer already followed to, or the old one —
+        // `writeMarks` follows the move itself from there.
+        guard let old else { return refuseNotes(change, String(localized: "The meeting folder isn’t available.")) }
+        if let new = movedIdentities[old] { return accept(change, key: new, folder: place) }
+        return accept(change, key: old, folder: folder)
+    }
+
+    private func refuseNotes(_ change: MeetingMarks.Change, _ reason: String) -> String {
+        recordNoteFailure(reason, ops: change.notes)
+        return reason
+    }
+
+    private func recordNoteFailure(_ reason: String, ops: [MeetingMarks.NoteOperation]) {
+        for op in ops { noteFailures[op.noteID] = MarkFailure(reason: reason, lost: MeetingMarks.Change(notes: [op])) }
+    }
+
+    /// The old identity of a folder the queue moved this run, when nothing
+    /// else named it: read off the main actor only for a folder whose
+    /// parent is the local root (the only root a notepad's recording can be
+    /// in), through the move's own recorded source.
+    private func oldIdentityForMovedFolder(_ folder: URL) -> FolderIdentity? {
+        MeetingStorage.address(of: folder).flatMap { moveSources[$0.path] }
+    }
+
+    /// Every `.moving` operation's source, kept by its address path: the
+    /// move's own identity for a folder nothing else named by then.
+    /// `operations` is the value as sent — `@Published` sends before the
+    /// property changes.
+    private func noteMoveSources(_ operations: [MeetingTranscriptionQueue.Operation]) {
+        for op in operations where op.kind == .moving {
+            if let id = op.address.identity { moveSources[op.address.path] = id }
+        }
+    }
+
+    /// Resumes every parked or following writer on the next turn, once the
+    /// queue's operations or moves have actually changed: the flag is reset
+    /// first, so an event that arrives while this runs is not swallowed.
+    private func scheduleMarksResume() {
+        guard !marksResumeScheduled else { return }
+        marksResumeScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.marksResumeScheduled = false
+                for key in Array(self.marksStates.keys) { self.writeMarks(of: key) }
+                self.forgetIdleMarks()
+                self.publishMarks()
+            }
+        }
+    }
+
+    /// Adds the change to the writer for `key`/`folder`: a state already
+    /// following a move to `folder` takes it instead, so an edit never
+    /// overtakes an earlier add still waiting for that same move. Returns
+    /// the reason it already failed synchronously, or nil while it is
+    /// written, parked or on its own channel.
+    private func accept(_ change: MeetingMarks.Change, key: FolderIdentity, folder: URL) -> String? {
+        let targetKey = marksStates[key] != nil ? key : (marksStates.first { $0.value.following == folder }?.key ?? key)
+        var state = marksStates[targetKey] ?? Marks(folder: folder)
+        if state.following == nil { state.folder = folder }
+        state.change.add(change)
+        state.edits += 1
+        marksStates[targetKey] = state
+        writeMarks(of: targetKey)
+        publishMarks()
+        guard let firstID = change.notes.first?.noteID else { return nil }
+        return noteFailures[firstID]?.reason
+    }
+
+    /// Starts the next write of a folder's marks, unless one is under way,
+    /// parked on an operation of the queue's, or following a move of its
+    /// own. A folder the queue may move (by its own rule, `isInMeetingsRoot`)
+    /// is written at once, here: the queue marks a move before it copies
     /// anything, on the main actor, so the write lands before the copy or is
     /// refused. Anything else (a network volume may hang) on the serial
-    /// queue of its parent folder; a move of that folder waits for it. Every
-    /// write checks the folder at its address is still this one.
-    private func writeMarks(of identity: FolderIdentity) {
-        guard var state = marksStates[identity], state.writing == nil, !state.change.isEmpty else { return }
+    /// queue of its parent folder; a move of that folder waits for it. The
+    /// name/star/names part and the notes part are sent in writes of their
+    /// own, so a crooked `notes` never takes the others down with it.
+    private func writeMarks(of key: FolderIdentity) {
+        guard var state = marksStates[key], state.writing == nil, state.following == nil, !state.change.isEmpty else { return }
+        // An operation on the folder parks the write rather than refuse it:
+        // `scheduleMarksResume` tries again once it ends.
+        guard queue.operation(on: key) == nil else { return }
+        // Only a notes-only write may follow a move: the name, the star and
+        // the names stay refused once the folder they were set for is gone,
+        // as before notes went their own way.
+        let sendingNotesOnly = state.change.withoutNotes.isEmpty
+        if sendingNotesOnly {
+            let place = address(of: state.folder)
+            guard place.path == state.folder.path else {
+                followMove(key, to: place)
+                return
+            }
+        }
+        let part = sendingNotesOnly ? state.change.onlyNotes : state.change.withoutNotes
         state.writing = state.edits
-        marksStates[identity] = state
+        state.sent = part
+        marksStates[key] = state
         let folder = state.folder
-        let change = state.change
         let edits = state.edits
         let write = reader.writeMarks
         if queue.isInMeetingsRoot(folder) {
-            switch Result(catching: { try write(change, folder, identity) }) {
-            case .success(let marks): finishMarks(of: identity, edits: edits, written: marks)
-            case .failure(let error): finishMarks(of: identity, edits: edits, failure: error.localizedDescription)
+            switch Result(catching: { try write(part, folder, key) }) {
+            case .success(let marks): finishMarks(of: key, edits: edits, written: marks)
+            case .failure(let error): finishMarks(of: key, edits: edits, failure: error)
             }
             return
         }
         channel(folder.deletingLastPathComponent().path).queue.async { [weak self] in
-            let result = Result(catching: { try write(change, folder, identity) })
+            let result = Result(catching: { try write(part, folder, key) })
             DispatchQueue.main.async {
                 MainActor.assumeIsolated {
                     switch result {
-                    case .success(let marks): self?.finishMarks(of: identity, edits: edits, written: marks)
+                    case .success(let marks): self?.finishMarks(of: key, edits: edits, written: marks)
                     case .failure(let error):
-                        self?.finishMarks(of: identity, edits: edits, failure: error.localizedDescription, late: true)
+                        self?.finishMarks(of: key, edits: edits, failure: error, late: true)
                     }
                 }
             }
         }
+    }
+
+    /// The folder this state was made for turned out to be where the
+    /// queue's own move already took it: parks the write and reads the new
+    /// place's identity on its own channel — it may be a network volume —
+    /// then re-keys the change there (`moveFollowed`).
+    private func followMove(_ key: FolderIdentity, to place: URL) {
+        guard var state = marksStates[key], state.following == nil else { return }
+        state.following = place
+        marksStates[key] = state
+        channel(place.deletingLastPathComponent().path).queue.async { [weak self] in
+            let found = FolderIdentity.of(place)
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated { self?.moveFollowed(key, to: place, found: found) }
+            }
+        }
+        publishMarks()
+    }
+
+    /// The new place's identity has been read. Found: the change moves to
+    /// that key, ahead of whatever is already waiting there, and its write
+    /// starts. Not found (replaced or gone with no operation and no later
+    /// move to explain it): the change fails with the text rather than park
+    /// forever — quit and Sparkle would wait for it otherwise.
+    private func moveFollowed(_ key: FolderIdentity, to place: URL, found: FolderIdentity?) {
+        guard var state = marksStates[key] else { return }
+        state.following = nil
+        guard let found else {
+            recordNoteFailure(MeetingMarks.Refusal.replaced.localizedDescription, ops: state.change.notes)
+            if !state.change.withoutNotes.isEmpty {
+                markFailures[key] = MarkFailure(
+                    reason: MeetingMarks.Refusal.replaced.localizedDescription, lost: state.change.withoutNotes
+                )
+            }
+            state.change = MeetingMarks.Change()
+            marksStates[key] = state
+            forgetIdleMarks()
+            publishMarks()
+            return
+        }
+        movedIdentities[key] = found
+        marksStates[key] = nil
+        var target = marksStates[found] ?? Marks(folder: place)
+        target.folder = place
+        var combined = state.change
+        combined.add(target.change)
+        target.change = combined
+        target.edits += state.edits
+        if let failure = markFailures[key] {
+            markFailures[found] = failure
+            markFailures[key] = nil
+        }
+        marksStates[found] = target
+        writeMarks(of: found)
+        forgetIdleMarks()
+        publishMarks()
     }
 
     /// A write has ended. What it wrote is what is on disk now, whatever is
@@ -1077,31 +1311,58 @@ final class MeetingLibrary: ObservableObject {
     /// again. A later change goes next, with every field the user set since
     /// the last write that took them all.
     /// `late`: the write ran off the main actor, and whoever asked for it has
-    /// moved on; a failure no card shows becomes the window's notice.
+    /// moved on; a failure no card shows becomes the window's notice — never
+    /// for a notes-only write, which the notepad shows on its own.
     private func finishMarks(
-        of identity: FolderIdentity, edits: Int, written: MeetingMarks? = nil, failure: String? = nil, late: Bool = false
+        of key: FolderIdentity, edits: Int, written: MeetingMarks? = nil, failure: Error? = nil, late: Bool = false
     ) {
-        guard var state = marksStates[identity] else { return }
+        guard var state = marksStates[key] else { return }
         state.writing = nil
+        let sent = state.sent ?? MeetingMarks.Change()
+        state.sent = nil
         let tookAll = state.edits == edits
-        let onCard = isCardShown && selection.flatMap({ meeting(at: $0) })?.identity == identity
-        if let failure, tookAll, late, !onCard {
+        let sendingNotes = !sent.notes.isEmpty
+        let onCard = isCardShown && selection.flatMap({ meeting(at: $0) })?.identity == key
+
+        // The folder was replaced at this very address, and an operation or
+        // a move already under way explains it: park rather than fail, and
+        // let the next write wait for the operation or follow the move. Only
+        // for a notes write: the name, the star and the names stay refused.
+        if let failure, tookAll, sendingNotes, (failure as? MeetingMarks.Refusal) == .replaced,
+           queue.operation(on: key) != nil || address(of: state.folder).path != state.folder.path {
+            marksStates[key] = state
+            writeMarks(of: key)
+            forgetIdleMarks()
+            publishMarks()
+            return
+        }
+
+        if let failure, tookAll, late, !onCard, !sendingNotes {
             let shown = meeting(at: state.folder).map { MeetingText.title($0, marks: $0.marks.marks) } ?? state.folder.lastPathComponent
-            markNotice = MarkNotice(lost: state.change, meeting: shown, reason: failure)
+            markNotice = MarkNotice(lost: sent, meeting: shown, reason: failure.localizedDescription)
         }
         if let written {
             marksClock += 1
             state.confirmed = (written, marksClock)
-            if tookAll { state.change = MeetingMarks.Change() }
-            markFailures[identity] = nil
-            show(written, of: identity)
+            if tookAll { state.change = sendingNotes ? state.change.withoutNotes : state.change.onlyNotes }
+            if sendingNotes {
+                for op in sent.notes { noteFailures[op.noteID] = nil }
+            } else {
+                markFailures[key] = nil
+            }
+            show(written, of: key)
         } else if let failure, tookAll {
-            markFailures[identity] = MarkFailure(reason: failure, lost: state.change)
-            state.change = MeetingMarks.Change()
-            AppLog.error("meeting-library", "\(state.folder.lastPathComponent): marks not saved: \(failure)")
+            if sendingNotes {
+                recordNoteFailure(failure.localizedDescription, ops: sent.notes)
+                state.change = state.change.withoutNotes
+            } else {
+                markFailures[key] = MarkFailure(reason: failure.localizedDescription, lost: sent)
+                state.change = state.change.onlyNotes
+                AppLog.error("meeting-library", "\(state.folder.lastPathComponent): marks not saved: \(failure.localizedDescription)")
+            }
         }
-        marksStates[identity] = state
-        writeMarks(of: identity)
+        marksStates[key] = state
+        writeMarks(of: key)
         forgetIdleMarks()
         publishMarks()
     }
@@ -1142,6 +1403,12 @@ final class MeetingLibrary: ObservableObject {
     private func publishMarks() {
         let pending = Set(marksStates.filter { $0.value.isPending }.keys)
         if pending != pendingMarks { pendingMarks = pending }
+        var notes: Set<UUID> = []
+        for state in marksStates.values {
+            notes.formUnion(state.change.notes.map(\.noteID))
+            if let sent = state.sent { notes.formUnion(sent.notes.map(\.noteID)) }
+        }
+        if notes != pendingNotes { pendingNotes = notes }
     }
 
     // MARK: - Deletion
@@ -1522,10 +1789,11 @@ final class MeetingLibrary: ObservableObject {
         removalRecheck = nil
     }
 
-    /// A change of a meeting's marks not on disk yet; a transcript being
+    /// A change of a meeting's marks not on disk yet, or a notepad note that
+    /// was refused or failed to write (`noteFailures`); a transcript being
     /// written to the file the user chose.
     var quitLosses: Set<AppDelegate.QuitLoss> {
-        var losses: Set<AppDelegate.QuitLoss> = pendingMarks.isEmpty ? [] : [.unsavedMeetingMark]
+        var losses: Set<AppDelegate.QuitLoss> = (pendingMarks.isEmpty && noteFailures.isEmpty) ? [] : [.unsavedMeetingMark]
         if exporting?.writing == true { losses.insert(.transcriptFile) }
         return losses
     }
@@ -1542,7 +1810,8 @@ final class MeetingLibrary: ObservableObject {
     func export(_ meeting: Meeting, as format: MeetingTranscript.Format, from owner: NSWindow?) -> String? {
         guard exporting == nil else { return String(localized: "A transcript is being saved already.") }
         guard let version, let shown = shownTranscript(of: meeting) else { return String(localized: "The transcript isn’t read yet.") }
-        guard let content = shown.exported(as: format) else {
+        let notes = MeetingLibrary.notesInOrder(marks(of: self.meeting(at: meeting.directory) ?? meeting)?.notes ?? [])
+        guard let content = shown.exported(as: format, notes: notes) else {
             return subtitlesRefusal(for: meeting) ?? String(localized: "No record of a transcription matches this transcript.")
         }
         let name = MeetingTranscript.exportName(folder: meeting.name, version: version, format: format)
@@ -2321,18 +2590,48 @@ extension MeetingTranscript {
 
     /// The text as a file of `format`, as the window shows it, the user's
     /// names included; nil for subtitles without the record's exact spans.
-    func exported(as format: Format) -> String? {
+    /// With `notes`, Markdown and plain text end with a Notes section
+    /// (`appendingNotes`); subtitles carry none — a call's captions have no
+    /// room for them, and `format != .subtitles` keeps this call byte for
+    /// byte the same as the one every caller made before notes existed.
+    func exported(as format: Format, notes: [MeetingNote] = []) -> String? {
         switch format {
         case .text:
             // What Copy Text copies, ending in one line break.
             var text = layout.string
             while text.hasSuffix("\n") { text.removeLast() }
-            return text + "\n"
+            return appendingNotes(text + "\n", notes: notes, format: format)
         case .markdown:
-            return markdown
+            return appendingNotes(markdown, notes: notes, format: format)
         case .subtitles:
             return subtitles
         }
+    }
+
+    /// Notes and marked moments under their own heading, by time, a marked
+    /// moment as `★`, one without a time as `(after the meeting)`; Markdown
+    /// lists them, plain text does not. Without notes, `text` unchanged.
+    private func appendingNotes(_ text: String, notes: [MeetingNote], format: Format) -> String {
+        guard format != .subtitles, !notes.isEmpty else { return text }
+        var body = text
+        if !body.hasSuffix("\n") { body += "\n" }
+        let heading = format == .markdown ? "## " + String(localized: "Notes") : String(localized: "Notes")
+        let rows = notes.map(Self.noteLine)
+        let listed = format == .markdown ? rows.map { "- " + $0 }.joined(separator: "\n") : rows.joined(separator: "\n")
+        return body + "\n" + heading + "\n\n" + listed + "\n"
+    }
+
+    /// One note's line: its time, or `(after the meeting)` without one, then
+    /// a marked moment's `★` or the note's text, its own line breaks turned
+    /// into spaces so each note stays one line.
+    private static func noteLine(_ note: MeetingNote) -> String {
+        let flattened = note.text
+            .replacingOccurrences(of: "\r\n", with: " ")
+            .replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\r", with: " ")
+        let body = note.kind == .moment ? (flattened.isEmpty ? "★" : "★ " + flattened) : flattened
+        guard let t = note.t else { return String(localized: "(after the meeting)") + " " + body }
+        return "[\(TranscriptSegment.timecode(t))] " + body
     }
 
     /// The file itself, byte for byte, unless the user's names took the

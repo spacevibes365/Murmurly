@@ -26,6 +26,12 @@ extension KeyboardShortcuts.Name {
         "copyLastDictation",
         initial: TestIsolation.isEnabled ? nil : .init(.c, modifiers: [.control, .command])
     )
+    /// "Mark Moment", only while a meeting is recording. Registered only for
+    /// that span, by `MarkMomentHotkey` (`NotesInputView.swift`), not here.
+    static let markMoment = Self(
+        "markMoment",
+        initial: TestIsolation.isEnabled ? nil : .init(.m, modifiers: [.option, .shift])
+    )
 }
 
 @MainActor
@@ -77,6 +83,12 @@ final class HotkeyManager {
     /// A test copy's stand-in streams: same open/closed life as the real
     /// ones, but no system hotkey.
     private var escapeContinuations: [KeyboardShortcuts.Shortcut: AsyncStream<KeyboardShortcuts.EventType>.Continuation] = [:]
+    /// ⌥⇧M, open only for the shortcut it was last asked for: the single
+    /// listener's own handle, the same shape as `escapeListeners` but one at
+    /// a time, since mark-moment has no chord variants to track.
+    private var markMomentListener: (shortcut: KeyboardShortcuts.Shortcut, id: UUID, task: Task<Void, Never>)?
+    private var markMomentContinuation: AsyncStream<KeyboardShortcuts.EventType>.Continuation?
+    private var onMarkMoment: () -> Void = {}
 
     /// A test copy installs no system handlers unless a test asks for them.
     init(installsSystemHandlers: Bool = !TestIsolation.isEnabled) {
@@ -87,6 +99,58 @@ final class HotkeyManager {
         settingsCancellable?.cancel()
         tearDownDictationRegistration()
         closeEscapeListener()
+        closeMarkMomentListener()
+    }
+
+    /// ⌥⇧M, open only while a meeting is recording: `shortcut` nil (no
+    /// shortcut assigned, or the recording ended) closes whatever is open.
+    /// Called again with the same shortcut already open is a no-op, so a
+    /// meeting's own driver (`MarkMomentHotkey`, `NotesInputView.swift`) can
+    /// call this on every tick without reopening the stream. Never hits the
+    /// system in a test copy (`installsSystemHandlers`): the stand-in stream
+    /// still opens, for `pressMarkMomentForTesting()`.
+    func listenForMarkMoment(_ shortcut: KeyboardShortcuts.Shortcut?, onMarkMoment: @escaping () -> Void) {
+        guard let shortcut else {
+            closeMarkMomentListener()
+            return
+        }
+        self.onMarkMoment = onMarkMoment
+        guard markMomentListener?.shortcut != shortcut else { return }
+        closeMarkMomentListener()
+        openMarkMomentListener(for: shortcut)
+    }
+
+    func closeMarkMomentListener() {
+        markMomentListener?.task.cancel()
+        markMomentListener = nil
+        markMomentContinuation?.finish()
+        markMomentContinuation = nil
+    }
+
+    private func openMarkMomentListener(for shortcut: KeyboardShortcuts.Shortcut) {
+        let events: AsyncStream<KeyboardShortcuts.EventType>
+        if installsSystemHandlers {
+            #if DEBUG
+            Self.systemRegistrationsForTesting += 1
+            #endif
+            events = KeyboardShortcuts.events(for: shortcut)
+        } else {
+            let (stream, continuation) = AsyncStream<KeyboardShortcuts.EventType>.makeStream()
+            markMomentContinuation = continuation
+            events = stream
+        }
+        let id = UUID()
+        let task = Task { @MainActor [weak self] in
+            for await event in events where event == .keyDown {
+                self?.onMarkMoment()
+            }
+            self?.markMomentListenerEnded(id)
+        }
+        markMomentListener = (shortcut, id, task)
+    }
+
+    private func markMomentListenerEnded(_ id: UUID) {
+        if markMomentListener?.id == id { markMomentListener = nil }
     }
 
     /// Esc is taken from every app while registered: open exactly
@@ -437,6 +501,21 @@ final class HotkeyManager {
 
     @discardableResult
     func pressEscapeForTesting() -> Bool { pressEscapeForTesting(.init(.escape)) }
+
+    /// Reads the real handle: open only while its task is alive and not cancelled.
+    var isMarkMomentListenerOpenForTesting: Bool {
+        guard let markMomentListener else { return false }
+        return !markMomentListener.task.isCancelled
+    }
+
+    /// Puts a key-down on the mark-moment stand-in stream, the seam tests use
+    /// instead of a real ⌥⇧M. Returns whether a listener was open to receive it.
+    @discardableResult
+    func pressMarkMomentForTesting() -> Bool {
+        guard let continuation = markMomentContinuation else { return false }
+        continuation.yield(.keyDown)
+        return true
+    }
     #endif
 
     static func registerMeeting(onToggle: @escaping () -> Void) {

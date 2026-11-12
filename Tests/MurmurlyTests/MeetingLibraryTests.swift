@@ -1674,6 +1674,38 @@ final class MeetingLibraryTests: XCTestCase {
         library.meeting(at: folder).flatMap(library.markFailure(of:))?.reason
     }
 
+    /// `addNote`/`deleteNote` (`MeetingLibrary+Notes.swift`) go through the
+    /// same writer as the star and the names, so the note reaches the
+    /// meeting's own `murmurly.json`.
+    func testANoteAddedThroughTheLibraryReachesTheMeetingsFolder() async throws {
+        let meeting = try seed("2026-10-06 10-00-00 Meeting", in: local, metadata: done)
+        let library = makeLibrary()
+        library.windowOpened()
+        try await until { library.local.fresh }
+        let row = try XCTUnwrap(library.meeting(at: meeting))
+        let note = MeetingNote(id: UUID(), t: 3, kind: .moment, text: "Созвон по релизу")
+
+        let addFailure = library.addNote(note, identity: row.identity, folder: meeting)
+        XCTAssertNil(addFailure)
+        try await until { library.pendingMarks.isEmpty }
+
+        guard case .read(let marks) = MeetingMarks.read(in: meeting) else { return XCTFail("the marks did not read") }
+        XCTAssertEqual(marks.notes, [note])
+        let afterAdd = try XCTUnwrap(library.meeting(at: meeting))
+        XCTAssertEqual(library.marks(of: afterAdd)?.notes, [note])
+
+        let deleteFailure = library.deleteNote(id: note.id, identity: afterAdd.identity, folder: meeting)
+        XCTAssertNil(deleteFailure)
+        try await until { library.pendingMarks.isEmpty }
+
+        guard case .read(let afterDelete) = MeetingMarks.read(in: meeting) else { return XCTFail("the marks did not read") }
+        XCTAssertEqual(afterDelete.notes, [])
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(contentsOf: meeting.appendingPathComponent(MeetingMarks.fileName))) as? [String: Any]
+        )
+        XCTAssertNil(object["notes"], "the key goes once its last note is deleted")
+    }
+
     // MARK: - Speakers' names
 
     /// A transcript as the queue writes it, and the record of its attempt:

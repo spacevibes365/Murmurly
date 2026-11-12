@@ -376,10 +376,70 @@ struct MeetingAttempt: Codable, Sendable, Equatable {
 
 // MARK: - The user's marks
 
-/// The user's own name for a meeting, its star and the names of its
-/// speakers, in the meeting's folder as `murmurly.json` (never translated),
-/// so they go wherever the meeting goes.
-/// Written by the window alone (`MeetingStorage.write`, in `MeetingStorage.swift`).
+/// A note or marked moment on a meeting's notepad, in `MeetingMarks.notes`.
+/// `t` is seconds into the recording (`MeetingRecorder.recordingSeconds()`'s
+/// scale); nil for a note typed with no time to attach it to. A malformed
+/// element is skipped on read (`init(jsonObject:)`) and kept on write
+/// (`MeetingStorage.write`): the array is edited in place by `id`.
+struct MeetingNote: Sendable, Equatable, Identifiable {
+    let id: UUID
+    var t: Double?
+    var kind: Kind
+    var text: String
+
+    enum Kind: String, Sendable {
+        case note
+        case moment
+    }
+
+    init(id: UUID, t: Double?, kind: Kind, text: String) {
+        self.id = id
+        self.t = t
+        self.kind = kind
+        self.text = text
+    }
+
+    /// nil for anything this app does not recognize as one of its own notes:
+    /// the caller skips it rather than fail the whole file.
+    init?(jsonObject: Any) {
+        guard let object = jsonObject as? [String: Any] else { return nil }
+        guard let idString = object["id"] as? String, let id = UUID(uuidString: idString) else { return nil }
+        guard let kindString = object["kind"] as? String, let kind = Kind(rawValue: kindString) else { return nil }
+        guard let text = object["text"] as? String else { return nil }
+        switch object["t"] {
+        case nil, is NSNull:
+            self.t = nil
+        case let number as NSNumber:
+            // `JSONSerialization` hands a JSON `true`/`false` back as an
+            // `NSNumber` too, and `doubleValue` would read it as 1.0/0.0.
+            guard CFGetTypeID(number) != CFBooleanGetTypeID() else { return nil }
+            let value = number.doubleValue
+            guard value.isFinite, value >= 0 else { return nil }
+            // At 100 hours or more, as subtitles' times, the note keeps its
+            // text and loses its time: no recording is longer, and a time
+            // from a file edited by hand is shown as `m:ss` through
+            // `Int(_:)`, which would stop the app on 1e20.
+            self.t = value < 360_000 ? value : nil
+        default:
+            return nil
+        }
+        self.id = id
+        self.kind = kind
+        self.text = text
+    }
+
+    var jsonObject: [String: Any] {
+        var object: [String: Any] = ["id": id.uuidString, "kind": kind.rawValue, "text": text]
+        if let t { object["t"] = t }
+        return object
+    }
+}
+
+/// The user's own name for a meeting, its star, the names of its speakers
+/// and its notepad's notes, in the meeting's folder as `murmurly.json`
+/// (never translated), so they go wherever the meeting goes.
+/// Written by `MeetingLibrary` alone: the window's marks and the notepad's
+/// notes (`MeetingStorage.write`, in `MeetingStorage.swift`).
 /// Read loosely and written over the file as it is then, so every other key,
 /// a later version's or anyone's, survives; a file this app cannot read, or
 /// one of a later version, is never written over: its marks cannot be
@@ -398,6 +458,10 @@ struct MeetingMarks: Sendable, Equatable {
     /// itself used ("Guest" → "Anya"); empty for a name not renamed, which
     /// shows as the feed found it. The transcripts are never changed.
     var callNames: [String: String] = [:]
+    /// The meeting's notepad notes and marked moments, in file order. A
+    /// `notes` that is not a JSON array is kept as it is and reads as empty
+    /// here, so a crooked value there never hides the star or the names.
+    var notes: [MeetingNote] = []
 
     /// What a meeting's folder holds.
     enum State: Sendable, Equatable {
@@ -499,8 +563,22 @@ struct MeetingMarks: Sendable, Equatable {
                 callNames[found] = name
             }
         }
+        // A `notes` that is not an array, or an array element that is not a
+        // readable note, is kept on write but read as nothing here — it
+        // never blocks the star or the names. `ForEach` cannot abide a
+        // duplicate id, so only the first note of a repeated id is kept.
+        var notes: [MeetingNote] = []
+        if let rawNotes = object["notes"] as? [Any] {
+            var seenIDs: Set<UUID> = []
+            for item in rawNotes {
+                guard let note = MeetingNote(jsonObject: item), !seenIDs.contains(note.id) else { continue }
+                seenIDs.insert(note.id)
+                notes.append(note)
+            }
+        }
         return .success(MeetingMarks(
-            title: title as? String, starred: starred as? Bool ?? false, speakers: speakers, callNames: callNames
+            title: title as? String, starred: starred as? Bool ?? false,
+            speakers: speakers, callNames: callNames, notes: notes
         ))
     }
 }

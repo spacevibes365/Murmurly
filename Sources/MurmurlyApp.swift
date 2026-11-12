@@ -15,6 +15,11 @@ struct MurmurlyApp: App {
     @StateObject private var permissions = PermissionManager()
     @StateObject private var loginItem = LoginItemManager()
     @StateObject private var updater: AppUpdater
+    /// Ties the notepad to the recorder and the library; kept alive for the
+    /// app's own lifetime, like `updater` — the notepad's slots are handed
+    /// only the model, so this is what fills `notepad.meeting` and wires the
+    /// writer (`NotesInputView.swift`).
+    private let notepadNotes: NotepadNotes
 
     init() {
         let settings = SettingsStore()
@@ -62,6 +67,7 @@ struct MurmurlyApp: App {
             recorder: recorders.meeting, queue: transcripts, settings: settings, reader: reader, dictation: recorders.dictation
         )
         _library = StateObject(wrappedValue: library)
+        notepadNotes = NotepadNotes.attach(notepad: liveTranscript.notepad, recorder: recorders.meeting, library: library)
         AppLog.rotateIfNeeded()
         // An isolated launch keeps its log, archives and settings in one
         // folder and names it, so the runner removes exactly what it created.

@@ -24,6 +24,7 @@ final class TestIsolationTests: XCTestCase {
         manager.activate(settings: settings, onToggle: {}, isRecording: { false })
         HotkeyManager.registerMeeting {}
         HotkeyManager.registerLastDictation(onPasteDown: {}, onPasteUp: {}, onCopy: {})
+        manager.listenForMarkMoment(KeyboardShortcuts.Shortcut(.m, modifiers: [.option, .shift])) {}
 
         XCTAssertEqual(
             HotkeyManager.systemRegistrationsForTesting - before, 0,
@@ -64,6 +65,7 @@ final class TestIsolationTests: XCTestCase {
         XCTAssertNil(KeyboardShortcuts.Name.meeting.initialShortcut)
         XCTAssertNil(KeyboardShortcuts.Name.pasteLastDictation.initialShortcut)
         XCTAssertNil(KeyboardShortcuts.Name.copyLastDictation.initialShortcut)
+        XCTAssertNil(KeyboardShortcuts.Name.markMoment.initialShortcut)
     }
 
     func testInjectedSnapshotStillDrivesTheWatchdog() {

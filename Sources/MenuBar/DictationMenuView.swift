@@ -32,6 +32,7 @@ struct MenuBarLabel: View {
             appDelegate.followAppearance(of: settings)
             permissions.activate()
             dictation.activate(settings: settings, permissions: permissions)
+            meeting.notepadLinks = .init(library: library)
             meeting.activate(
                 settings: settings,
                 permissions: permissions,
@@ -47,6 +48,7 @@ struct MenuBarLabel: View {
             appDelegate.fileLosses = { files.quitLosses }
             appDelegate.meetingLosses = { library.quitLosses }
             appDelegate.showMainWindow = { AppWindowController.show("main", with: openWindow) }
+            MeetingLibrary.showMainWindow = { AppWindowController.show("main", with: openWindow) }
         }
     }
 }

@@ -110,6 +110,11 @@ final class SettingsStore: ObservableObject {
     @Published var liveTranscriptPanelFrame: LiveTranscriptPanelFrame? {
         didSet { Self.store(liveTranscriptPanelFrame, in: d, forKey: K.liveTranscriptPanelFrame) }
     }
+    /// "Keep on top" for the notepad window; off by default. The interface
+    /// is the notepad's own pin (`NotepadWindowControls`).
+    @Published var liveTranscriptKeepOnTop: Bool {
+        didSet { d.set(liveTranscriptKeepOnTop, forKey: K.liveTranscriptKeepOnTop) }
+    }
     @Published var systemAudioCheck: SystemAudioCheck? {
         didSet { Self.store(systemAudioCheck, in: d, forKey: K.systemAudioCheck) }
     }
@@ -197,6 +202,7 @@ final class SettingsStore: ObservableObject {
         static let namesFromCallWindow = "meeting.namesFromCallWindow"
         static let liveTranscript = "meeting.liveTranscript"
         static let liveTranscriptPanelFrame = "liveTranscript.panelFrame"
+        static let liveTranscriptKeepOnTop = "liveTranscript.keepOnTop"
         static let systemAudioCheck = "permissions.systemAudioCheck"
         static let meetingsFolder = "meeting.storageFolder"
         static let meetingAudioRetention = "meeting.audioRetentionDays"
@@ -262,6 +268,7 @@ final class SettingsStore: ObservableObject {
         namesFromCallWindow = d.object(forKey: K.namesFromCallWindow) as? Bool ?? true
         liveTranscript = d.object(forKey: K.liveTranscript) as? Bool ?? true
         liveTranscriptPanelFrame = Self.load(LiveTranscriptPanelFrame.self, from: d, forKey: K.liveTranscriptPanelFrame)
+        liveTranscriptKeepOnTop = d.object(forKey: K.liveTranscriptKeepOnTop) as? Bool ?? false
         systemAudioCheck = Self.load(SystemAudioCheck.self, from: d, forKey: K.systemAudioCheck)
         meetingsFolderPath = d.string(forKey: K.meetingsFolder)
         meetingAudioRetention = MeetingAudioRetention(rawValue: d.integer(forKey: K.meetingAudioRetention)) ?? .keep
